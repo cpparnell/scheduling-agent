@@ -17,6 +17,35 @@ def apple_to_unix(apple_ts: int) -> float:
     return apple_ts / 1e9 + APPLE_EPOCH_OFFSET
 
 
+def _decode_attributed_body(data: bytes | None) -> str | None:
+    """
+    Extract the message text from the attributedBody typedstream BLOB.
+    On modern macOS many messages (especially sent ones) have a NULL `text`
+    column and store their content only here.
+    """
+    if not data:
+        return None
+    idx = data.find(b"NSString")
+    if idx == -1:
+        return None
+    # The string payload follows a 0x2b ('+') token after the NSString class name
+    idx = data.find(b"+", idx)
+    if idx == -1:
+        return None
+    idx += 1
+    if data[idx] == 0x81:
+        # Lengths >= 128 are encoded as a 2-byte little-endian int after 0x81
+        length = int.from_bytes(data[idx + 1:idx + 3], "little")
+        idx += 3
+    else:
+        length = data[idx]
+        idx += 1
+    try:
+        return data[idx:idx + length].decode("utf-8", errors="replace")
+    except (IndexError, UnicodeDecodeError):
+        return None
+
+
 def get_threads_since(last_apple_ts: int | None, lookback_days: int, blocked: list[str]) -> list[dict]:
     if last_apple_ts is None:
         cutoff = unix_to_apple(time.time() - lookback_days * 86400)
@@ -37,6 +66,7 @@ def get_threads_since(last_apple_ts: int | None, lookback_days: int, blocked: li
                 c.ROWID AS chat_id,
                 m.ROWID AS msg_id,
                 m.text,
+                m.attributedBody,
                 COALESCE(h.id, 'me') AS sender,
                 m.is_from_me,
                 m.date AS apple_ts
@@ -45,8 +75,7 @@ def get_threads_since(last_apple_ts: int | None, lookback_days: int, blocked: li
             JOIN chat c ON cmj.chat_id = c.ROWID
             LEFT JOIN handle h ON m.handle_id = h.ROWID
             WHERE m.date > ?
-              AND m.text IS NOT NULL
-              AND m.text != ''
+              AND ((m.text IS NOT NULL AND m.text != '') OR m.attributedBody IS NOT NULL)
             ORDER BY c.ROWID, m.date ASC
         """, (cutoff,))
 
@@ -69,9 +98,14 @@ def get_threads_since(last_apple_ts: int | None, lookback_days: int, blocked: li
     blocked_set = set(blocked)
     threads: dict[int, dict] = {}
 
-    for chat_id, msg_id, text, sender, from_me, apple_ts in rows:
+    for chat_id, msg_id, text, attributed_body, sender, from_me, apple_ts in rows:
         participants = participants_by_chat.get(chat_id, [])
         if any(p in blocked_set for p in participants):
+            continue
+
+        if not text:
+            text = _decode_attributed_body(attributed_body)
+        if not text:
             continue
 
         if chat_id not in threads:
