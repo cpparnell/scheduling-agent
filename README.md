@@ -64,6 +64,47 @@ The config file lives at `~/.scheduling-agent/config.json` and is created with d
 
 State (the last-processed message timestamp and hashes of created events) is stored in `~/.scheduling-agent/state.json`.
 
+## Testing
+
+Install the dev dependencies first:
+
+```bash
+source venv/bin/activate
+pip install -r requirements.dev.txt
+```
+
+There are two tiers:
+
+**Unit / integration tests** — fast, offline, and free. No API key required.
+
+```bash
+pytest
+```
+
+These cover the deterministic plumbing: the chat.db reader and `attributedBody`
+decoding (run against a temporary SQLite fixture database), detector parsing and
+filtering (with the Anthropic client stubbed out), the dedup/state logic, and
+AppleScript event assembly. All on-disk state is redirected to a temp directory,
+so your real `~/.scheduling-agent` is never touched.
+
+**Detection eval** — measures the Claude detector against a golden dataset of
+~20 synthetic threads (confirmed plans plus hard negatives like vague or
+cancelled invites). This calls the real model, so it needs `ANTHROPIC_API_KEY`
+and costs roughly $0.05 per run.
+
+```bash
+python -m evals.run                     # baseline on the default model
+python -m evals.run --model claude-sonnet-4-6   # compare another model
+python -m evals.run --judge             # add an LLM title-quality score
+pytest -m eval                          # run it as a pass/fail gate
+```
+
+It prints per-case results plus aggregate accuracy and the false-positive rate
+on hard negatives, and writes a timestamped report to `evals/reports/` so runs
+can be diffed across prompt or model changes. The golden cases (`evals/golden.jsonl`)
+use date placeholders that are resolved relative to the current day at runtime,
+so they never go stale.
+
 ## Project structure
 
 ```
@@ -76,6 +117,12 @@ scheduling_agent/
 ├── detector.py        # Claude Haiku plan detection (JSON schema output)
 ├── calendar.py        # Apple Calendar event creation via osascript
 └── watcher.py         # Filesystem watcher with debounce
+tests/                 # Offline unit/integration tests (pytest)
+└── fixtures/chatdb.py # Builds a temp chat.db + encodes attributedBody blobs
+evals/                 # Paid detection eval (golden dataset + runner)
+├── golden.jsonl       # ~20 labeled threads (positives + hard negatives)
+├── loader.py          # Materializes runtime-relative dates
+└── run.py             # Scorer + report writer
 ```
 
 ## Privacy notes

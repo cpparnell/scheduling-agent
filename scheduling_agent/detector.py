@@ -6,7 +6,19 @@ import anthropic
 
 logger = logging.getLogger(__name__)
 
-_client = anthropic.Anthropic()
+MODEL = "claude-haiku-4-5-20251001"
+
+_client = None
+
+
+def _get_client() -> "anthropic.Anthropic":
+    """Lazily construct the Anthropic client so importing this module does not
+    require ANTHROPIC_API_KEY (and so tests can swap in a fake)."""
+    global _client
+    if _client is None:
+        _client = anthropic.Anthropic()
+    return _client
+
 
 SYSTEM_PROMPT = """You are an assistant that analyzes iMessage conversation threads to determine if confirmed plans have been made.
 
@@ -56,8 +68,8 @@ EVENT_SCHEMA = {
 }
 
 
-def _format_thread(thread: dict) -> str:
-    today = datetime.now().strftime("%A, %B %d, %Y")
+def _format_thread(thread: dict, today: datetime | None = None) -> str:
+    today = (today or datetime.now()).strftime("%A, %B %d, %Y")
     participants = ", ".join(thread.get("participants", ["unknown"]))
     lines = [f"[Today is {today}]", f"[Participants: {participants}]", ""]
     for msg in thread.get("messages", []):
@@ -67,7 +79,7 @@ def _format_thread(thread: dict) -> str:
     return "\n".join(lines)
 
 
-def detect_plans(threads: list[dict]) -> list[dict]:
+def detect_plans(threads: list[dict], model: str = MODEL) -> list[dict]:
     """
     Analyze a list of conversation threads for confirmed plans.
     Returns a list of event dicts for threads that have confirmed plans.
@@ -78,8 +90,8 @@ def detect_plans(threads: list[dict]) -> list[dict]:
         formatted = _format_thread(thread)
 
         try:
-            response = _client.messages.create(
-                model="claude-haiku-4-5-20251001",
+            response = _get_client().messages.create(
+                model=model,
                 max_tokens=512,
                 system=SYSTEM_PROMPT,
                 messages=[{

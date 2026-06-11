@@ -37,14 +37,14 @@ def is_duplicate(chat_id: int, date: str, title: str) -> bool:
     return h in data.get("created_events", [])
 
 
-def record_event(chat_id: int, date: str, title: str, new_timestamp: int) -> None:
+def record_event(chat_id: int, date: str, title: str) -> None:
+    """Record a created event's dedup hash. Timestamp advancement is handled
+    separately by update_timestamp()."""
     data = _load()
     h = event_hash(chat_id, date, title)
     created = set(data.get("created_events", []))
     created.add(h)
     data["created_events"] = list(created)
-    if new_timestamp > (data.get("last_processed_timestamp") or 0):
-        data["last_processed_timestamp"] = new_timestamp
     _save(data)
 
 

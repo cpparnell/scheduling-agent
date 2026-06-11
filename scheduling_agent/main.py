@@ -62,7 +62,7 @@ def process_new_messages(cfg: dict) -> None:
         )
 
         if created:
-            state.record_event(chat_id, date, title, new_timestamp=0)
+            state.record_event(chat_id, date, title)
             print(f"  ✓ Created: {title} on {date}")
         else:
             logger.error("Failed to create calendar event: %s", title)

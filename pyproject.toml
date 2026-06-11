@@ -1,0 +1,7 @@
+[tool.pytest.ini_options]
+testpaths = ["tests", "evals"]
+# Default run excludes paid eval tests. Run them explicitly with: pytest -m eval
+addopts = "-m 'not eval'"
+markers = [
+    "eval: paid tests that call the real Anthropic API (run with: pytest -m eval)",
+]

@@ -1,8 +1,8 @@
-# Plan: iMessage-to-Calendar Scheduling Agent
+# iMessage-to-Calendar Scheduling Agent
 
 ## Context
 
-Build a Python agent that continuously watches iMessages on macOS, uses Claude to detect confirmed plans in conversations, and automatically creates Apple Calendar events — no confirmation step. Runs as a persistent background process. First run scans the last 7 days; subsequent runs process only new messages.
+Build a tool that continuously watches iMessages on macOS, uses Claude to detect confirmed plans in conversations, and automatically creates Apple Calendar events — no confirmation step. Runs as a persistent background process. First run scans the last 7 days; subsequent runs process only new messages.
 
 ## Critique & Refinements to the Original Idea
 
