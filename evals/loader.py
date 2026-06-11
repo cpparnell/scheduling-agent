@@ -47,8 +47,15 @@ def materialize_case(case: dict, today: date | None = None, now: float | None = 
     participants = case.get("participants", ["+15550000000"])
     messages = []
     for msg in case["messages"]:
+        if msg.get("from_me"):
+            sender = "me"
+        else:
+            # sender_index picks which participant sent the message (default 0).
+            # Enables group-chat cases where multiple people speak.
+            idx = msg.get("sender_index", 0)
+            sender = participants[idx] if idx < len(participants) else participants[0]
         messages.append({
-            "sender": "me" if msg.get("from_me") else participants[0],
+            "sender": sender,
             "text": _substitute(msg["text"], today),
             "from_me": msg.get("from_me", False),
             "unix_ts": now - msg.get("hours_ago", 1) * 3600,
