@@ -2,13 +2,15 @@
 the real ``today`` at runtime, so fixtures never go stale.
 
 Placeholders in message text:
-  {day+N}    -> weekday name of today+N        (keep N in 1..6 to stay unambiguous)
+  {day+N}    -> "Weekday, Month D" of today+N  (e.g. "Tuesday, June 17")
   {date+N}   -> "Month D" of today+N           (e.g. "June 13")
+  {saturday} -> "Saturday" (next Saturday from today)
   {tomorrow} -> "tomorrow"
   {tonight}  -> "tonight"
 
-Expectation field:
-  date_offset_days: N  ->  resolved to concrete "YYYY-MM-DD" (today+N)
+Expectation fields:
+  date_offset_days: N       ->  resolved to concrete "YYYY-MM-DD" (today+N)
+  date_offset_saturday: true -> resolved to next Saturday's "YYYY-MM-DD"
 """
 
 import json
@@ -22,17 +24,24 @@ GOLDEN_PATH = Path(__file__).parent / "golden.jsonl"
 _PLACEHOLDER = re.compile(r"\{([^}]+)\}")
 
 
+def _days_until_saturday(today: date) -> int:
+    """Days from today until the next Saturday (never 0 — always at least 1)."""
+    return (5 - today.weekday()) % 7 or 7
+
+
 def _substitute(text: str, today: date) -> str:
     def repl(m: re.Match) -> str:
         token = m.group(1)
         if token in ("tomorrow", "tonight"):
             return token
+        if token == "saturday":
+            return (today + timedelta(days=_days_until_saturday(today))).strftime("%A")
         rel = re.fullmatch(r"(day|date)\+(\d+)", token)
         if rel:
             kind, n = rel.group(1), int(rel.group(2))
             d = today + timedelta(days=n)
             if kind == "day":
-                return d.strftime("%A")
+                return f"{d.strftime('%A, %B')} {d.day}"
             return f"{d.strftime('%B')} {d.day}"
         return m.group(0)
 
@@ -71,6 +80,8 @@ def materialize_case(case: dict, today: date | None = None, now: float | None = 
     if "date_offset_days" in expected:
         offset = expected.pop("date_offset_days")
         expected["date"] = (today + timedelta(days=offset)).isoformat()
+    if expected.pop("date_offset_saturday", False):
+        expected["date"] = (today + timedelta(days=_days_until_saturday(today))).isoformat()
 
     return thread, expected
 
