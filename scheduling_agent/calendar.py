@@ -17,6 +17,7 @@ def create_event(
     duration_minutes: int | None,
     location: str | None,
     calendar_name: str = "Calendar",
+    tentative: bool = False,
 ) -> bool:
     """
     Create an Apple Calendar event via osascript.
@@ -41,6 +42,8 @@ def create_event(
         if location:
             safe_location = location.replace('"', '\\"')
             props += f', location:"{safe_location}"'
+        if tentative:
+            props += ", status:tentative"
         props += "}"
 
         script = f"""

@@ -19,6 +19,7 @@ def _cfg(**overrides):
 def _event(**overrides):
     base = {
         "has_event": True,
+        "status": "confirmed",
         "title": "Dinner",
         "date": "2026-06-13",
         "time_start": "19:00",
@@ -41,6 +42,12 @@ def spy_create_event(monkeypatch):
 
     monkeypatch.setattr(calendar, "create_event", fake)
     return state_
+
+
+def _tentative_cfg(**overrides):
+    cfg = _cfg(**overrides)
+    cfg["tentative_confidence_threshold"] = 0.6
+    return cfg
 
 
 @pytest.fixture
@@ -130,3 +137,26 @@ def test_no_threads_does_nothing(fake_chat_db, fake_anthropic, spy_create_event)
 
     assert spy_create_event["calls"] == []
     assert state.get_last_timestamp() is None
+
+
+def test_tentative_event_created_for_unanswered_invite(
+    one_chat_db, fake_anthropic, spy_create_event
+):
+    fake_anthropic([_event(status="tentative", confidence=0.7)])
+
+    main.process_new_messages(_tentative_cfg())
+
+    assert len(spy_create_event["calls"]) == 1
+    assert spy_create_event["calls"][0]["tentative"] is True
+    assert state.is_duplicate(1, "2026-06-13", "19:00", "Dinner") is True
+
+
+def test_tentative_below_threshold_is_skipped(
+    one_chat_db, fake_anthropic, spy_create_event
+):
+    fake_anthropic([_event(status="tentative", confidence=0.4)])
+
+    main.process_new_messages(_tentative_cfg())
+
+    assert spy_create_event["calls"] == []
+    assert state.is_duplicate(1, "2026-06-13", "19:00", "Dinner") is False

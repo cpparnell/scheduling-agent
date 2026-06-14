@@ -36,18 +36,24 @@ def process_new_messages(cfg: dict) -> None:
     events = detector.detect_plans(threads)
 
     for event in events:
-        if event["confidence"] < cfg["confidence_threshold"]:
-            logger.info(
-                "Skipping low-confidence event (%.2f): %s",
-                event["confidence"],
-                event["title"],
-            )
-            continue
-
         chat_id = event["chat_id"]
         title = event["title"]
         date = event["date"]
         time_start = event.get("time_start")
+        is_tentative = event.get("status") == "tentative"
+
+        threshold = (
+            cfg["tentative_confidence_threshold"] if is_tentative
+            else cfg["confidence_threshold"]
+        )
+        if event["confidence"] < threshold:
+            logger.info(
+                "Skipping low-confidence %s event (%.2f): %s",
+                event.get("status", "confirmed"),
+                event["confidence"],
+                title,
+            )
+            continue
 
         if state.is_duplicate(chat_id, date, time_start, title):
             logger.info("Skipping duplicate event: %s on %s", title, date)
@@ -60,11 +66,13 @@ def process_new_messages(cfg: dict) -> None:
             duration_minutes=event.get("duration_minutes"),
             location=event.get("location"),
             calendar_name=cfg["target_calendar"],
+            tentative=is_tentative,
         )
 
         if created:
             state.record_event(chat_id, date, time_start, title)
-            print(f"  ✓ Created: {title} on {date}")
+            label = "Tentative" if is_tentative else "Created"
+            print(f"  ✓ {label}: {title} on {date}")
         else:
             logger.error("Failed to create calendar event: %s", title)
 

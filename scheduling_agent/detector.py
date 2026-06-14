@@ -20,19 +20,22 @@ def _get_client() -> "anthropic.Anthropic":
     return _client
 
 
-SYSTEM_PROMPT = """You are an assistant that analyzes iMessage conversation threads to determine if confirmed plans have been made.
+SYSTEM_PROMPT = """You are an assistant that analyzes iMessage conversation threads to identify scheduled plans.
 
-A "confirmed plan" requires ALL of the following:
-1. An explicit invitation to do something at a specific time or date (e.g. "want to grab dinner Friday?", "meet at 3pm?", "let's do lunch Tuesday")
-2. An explicit acceptance from the other party (e.g. "yes!", "sounds good", "I'll be there", "see you then")
-3. A reasonably specific date (day of week, date, or relative like "this Saturday")
+Plans fall into two categories — set `status` accordingly:
 
-Do NOT create events for:
-- Vague expressions of interest ("we should hang out sometime")
-- Unconfirmed invitations with no response yet
-- Plans that were cancelled or rescheduled without confirmation
-- Casual references to past events
-- Plans where acceptance is ambiguous
+**confirmed**: An explicit invitation with a specific date AND all responding parties have explicitly accepted.
+Acceptance includes: "yes!", "sounds good", "I'll be there", "see you then", "k", "I'm down", "sure", "why not", "!!", 👍, or similar clear agreement.
+
+**tentative**: An explicit invitation with a specific date, but acceptance is incomplete or uncertain.
+This includes: no response yet, mixed responses (some yes, some maybe), "maybe", "I'll try", "hopefully", "we'll see", or any hedged/conditional reply from any party.
+
+Set `has_event: true` for BOTH confirmed and tentative plans.
+Set `has_event: false` when:
+- No specific invitation exists ("we should hang out sometime")
+- The user explicitly declined or the plan was cancelled
+- No reasonably specific date is mentioned
+- The thread only references a past event
 
 Respond with a JSON object only. No prose.
 """
@@ -61,10 +64,15 @@ EVENT_SCHEMA = {
         },
         "confidence": {
             "type": "number",
-            "description": "Confidence score 0.0-1.0 that this is a genuine confirmed plan"
+            "description": "Confidence score 0.0-1.0 that this is a genuine plan"
+        },
+        "status": {
+            "type": "string",
+            "enum": ["confirmed", "tentative"],
+            "description": "confirmed if the user explicitly accepted; tentative if the invite exists but user hasn't clearly responded"
         }
     },
-    "required": ["has_event", "title", "date", "time_start", "duration_minutes", "location", "confidence"]
+    "required": ["has_event", "title", "date", "time_start", "duration_minutes", "location", "confidence", "status"]
 }
 
 

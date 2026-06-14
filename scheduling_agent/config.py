@@ -10,6 +10,7 @@ DEFAULTS = {
     "target_calendar": "Calendar",
     "lookback_days": 7,
     "confidence_threshold": 0.85,
+    "tentative_confidence_threshold": 0.6,
 }
 
 

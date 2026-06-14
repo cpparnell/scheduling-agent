@@ -23,7 +23,7 @@ from scheduling_agent import detector
 
 REPORTS_DIR = Path(__file__).parent / "reports"
 
-_GOT_FIELDS = ("title", "date", "time_start", "location", "confidence")
+_GOT_FIELDS = ("title", "date", "time_start", "location", "confidence", "status")
 
 
 def score_case(case: dict, model: str) -> dict:
@@ -46,6 +46,8 @@ def score_case(case: dict, model: str) -> dict:
         exp_time = expected.get("time_start")
         if exp_time and got.get("time_start") != exp_time:
             failures.append(f"time_start {got.get('time_start')} != {exp_time}")
+        if "status" in expected and got.get("status") != expected["status"]:
+            failures.append(f"status {got.get('status')!r} != {expected['status']!r}")
         if "title_contains_any" in expected:
             title = (got.get("title") or "").lower()
             if not any(s.lower() in title for s in expected["title_contains_any"]):
@@ -86,7 +88,8 @@ def run(cases: list[dict], model: str = detector.MODEL, judge: bool = False) -> 
 def summarize(results: list[dict]) -> dict:
     gated = [r for r in results if not r["known_failure"]]
     negatives = [r for r in results if r["category"] == "hard_negative"]
-    positives = [r for r in gated if r["expected_has_event"]]
+    tentatives = [r for r in gated if r["category"] == "tentative"]
+    positives = [r for r in gated if r["expected_has_event"] and r["category"] != "tentative"]
     fps = sum(1 for r in negatives if r["predicted_has_event"])
 
     conf: dict[str, list[float]] = defaultdict(list)
@@ -97,6 +100,7 @@ def summarize(results: list[dict]) -> dict:
     return {
         "accuracy": (sum(r["passed"] for r in gated) / len(gated)) if gated else 0.0,
         "positive_recall": (sum(r["passed"] for r in positives) / len(positives)) if positives else 0.0,
+        "tentative_recall": (sum(r["passed"] for r in tentatives) / len(tentatives)) if tentatives else 0.0,
         "false_positive_rate": (fps / len(negatives)) if negatives else 0.0,
         "false_positives": fps,
         "n_total": len(results),
@@ -123,6 +127,7 @@ def print_report(results: list[dict], summary: dict, model: str) -> None:
         f"({summary['n_passed_gated']}/{summary['n_gated']})"
     )
     print(f"  positive recall:             {summary['positive_recall']:.0%}")
+    print(f"  tentative recall:            {summary['tentative_recall']:.0%}")
     print(
         f"  false-positive rate (neg):   {summary['false_positive_rate']:.0%} "
         f"({summary['false_positives']} hard-negative(s) produced an event)"
