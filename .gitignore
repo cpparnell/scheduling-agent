@@ -224,3 +224,5 @@ CLAUDE.md
 # Eval reports (generated, diffed locally)
 evals/reports/
 
+# Misc.
+NOTES.md

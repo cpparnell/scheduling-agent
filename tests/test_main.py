@@ -73,7 +73,7 @@ def test_happy_path_creates_event_records_and_advances_timestamp(
     assert call["title"] == "Dinner"
     assert call["calendar_name"] == "Work"
     # Dedup hash recorded (chat_id 1 from the fixture).
-    assert state.is_duplicate(1, "2026-06-13", "Dinner") is True
+    assert state.is_duplicate(1, "2026-06-13", "19:00", "Dinner") is True
     # Timestamp advanced to the newest message seen.
     assert state.get_last_timestamp() == newest_apple
 
@@ -84,12 +84,12 @@ def test_low_confidence_event_is_skipped(one_chat_db, fake_anthropic, spy_create
     main.process_new_messages(_cfg(confidence_threshold=0.85))
 
     assert spy_create_event["calls"] == []
-    assert state.is_duplicate(1, "2026-06-13", "Dinner") is False
+    assert state.is_duplicate(1, "2026-06-13", "19:00", "Dinner") is False
 
 
 def test_duplicate_event_is_skipped(one_chat_db, fake_anthropic, spy_create_event):
     # Pre-seed the dedup hash for chat 1.
-    state.record_event(1, "2026-06-13", "Dinner")
+    state.record_event(1, "2026-06-13", "19:00", "Dinner")
     fake_anthropic([_event()])
 
     main.process_new_messages(_cfg())
@@ -105,7 +105,22 @@ def test_failed_create_does_not_record_hash(one_chat_db, fake_anthropic, spy_cre
 
     assert len(spy_create_event["calls"]) == 1
     # Not recorded -> will be retried on the next run.
-    assert state.is_duplicate(1, "2026-06-13", "Dinner") is False
+    assert state.is_duplicate(1, "2026-06-13", "19:00", "Dinner") is False
+
+
+def test_same_time_different_title_is_duplicate(
+    one_chat_db, fake_anthropic, spy_create_event
+):
+    # Simulate the first event already having been created (e.g. from a prior run).
+    state.record_event(1, "2026-06-13", "17:30", "Pizza at Dicey's")
+
+    # The detector now returns a differently-described event at the exact same time.
+    fake_anthropic([_event(title="Drinks", time_start="17:30")])
+
+    main.process_new_messages(_cfg())
+
+    # Must be suppressed — same chat/date/time is the same real-world event.
+    assert spy_create_event["calls"] == []
 
 
 def test_no_threads_does_nothing(fake_chat_db, fake_anthropic, spy_create_event):

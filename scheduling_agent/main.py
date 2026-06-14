@@ -47,22 +47,23 @@ def process_new_messages(cfg: dict) -> None:
         chat_id = event["chat_id"]
         title = event["title"]
         date = event["date"]
+        time_start = event.get("time_start")
 
-        if state.is_duplicate(chat_id, date, title):
+        if state.is_duplicate(chat_id, date, time_start, title):
             logger.info("Skipping duplicate event: %s on %s", title, date)
             continue
 
         created = calendar.create_event(
             title=title,
             date_str=date,
-            time_start=event.get("time_start"),
+            time_start=time_start,
             duration_minutes=event.get("duration_minutes"),
             location=event.get("location"),
             calendar_name=cfg["target_calendar"],
         )
 
         if created:
-            state.record_event(chat_id, date, title)
+            state.record_event(chat_id, date, time_start, title)
             print(f"  ✓ Created: {title} on {date}")
         else:
             logger.error("Failed to create calendar event: %s", title)
