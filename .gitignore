@@ -216,3 +216,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Claude
+.claude
+CLAUDE.md
+
+# Eval reports (generated, diffed locally)
+evals/reports/
+
+# Misc.
+NOTES.md
