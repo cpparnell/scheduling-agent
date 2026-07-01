@@ -56,12 +56,9 @@ def _decode_attributed_body(data: bytes | None) -> str | None:
         return None
 
 
-<<<<<<< HEAD
 CONTEXT_WINDOW = 30  # prior messages to prepend per thread for context
 
 
-=======
->>>>>>> origin
 def get_threads_since(last_apple_ts: int | None, lookback_days: int, blocked: list[str]) -> list[dict]:
     if last_apple_ts is None:
         cutoff = unix_to_apple(time.time() - lookback_days * 86400)
@@ -92,15 +89,11 @@ def get_threads_since(last_apple_ts: int | None, lookback_days: int, blocked: li
             JOIN chat c ON cmj.chat_id = c.ROWID
             LEFT JOIN handle h ON m.handle_id = h.ROWID
             WHERE m.date > ?
-<<<<<<< HEAD
               AND (
                 (m.text IS NOT NULL AND m.text != '')
                 OR m.attributedBody IS NOT NULL
                 OR COALESCE(m.associated_message_type, 0) BETWEEN 2000 AND 2005
               )
-=======
-              AND ((m.text IS NOT NULL AND m.text != '') OR m.attributedBody IS NOT NULL)
->>>>>>> origin
             ORDER BY c.ROWID, m.date ASC
         """, (cutoff,))
 
@@ -123,11 +116,7 @@ def get_threads_since(last_apple_ts: int | None, lookback_days: int, blocked: li
     blocked_set = set(blocked)
     threads: dict[int, dict] = {}
 
-<<<<<<< HEAD
     for chat_id, msg_id, text, attributed_body, sender, from_me, apple_ts, tapback_type in rows:
-=======
-    for chat_id, msg_id, text, attributed_body, sender, from_me, apple_ts in rows:
->>>>>>> origin
         participants = participants_by_chat.get(chat_id, [])
         if any(p in blocked_set for p in participants):
             continue
@@ -135,11 +124,8 @@ def get_threads_since(last_apple_ts: int | None, lookback_days: int, blocked: li
         if not text:
             text = _decode_attributed_body(attributed_body)
         if not text:
-<<<<<<< HEAD
             text = TAPBACK_LABELS.get(tapback_type)
         if not text:
-=======
->>>>>>> origin
             continue
 
         if chat_id not in threads:

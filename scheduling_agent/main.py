@@ -65,7 +65,6 @@ def process_new_messages(cfg: dict) -> None:
         title = event["title"]
         date = event["date"]
         time_start = event.get("time_start")
-<<<<<<< HEAD
         location = event.get("location")
         confidence = event["confidence"]
         status = event.get("status", "confirmed")
@@ -101,11 +100,6 @@ def process_new_messages(cfg: dict) -> None:
         if state.is_duplicate(chat_id, date, time_start, title):
             logger.info("Skipping duplicate: %s on %s", title, date)
             skipped_count += 1
-=======
-
-        if state.is_duplicate(chat_id, date, time_start, title):
-            logger.info("Skipping duplicate event: %s on %s", title, date)
->>>>>>> origin
             continue
 
         created = calendar.create_event(
@@ -122,7 +116,6 @@ def process_new_messages(cfg: dict) -> None:
 
         if created:
             state.record_event(chat_id, date, time_start, title)
-<<<<<<< HEAD
             time_str = f" at {time_start}" if time_start else ""
             loc_str = f" @ {location}" if location else ""
             logger.info(
@@ -135,9 +128,6 @@ def process_new_messages(cfg: dict) -> None:
                 confidence,
             )
             created_count += 1
-=======
-            print(f"  ✓ Created: {title} on {date}")
->>>>>>> origin
         else:
             logger.error("Failed to create calendar event: %s", title)
 

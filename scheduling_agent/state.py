@@ -73,7 +73,6 @@ def get_last_timestamp() -> int | None:
     return _load().get("last_processed_timestamp")
 
 
-<<<<<<< HEAD
 def _normalize_title(title: str) -> str:
     """Lowercase, strip punctuation and leading month names for title dedup."""
     t = title.lower()
@@ -90,13 +89,6 @@ def _title_key(chat_id: int, title: str) -> str:
 # The dedup key uses time_start when a time is present, falling back to a
 # normalized title otherwise. See _migrate() for how pre-versioning state files
 # (which used a title-only key) are handled on upgrade.
-=======
-# MIGRATION NOTE: as of this version the dedup key uses time_start instead of
-# title when a time is present. Existing state.json hashes (keyed on title) will
-# not match the new formula, so events within lookback_days may be re-created
-# once on the first run after upgrading. Delete ~/.scheduling-agent/state.json
-# to reset cleanly.
->>>>>>> origin
 def event_hash(chat_id: int, date: str, time_start: str | None, title: str) -> str:
     if time_start is not None:
         key = f"{chat_id}|{date}|{time_start}"
@@ -108,7 +100,6 @@ def event_hash(chat_id: int, date: str, time_start: str | None, title: str) -> s
 def is_duplicate(chat_id: int, date: str, time_start: str | None, title: str) -> bool:
     data = _load()
     h = event_hash(chat_id, date, time_start, title)
-<<<<<<< HEAD
     if h in data.get("created_events", []):
         return True
 
@@ -130,20 +121,11 @@ def is_duplicate(chat_id: int, date: str, time_start: str | None, title: str) ->
 def record_event(chat_id: int, date: str, time_start: str | None, title: str) -> None:
     """Record a created event's dedup hash and title key. Timestamp advancement
     is handled separately by update_timestamp()."""
-=======
-    return h in data.get("created_events", [])
-
-
-def record_event(chat_id: int, date: str, time_start: str | None, title: str) -> None:
-    """Record a created event's dedup hash. Timestamp advancement is handled
-    separately by update_timestamp()."""
->>>>>>> origin
     data = _load()
     h = event_hash(chat_id, date, time_start, title)
     created = set(data.get("created_events", []))
     created.add(h)
     data["created_events"] = list(created)
-<<<<<<< HEAD
 
     key = _title_key(chat_id, title)
     title_events = data.setdefault("title_events", {})
@@ -152,8 +134,6 @@ def record_event(chat_id: int, date: str, time_start: str | None, title: str) ->
     if not existing or date > existing:
         title_events[key] = date
 
-=======
->>>>>>> origin
     _save(data)
 
 

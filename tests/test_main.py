@@ -16,7 +16,6 @@ def _cfg(**overrides):
     return cfg
 
 
-<<<<<<< HEAD
 FUTURE_DATE = "2099-01-15"
 
 
@@ -26,22 +25,12 @@ def _event(**overrides):
         "status": "confirmed",
         "title": "Dinner",
         "date": FUTURE_DATE,
-=======
-def _event(**overrides):
-    base = {
-        "has_event": True,
-        "title": "Dinner",
-        "date": "2026-06-13",
->>>>>>> origin
         "time_start": "19:00",
         "duration_minutes": 60,
         "location": None,
         "confidence": 0.95,
-<<<<<<< HEAD
         "recurrence": None,
         "end_date": None,
-=======
->>>>>>> origin
     }
     base.update(overrides)
     return base
@@ -60,15 +49,12 @@ def spy_create_event(monkeypatch):
     return state_
 
 
-<<<<<<< HEAD
 def _tentative_cfg(**overrides):
     cfg = _cfg(**overrides)
     cfg["tentative_confidence_threshold"] = 0.6
     return cfg
 
 
-=======
->>>>>>> origin
 @pytest.fixture
 def one_chat_db(fake_chat_db):
     """A single chat (chat_id == 1) with one recent message; returns the newest
@@ -99,11 +85,7 @@ def test_happy_path_creates_event_records_and_advances_timestamp(
     assert call["title"] == "Dinner"
     assert call["calendar_name"] == "Work"
     # Dedup hash recorded (chat_id 1 from the fixture).
-<<<<<<< HEAD
     assert state.is_duplicate(1, FUTURE_DATE, "19:00", "Dinner") is True
-=======
-    assert state.is_duplicate(1, "2026-06-13", "19:00", "Dinner") is True
->>>>>>> origin
     # Timestamp advanced to the newest message seen.
     assert state.get_last_timestamp() == newest_apple
 
@@ -114,20 +96,12 @@ def test_low_confidence_event_is_skipped(one_chat_db, fake_anthropic, spy_create
     main.process_new_messages(_cfg(confidence_threshold=0.85))
 
     assert spy_create_event["calls"] == []
-<<<<<<< HEAD
     assert state.is_duplicate(1, FUTURE_DATE, "19:00", "Dinner") is False
-=======
-    assert state.is_duplicate(1, "2026-06-13", "19:00", "Dinner") is False
->>>>>>> origin
 
 
 def test_duplicate_event_is_skipped(one_chat_db, fake_anthropic, spy_create_event):
     # Pre-seed the dedup hash for chat 1.
-<<<<<<< HEAD
     state.record_event(1, FUTURE_DATE, "19:00", "Dinner")
-=======
-    state.record_event(1, "2026-06-13", "19:00", "Dinner")
->>>>>>> origin
     fake_anthropic([_event()])
 
     main.process_new_messages(_cfg())
@@ -143,22 +117,14 @@ def test_failed_create_does_not_record_hash(one_chat_db, fake_anthropic, spy_cre
 
     assert len(spy_create_event["calls"]) == 1
     # Not recorded -> will be retried on the next run.
-<<<<<<< HEAD
     assert state.is_duplicate(1, FUTURE_DATE, "19:00", "Dinner") is False
-=======
-    assert state.is_duplicate(1, "2026-06-13", "19:00", "Dinner") is False
->>>>>>> origin
 
 
 def test_same_time_different_title_is_duplicate(
     one_chat_db, fake_anthropic, spy_create_event
 ):
     # Simulate the first event already having been created (e.g. from a prior run).
-<<<<<<< HEAD
     state.record_event(1, FUTURE_DATE, "17:30", "Pizza at Dicey's")
-=======
-    state.record_event(1, "2026-06-13", "17:30", "Pizza at Dicey's")
->>>>>>> origin
 
     # The detector now returns a differently-described event at the exact same time.
     fake_anthropic([_event(title="Drinks", time_start="17:30")])
@@ -176,7 +142,6 @@ def test_no_threads_does_nothing(fake_chat_db, fake_anthropic, spy_create_event)
 
     assert spy_create_event["calls"] == []
     assert state.get_last_timestamp() is None
-<<<<<<< HEAD
 
 
 def test_tentative_event_created_for_unanswered_invite(
@@ -219,5 +184,3 @@ def test_today_event_is_not_skipped(one_chat_db, fake_anthropic, spy_create_even
 
     assert len(spy_create_event["calls"]) == 1
     assert state.is_duplicate(1, FUTURE_DATE, "19:00", "Dinner") is False
-=======
->>>>>>> origin

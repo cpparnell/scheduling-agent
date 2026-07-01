@@ -1,8 +1,5 @@
-<<<<<<< HEAD
 import json
 
-=======
->>>>>>> origin
 from scheduling_agent import state
 
 
@@ -71,7 +68,6 @@ def test_update_timestamp_is_monotonic():
 def test_fresh_state_defaults():
     assert state.get_last_timestamp() is None
     assert state.is_duplicate(1, "2026-06-13", None, "Anything") is False
-<<<<<<< HEAD
 
 
 def test_fresh_state_file_is_stamped_with_current_version():
@@ -135,5 +131,3 @@ def test_migrate_is_noop_for_current_version():
         "created_events": ["x"],
     }
     assert state._migrate(dict(data)) == data
-=======
->>>>>>> origin
