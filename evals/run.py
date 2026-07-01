@@ -23,7 +23,7 @@ from scheduling_agent import detector
 
 REPORTS_DIR = Path(__file__).parent / "reports"
 
-_GOT_FIELDS = ("title", "date", "time_start", "location", "confidence", "status")
+_GOT_FIELDS = ("title", "date", "time_start", "location", "confidence", "status", "recurrence", "end_date")
 
 
 def score_case(case: dict, model: str) -> dict:
@@ -60,6 +60,10 @@ def score_case(case: dict, model: str) -> dict:
                 failures.append(
                     f"location {got.get('location')!r} missing any of {expected['location_contains_any']}"
                 )
+        if "recurrence" in expected and got.get("recurrence") != expected["recurrence"]:
+            failures.append(f"recurrence {got.get('recurrence')!r} != {expected['recurrence']!r}")
+        if "end_date" in expected and got.get("end_date") != expected["end_date"]:
+            failures.append(f"end_date {got.get('end_date')!r} != {expected['end_date']!r}")
 
     return {
         "id": case["id"],

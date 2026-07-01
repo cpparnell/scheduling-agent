@@ -1,6 +1,8 @@
 import json
-import os
+import logging
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 CONFIG_DIR = Path.home() / ".scheduling-agent"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -19,6 +21,13 @@ def load() -> dict:
     if not CONFIG_FILE.exists():
         CONFIG_FILE.write_text(json.dumps(DEFAULTS, indent=2))
         return dict(DEFAULTS)
-    with open(CONFIG_FILE) as f:
-        data = json.load(f)
+    try:
+        with open(CONFIG_FILE) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        logger.error("Could not read %s (%s); using defaults", CONFIG_FILE, e)
+        return dict(DEFAULTS)
+    if not isinstance(data, dict):
+        logger.error("%s is not a JSON object; using defaults", CONFIG_FILE)
+        return dict(DEFAULTS)
     return {**DEFAULTS, **data}

@@ -21,7 +21,8 @@ CREATE TABLE message (
     attributedBody BLOB,
     handle_id INTEGER,
     date INTEGER,
-    is_from_me INTEGER
+    is_from_me INTEGER,
+    associated_message_type INTEGER DEFAULT 0
 );
 CREATE TABLE chat_message_join (chat_id INTEGER, message_id INTEGER);
 CREATE TABLE chat_handle_join (chat_id INTEGER, handle_id INTEGER);
@@ -114,10 +115,12 @@ def build_chat_db(path, chats: list[dict]):
                 else:
                     blob = None
 
+                tapback_type = msg.get("tapback", 0)
+
                 cur.execute(
                     "INSERT INTO message "
-                    "(ROWID, text, attributedBody, handle_id, date, is_from_me) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    "(ROWID, text, attributedBody, handle_id, date, is_from_me, associated_message_type) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (
                         msg_rowid,
                         text,
@@ -125,6 +128,7 @@ def build_chat_db(path, chats: list[dict]):
                         handle_id,
                         reader.unix_to_apple(msg["unix_ts"]),
                         1 if from_me else 0,
+                        tapback_type,
                     ),
                 )
                 cur.execute(

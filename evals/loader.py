@@ -82,6 +82,9 @@ def materialize_case(case: dict, today: date | None = None, now: float | None = 
         expected["date"] = (today + timedelta(days=offset)).isoformat()
     if expected.pop("date_offset_saturday", False):
         expected["date"] = (today + timedelta(days=_days_until_saturday(today))).isoformat()
+    if "end_date_offset_days" in expected:
+        offset = expected.pop("end_date_offset_days")
+        expected["end_date"] = (today + timedelta(days=offset)).isoformat()
 
     return thread, expected
 
