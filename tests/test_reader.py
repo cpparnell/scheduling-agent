@@ -99,7 +99,15 @@ def test_last_apple_ts_cutoff_excludes_older(fake_chat_db):
     threads = reader.get_threads_since(cutoff, lookback_days=7, blocked=[])
 
     assert len(threads) == 1
+<<<<<<< HEAD
+    # The new message must be present; the old message may also appear as
+    # context (prepended by _prepend_context), but "new" must be last.
+    msgs = [m["text"] for m in threads[0]["messages"]]
+    assert "new" in msgs
+    assert msgs.index("new") > msgs.index("old")
+=======
     assert [m["text"] for m in threads[0]["messages"]] == ["new"]
+>>>>>>> origin
 
 
 def test_lookback_days_fallback_when_no_timestamp(fake_chat_db):
@@ -169,3 +177,56 @@ def test_multi_chat_grouping_and_latest_ts(fake_chat_db):
 def test_apple_unix_round_trip(unix_ts):
     apple = reader.unix_to_apple(unix_ts)
     assert reader.apple_to_unix(apple) == pytest.approx(unix_ts, abs=1e-3)
+<<<<<<< HEAD
+
+
+def test_tapback_null_text_synthesizes_label(fake_chat_db):
+    fake_chat_db([
+        {
+            "participants": ["+15551234567"],
+            "messages": [
+                {"text": "dinner friday at 7?", "from_me": True, "unix_ts": _recent(2)},
+                {"tapback": 2000, "from_me": False, "unix_ts": _recent(1)},
+            ],
+        }
+    ])
+
+    threads = reader.get_threads_since(None, lookback_days=7, blocked=[])
+
+    assert len(threads) == 1
+    texts = [m["text"] for m in threads[0]["messages"]]
+    assert texts[0] == "dinner friday at 7?"
+    assert "Loved" in texts[1]
+
+
+def test_tapback_disliked_synthesizes_label(fake_chat_db):
+    fake_chat_db([
+        {
+            "participants": ["+15551234567"],
+            "messages": [
+                {"tapback": 2002, "from_me": False, "unix_ts": _recent(1)},
+            ],
+        }
+    ])
+
+    threads = reader.get_threads_since(None, lookback_days=7, blocked=[])
+
+    assert "Disliked" in threads[0]["messages"][0]["text"]
+
+
+def test_tapback_with_existing_text_uses_text_column(fake_chat_db):
+    fake_chat_db([
+        {
+            "participants": ["+15551234567"],
+            "messages": [
+                # Modern macOS writes "Loved '...'" directly into text column alongside the tapback type
+                {"text": "Loved \"dinner friday at 7?\"", "tapback": 2000, "from_me": False, "unix_ts": _recent(1)},
+            ],
+        }
+    ])
+
+    threads = reader.get_threads_since(None, lookback_days=7, blocked=[])
+
+    assert threads[0]["messages"][0]["text"] == 'Loved "dinner friday at 7?"'
+=======
+>>>>>>> origin

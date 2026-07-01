@@ -71,3 +71,38 @@ def test_none_duration_defaults_to_60_minutes(capture_osascript):
 def test_location_omitted_when_none(capture_osascript):
     calendar.create_event("Dinner", "2026-06-13", "19:00", 60, None)
     assert "location:" not in capture_osascript["script"]
+<<<<<<< HEAD
+
+
+def test_weekly_recurrence_sets_rrule(capture_osascript):
+    calendar.create_event("Standup", "2026-06-13", "10:00", 30, None, recurrence="weekly")
+    script = capture_osascript["script"]
+    assert 'set recurrence of newEvent to "FREQ=WEEKLY;INTERVAL=1"' in script
+
+
+def test_biweekly_recurrence_sets_rrule(capture_osascript):
+    calendar.create_event("Standup", "2026-06-13", "10:00", 30, None, recurrence="biweekly")
+    script = capture_osascript["script"]
+    assert 'set recurrence of newEvent to "FREQ=WEEKLY;INTERVAL=2"' in script
+
+
+def test_no_recurrence_omits_rrule_line(capture_osascript):
+    calendar.create_event("Dinner", "2026-06-13", "19:00", 60, None, recurrence=None)
+    assert "recurrence" not in capture_osascript["script"]
+
+
+def test_end_date_overrides_duration_based_end(capture_osascript):
+    calendar.create_event("NYC Trip", "2026-06-13", None, 60, None, end_date="2026-06-16")
+    script = capture_osascript["script"]
+    # Start: June 13 at noon; end: June 16 at noon (same time, end_date day)
+    assert 'date "June 13, 2026 at 12:00:00 PM"' in script
+    assert 'date "June 16, 2026 at 12:00:00 PM"' in script
+
+
+def test_end_date_with_time_start(capture_osascript):
+    calendar.create_event("Conference", "2026-06-10", "09:00", 60, None, end_date="2026-06-12")
+    script = capture_osascript["script"]
+    assert 'date "June 10, 2026 at 09:00:00 AM"' in script
+    assert 'date "June 12, 2026 at 09:00:00 AM"' in script
+=======
+>>>>>>> origin

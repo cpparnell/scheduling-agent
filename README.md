@@ -88,7 +88,7 @@ AppleScript event assembly. All on-disk state is redirected to a temp directory,
 so your real `~/.scheduling-agent` is never touched.
 
 **Detection eval** — measures the Claude detector against a golden dataset of
-~20 synthetic threads (confirmed plans plus hard negatives like vague or
+synthetic threads (confirmed plans plus hard negatives like vague or
 cancelled invites). This calls the real model, so it needs `ANTHROPIC_API_KEY`
 and costs roughly $0.05 per run.
 

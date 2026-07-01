@@ -4,6 +4,13 @@ from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
+_RRULE = {
+    "daily": "FREQ=DAILY;INTERVAL=1",
+    "weekly": "FREQ=WEEKLY;INTERVAL=1",
+    "biweekly": "FREQ=WEEKLY;INTERVAL=2",
+    "monthly": "FREQ=MONTHLY;INTERVAL=1",
+}
+
 
 def _applescript_date(dt: datetime) -> str:
     """Convert a Python datetime to an AppleScript date literal."""
@@ -17,24 +24,28 @@ def create_event(
     duration_minutes: int | None,
     location: str | None,
     calendar_name: str = "Calendar",
+    tentative: bool = False,
+    recurrence: str | None = None,
+    end_date: str | None = None,
 ) -> bool:
     """
     Create an Apple Calendar event via osascript.
     Returns True on success, False on failure.
     """
     try:
-        if time_start:
-            start_dt = datetime.strptime(f"{date_str} {time_start}", "%Y-%m-%d %H:%M")
-        else:
-            # All-day: use noon so it doesn't bleed into adjacent days
-            start_dt = datetime.strptime(f"{date_str} 12:00", "%Y-%m-%d %H:%M")
+        time_part = time_start or "12:00"
+        start_dt = datetime.strptime(f"{date_str} {time_part}", "%Y-%m-%d %H:%M")
 
-        end_dt = start_dt + timedelta(minutes=duration_minutes or 60)
+        if end_date:
+            end_dt = datetime.strptime(f"{end_date} {time_part}", "%Y-%m-%d %H:%M")
+        else:
+            end_dt = start_dt + timedelta(minutes=duration_minutes or 60)
 
         start_str = _applescript_date(start_dt)
         end_str = _applescript_date(end_dt)
 
-        safe_title = title.replace('"', '\\"')
+        display_title = f"(Tentative) {title}" if tentative else title
+        safe_title = display_title.replace('"', '\\"')
         safe_calendar = calendar_name.replace('"', '\\"')
 
         props = f'{{summary:"{safe_title}", start date:date "{start_str}", end date:date "{end_str}"'
@@ -43,10 +54,14 @@ def create_event(
             props += f', location:"{safe_location}"'
         props += "}"
 
+        recurrence_line = ""
+        if recurrence and recurrence in _RRULE:
+            recurrence_line = f'\n    set recurrence of newEvent to "{_RRULE[recurrence]}"'
+
         script = f"""
 tell application "Calendar"
     set targetCalendar to first calendar whose name is "{safe_calendar}"
-    make new event at targetCalendar with properties {props}
+    set newEvent to make new event at targetCalendar with properties {props}{recurrence_line}
 end tell
 """
 

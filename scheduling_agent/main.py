@@ -2,20 +2,42 @@ import logging
 import signal
 import sys
 import time
+from datetime import datetime
+from pathlib import Path
 
 from . import calendar, config, detector, reader, state, watcher
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    datefmt="%H:%M:%S",
-)
+LOGS_DIR = Path(__file__).parent.parent / "logs"
+
 logger = logging.getLogger(__name__)
+
+
+def setup_logging() -> None:
+    LOGS_DIR.mkdir(exist_ok=True)
+    log_file = LOGS_DIR / f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
+
+    fmt = "%(asctime)s %(levelname)-8s %(name)s: %(message)s"
+    datefmt = "%H:%M:%S"
+    formatter = logging.Formatter(fmt, datefmt)
+
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+
+    console = logging.StreamHandler()
+    console.setFormatter(formatter)
+    root.addHandler(console)
+
+    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    root.addHandler(file_handler)
+
+    logger.info("Logging to %s", log_file)
 
 
 def process_new_messages(cfg: dict) -> None:
     last_ts = state.get_last_timestamp()
-    logger.info("Checking for new messages (last_ts=%s)", last_ts)
+    logger.info("─" * 60)
+    logger.info("Polling for new messages (last_ts=%s)", last_ts)
 
     try:
         threads = reader.get_threads_since(
@@ -35,22 +57,55 @@ def process_new_messages(cfg: dict) -> None:
 
     events = detector.detect_plans(threads)
 
-    for event in events:
-        if event["confidence"] < cfg["confidence_threshold"]:
-            logger.info(
-                "Skipping low-confidence event (%.2f): %s",
-                event["confidence"],
-                event["title"],
-            )
-            continue
+    created_count = 0
+    skipped_count = 0
 
+    for event in events:
         chat_id = event["chat_id"]
         title = event["title"]
         date = event["date"]
         time_start = event.get("time_start")
+<<<<<<< HEAD
+        location = event.get("location")
+        confidence = event["confidence"]
+        status = event.get("status", "confirmed")
+        is_tentative = status == "tentative"
+
+        threshold = (
+            cfg["tentative_confidence_threshold"] if is_tentative
+            else cfg["confidence_threshold"]
+        )
+        if confidence < threshold:
+            logger.info(
+                "Skipping low-confidence %s event (%.2f < %.2f): %s",
+                status,
+                confidence,
+                threshold,
+                title,
+            )
+            skipped_count += 1
+            continue
+
+        try:
+            event_date = datetime.strptime(date, "%Y-%m-%d").date()
+        except ValueError:
+            logger.warning("Skipping event with unparseable date %r: %s", date, title)
+            skipped_count += 1
+            continue
+
+        if event_date < datetime.now().date():
+            logger.info("Skipping past event: %s on %s", title, date)
+            skipped_count += 1
+            continue
+
+        if state.is_duplicate(chat_id, date, time_start, title):
+            logger.info("Skipping duplicate: %s on %s", title, date)
+            skipped_count += 1
+=======
 
         if state.is_duplicate(chat_id, date, time_start, title):
             logger.info("Skipping duplicate event: %s on %s", title, date)
+>>>>>>> origin
             continue
 
         created = calendar.create_event(
@@ -58,15 +113,40 @@ def process_new_messages(cfg: dict) -> None:
             date_str=date,
             time_start=time_start,
             duration_minutes=event.get("duration_minutes"),
-            location=event.get("location"),
+            location=location,
             calendar_name=cfg["target_calendar"],
+            tentative=is_tentative,
+            recurrence=event.get("recurrence"),
+            end_date=event.get("end_date"),
         )
 
         if created:
             state.record_event(chat_id, date, time_start, title)
+<<<<<<< HEAD
+            time_str = f" at {time_start}" if time_start else ""
+            loc_str = f" @ {location}" if location else ""
+            logger.info(
+                "Created %s event: %s — %s%s%s (confidence %.2f)",
+                status,
+                title,
+                date,
+                time_str,
+                loc_str,
+                confidence,
+            )
+            created_count += 1
+=======
             print(f"  ✓ Created: {title} on {date}")
+>>>>>>> origin
         else:
             logger.error("Failed to create calendar event: %s", title)
+
+    logger.info(
+        "Done — %d created, %d skipped, %d threads processed",
+        created_count,
+        skipped_count,
+        len(threads),
+    )
 
     # Update the last-processed timestamp to the newest message we saw
     if threads:
@@ -75,6 +155,7 @@ def process_new_messages(cfg: dict) -> None:
 
 
 def main() -> None:
+    setup_logging()
     cfg = config.load()
     logger.info("Scheduling agent starting (calendar=%s)", cfg["target_calendar"])
 

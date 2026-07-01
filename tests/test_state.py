@@ -1,3 +1,8 @@
+<<<<<<< HEAD
+import json
+
+=======
+>>>>>>> origin
 from scheduling_agent import state
 
 
@@ -66,3 +71,69 @@ def test_update_timestamp_is_monotonic():
 def test_fresh_state_defaults():
     assert state.get_last_timestamp() is None
     assert state.is_duplicate(1, "2026-06-13", None, "Anything") is False
+<<<<<<< HEAD
+
+
+def test_fresh_state_file_is_stamped_with_current_version():
+    # Writing anything materializes the file at the current schema version.
+    state.update_timestamp(123)
+    data = json.loads(state.STATE_FILE.read_text())
+    assert data["schema_version"] == state.CURRENT_SCHEMA_VERSION
+
+
+def test_pre_versioning_state_migrates_and_persists_on_load():
+    # Simulate a v0 file (no schema_version) written by an older build.
+    state.STATE_DIR.mkdir(exist_ok=True)
+    legacy = {"last_processed_timestamp": 999, "created_events": ["abc123"]}
+    state.STATE_FILE.write_text(json.dumps(legacy))
+
+    # Reading it migrates in memory and preserves existing data.
+    assert state.get_last_timestamp() == 999
+    assert "abc123" in state._load()["created_events"]
+
+    # The upgrade is persisted to disk so later reads are clean.
+    on_disk = json.loads(state.STATE_FILE.read_text())
+    assert on_disk["schema_version"] == state.CURRENT_SCHEMA_VERSION
+    assert on_disk["last_processed_timestamp"] == 999
+    assert on_disk["created_events"] == ["abc123"]
+
+
+def test_normalize_title_strips_month_names():
+    # Month prefix stripped so "July Munch at Sinha" == "Munch at Sinha"
+    assert state._normalize_title("July Munch at Sinha") == state._normalize_title("Munch at Sinha")
+    assert state._normalize_title("August Munch at Sinha") == state._normalize_title("Munch at Sinha")
+
+
+def test_title_dedup_blocks_same_title_within_window():
+    state.record_event(300, "2026-07-09", "14:00", "July Munch at Sinha")
+    # Different date but within 28 days, title normalizes to the same key → duplicate
+    assert state.is_duplicate(300, "2026-07-16", "14:00", "Munch at Sinha") is True
+
+
+def test_title_dedup_allows_same_title_outside_window():
+    state.record_event(300, "2026-07-09", "14:00", "July Munch at Sinha")
+    # 35 days later → outside the 28-day window → new occurrence allowed
+    assert state.is_duplicate(300, "2026-08-13", "14:00", "August Munch at Sinha") is False
+
+
+def test_title_dedup_isolated_by_chat():
+    state.record_event(300, "2026-07-09", "14:00", "Munch at Sinha")
+    # Same title and date range but different chat → not a duplicate
+    assert state.is_duplicate(999, "2026-07-16", "14:00", "Munch at Sinha") is False
+
+
+def test_title_dedup_matches_across_month_prefix_variants():
+    state.record_event(300, "2026-07-09", "14:00", "July Munch at Sinha")
+    # "August Munch" strips to same key as "July Munch"; close date → blocked
+    assert state.is_duplicate(300, "2026-07-16", "14:00", "August Munch at Sinha") is True
+
+
+def test_migrate_is_noop_for_current_version():
+    data = {
+        "schema_version": state.CURRENT_SCHEMA_VERSION,
+        "last_processed_timestamp": 5,
+        "created_events": ["x"],
+    }
+    assert state._migrate(dict(data)) == data
+=======
+>>>>>>> origin
