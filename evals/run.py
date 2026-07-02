@@ -14,6 +14,7 @@ Usage:
 
 import argparse
 import json
+import sys
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -21,7 +22,8 @@ from pathlib import Path
 from evals import loader
 from scheduling_agent import detector
 
-REPORTS_DIR = Path(__file__).parent / "reports"
+LOGS_DIR = Path(__file__).parent.parent / "logs"
+REPORTS_DIR = LOGS_DIR / "evals"
 
 _GOT_FIELDS = ("title", "date", "time_start", "location", "confidence", "status", "recurrence", "end_date")
 
@@ -141,12 +143,35 @@ def print_report(results: list[dict], summary: dict, model: str) -> None:
         print(f"  known failures (tracked):    {', '.join(summary['known_failures'])}")
 
 
-def write_report(results: list[dict], summary: dict, model: str) -> Path:
-    REPORTS_DIR.mkdir(exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+def write_report(results: list[dict], summary: dict, model: str, ts: str) -> Path:
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     path = REPORTS_DIR / f"{ts}_{model.replace('/', '_')}.json"
     path.write_text(json.dumps({"model": model, "summary": summary, "results": results}, indent=2))
     return path
+
+
+class _Tee:
+    """Mirrors writes to stdout into a log file for the duration of the run."""
+
+    def __init__(self, log_file):
+        self._log_file = log_file
+        self._real_stdout = None
+
+    def __enter__(self) -> "_Tee":
+        self._real_stdout = sys.stdout
+        sys.stdout = self
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        sys.stdout = self._real_stdout
+
+    def write(self, data: str) -> None:
+        self._real_stdout.write(data)
+        self._log_file.write(data)
+
+    def flush(self) -> None:
+        self._real_stdout.flush()
+        self._log_file.flush()
 
 
 def main() -> None:
@@ -164,11 +189,17 @@ def main() -> None:
         print("No cases matched.")
         return
 
-    results = run(cases, model=args.model, judge=args.judge)
-    summary = summarize(results)
-    print_report(results, summary, args.model)
-    path = write_report(results, summary, args.model)
-    print(f"\n  report: {path}")
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    stdout_path = REPORTS_DIR / f"{ts}_{args.model.replace('/', '_')}.log"
+
+    with stdout_path.open("w") as log_file, _Tee(log_file):
+        results = run(cases, model=args.model, judge=args.judge)
+        summary = summarize(results)
+        print_report(results, summary, args.model)
+        path = write_report(results, summary, args.model, ts)
+        print(f"\n  report: {path}")
+        print(f"  stdout log: {stdout_path}")
 
 
 if __name__ == "__main__":

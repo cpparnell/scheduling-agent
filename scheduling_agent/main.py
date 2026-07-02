@@ -7,13 +7,13 @@ from pathlib import Path
 
 from . import calendar, config, detector, reader, state, watcher
 
-LOGS_DIR = Path(__file__).parent.parent / "logs"
+LOGS_DIR = Path(__file__).parent.parent / "logs" / "stdout"
 
 logger = logging.getLogger(__name__)
 
 
 def setup_logging() -> None:
-    LOGS_DIR.mkdir(exist_ok=True)
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
     log_file = LOGS_DIR / f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
 
     fmt = "%(asctime)s %(levelname)-8s %(name)s: %(message)s"
