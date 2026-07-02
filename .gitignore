@@ -221,8 +221,11 @@ __marimo__/
 .claude
 CLAUDE.md
 
-# Eval reports (generated, diffed locally)
-evals/reports/
+# Eval run logs (generated, diffed locally)
+logs/evals/*
+!logs/evals/.gitkeep
+logs/stdout/*
+!logs/stdout/.gitkeep
 
 # Misc.
 NOTES.md
