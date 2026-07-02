@@ -24,7 +24,6 @@ from scheduling_agent import detector
 
 LOGS_DIR = Path(__file__).parent.parent / "logs"
 REPORTS_DIR = LOGS_DIR / "evals"
-STDOUT_DIR = LOGS_DIR / "stdout"
 
 _GOT_FIELDS = ("title", "date", "time_start", "location", "confidence", "status", "recurrence", "end_date")
 
@@ -191,8 +190,8 @@ def main() -> None:
         return
 
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    STDOUT_DIR.mkdir(parents=True, exist_ok=True)
-    stdout_path = STDOUT_DIR / f"{ts}_{args.model.replace('/', '_')}.log"
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    stdout_path = REPORTS_DIR / f"{ts}_{args.model.replace('/', '_')}.log"
 
     with stdout_path.open("w") as log_file, _Tee(log_file):
         results = run(cases, model=args.model, judge=args.judge)
