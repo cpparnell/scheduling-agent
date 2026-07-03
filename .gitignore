@@ -222,7 +222,8 @@ __marimo__/
 CLAUDE.md
 
 # Eval reports (generated, diffed locally)
-evals/reports/
+logs/*
 
 # Misc.
 NOTES.md
+PLAN.md
