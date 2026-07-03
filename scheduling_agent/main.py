@@ -5,7 +5,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from . import calendar, config, detector, reader, state, watcher
+from . import calendar, config, dedup, detector, reader, state, watcher
 
 LOGS_DIR = Path(__file__).parent.parent / "logs" / "stdout"
 
@@ -55,7 +55,7 @@ def process_new_messages(cfg: dict) -> None:
 
     logger.info("Found %d thread(s) with new messages", len(threads))
 
-    events = detector.detect_plans(threads)
+    events, failed_chats = detector.detect_plans(threads)
 
     created_count = 0
     skipped_count = 0
@@ -65,9 +65,11 @@ def process_new_messages(cfg: dict) -> None:
         title = event["title"]
         date = event["date"]
         time_start = event.get("time_start")
+        time_confidence = event.get("time_confidence") or 0
         location = event.get("location")
         confidence = event["confidence"]
         status = event.get("status", "confirmed")
+        evidence = event.get("evidence")
         is_tentative = status == "tentative"
 
         threshold = (
@@ -97,12 +99,47 @@ def process_new_messages(cfg: dict) -> None:
             skipped_count += 1
             continue
 
+        if time_start is not None and time_confidence < cfg["time_confidence_threshold"]:
+            logger.info(
+                "Demoting to all-day (time_confidence %.2f < %.2f): %s",
+                time_confidence,
+                cfg["time_confidence_threshold"],
+                title,
+            )
+            time_start = None
+
         if state.is_duplicate(chat_id, date, time_start, title):
             logger.info("Skipping duplicate: %s on %s", title, date)
             skipped_count += 1
             continue
 
-        created = calendar.create_event(
+        if cfg["dedup_enabled"]:
+            candidates = dedup.find_candidates(
+                {"date": date, "_hash": state.event_hash(chat_id, date, time_start, title)},
+                state.get_events_near(date, cfg["dedup_day_window"]),
+                day_window=cfg["dedup_day_window"],
+            )
+            if candidates:
+                event_for_adjudication = {**event, "date": date, "time_start": time_start}
+                verdict = dedup.adjudicate(event_for_adjudication, candidates, model=cfg["dedup_model"])
+                if verdict is None and not cfg["dedup_fail_open"]:
+                    logger.warning("Skipping event after adjudicator failure (fail-closed): %s", title)
+                    skipped_count += 1
+                    continue
+                if verdict and verdict.get("is_duplicate"):
+                    logger.info(
+                        "LLM dedup: '%s' on %s duplicates an existing event — %s",
+                        title, date, verdict.get("reasoning"),
+                    )
+                    state.record_event(
+                        chat_id, date, time_start, title,
+                        location=location, status=status, evidence=evidence,
+                        suppressed=True,
+                    )
+                    skipped_count += 1
+                    continue
+
+        uid = calendar.create_event(
             title=title,
             date_str=date,
             time_start=time_start,
@@ -114,9 +151,13 @@ def process_new_messages(cfg: dict) -> None:
             end_date=event.get("end_date"),
         )
 
-        if created:
-            state.record_event(chat_id, date, time_start, title)
-            time_str = f" at {time_start}" if time_start else ""
+        if uid is not None:
+            state.record_event(
+                chat_id, date, time_start, title,
+                location=location, status=status, evidence=evidence,
+                calendar_uid=uid,
+            )
+            time_str = f" at {time_start}" if time_start else " (all-day)"
             loc_str = f" @ {location}" if location else ""
             logger.info(
                 "Created %s event: %s — %s%s%s (confidence %.2f)",
@@ -138,10 +179,31 @@ def process_new_messages(cfg: dict) -> None:
         len(threads),
     )
 
-    # Update the last-processed timestamp to the newest message we saw
+    # Update the last-processed timestamp to the newest message we saw, unless
+    # some thread's detection failed — hold the watermark so it's retried next
+    # poll, up to a bounded number of retries to avoid looping on a poison thread.
     if threads:
         newest_ts = max(t["latest_apple_ts"] for t in threads)
-        state.update_timestamp(newest_ts)
+        if not failed_chats:
+            state.update_timestamp(newest_ts)
+            state.set_watermark_hold(None, 0)
+        else:
+            hold = state.get_watermark_hold()
+            same_position = hold.get("ts") == last_ts
+            count = (hold.get("count", 0) + 1) if same_position else 1
+            if count >= cfg["max_watermark_retries"]:
+                logger.error(
+                    "Giving up on failed thread(s) %s after %d retries; advancing watermark anyway",
+                    failed_chats, count,
+                )
+                state.update_timestamp(newest_ts)
+                state.set_watermark_hold(None, 0)
+            else:
+                logger.warning(
+                    "Holding watermark for failed thread(s) %s (retry %d/%d)",
+                    failed_chats, count, cfg["max_watermark_retries"],
+                )
+                state.set_watermark_hold(last_ts, count)
 
 
 def main() -> None:

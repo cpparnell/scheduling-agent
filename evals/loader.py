@@ -2,15 +2,21 @@
 the real ``today`` at runtime, so fixtures never go stale.
 
 Placeholders in message text:
-  {day+N}    -> "Weekday, Month D" of today+N  (e.g. "Tuesday, June 17")
-  {date+N}   -> "Month D" of today+N           (e.g. "June 13")
-  {saturday} -> "Saturday" (next Saturday from today)
-  {tomorrow} -> "tomorrow"
-  {tonight}  -> "tonight"
+  {day+N}     -> "Weekday, Month D" of today+N  (e.g. "Tuesday, June 17")
+  {date+N}    -> "Month D" of today+N           (e.g. "June 13")
+  {saturday}  -> "Saturday" (next Saturday from today)
+  {monday}, {tuesday}, ... -> next occurrence of that weekday's name, never today
+                               (use this instead of {day+N} whenever the message text
+                               also names a literal weekday, e.g. "every Monday" — a
+                               fixed N-day offset will only coincidentally land on the
+                               right weekday, silently making the case flaky)
+  {tomorrow}  -> "tomorrow"
+  {tonight}   -> "tonight"
 
 Expectation fields:
-  date_offset_days: N       ->  resolved to concrete "YYYY-MM-DD" (today+N)
-  date_offset_saturday: true -> resolved to next Saturday's "YYYY-MM-DD"
+  date_offset_days: N            ->  resolved to concrete "YYYY-MM-DD" (today+N)
+  date_offset_saturday: true     ->  resolved to next Saturday's "YYYY-MM-DD"
+  date_offset_weekday: "monday"  ->  resolved to next occurrence of that weekday
 """
 
 import json
@@ -23,10 +29,18 @@ GOLDEN_PATH = Path(__file__).parent / "golden.jsonl"
 
 _PLACEHOLDER = re.compile(r"\{([^}]+)\}")
 
+_WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+
+
+def _days_until_weekday(today: date, weekday_name: str) -> int:
+    """Days from today until the next occurrence of weekday_name (never 0 —
+    always at least 1, i.e. "next Monday" said today never means today)."""
+    target = _WEEKDAYS.index(weekday_name.lower())
+    return (target - today.weekday()) % 7 or 7
+
 
 def _days_until_saturday(today: date) -> int:
-    """Days from today until the next Saturday (never 0 — always at least 1)."""
-    return (5 - today.weekday()) % 7 or 7
+    return _days_until_weekday(today, "saturday")
 
 
 def _substitute(text: str, today: date) -> str:
@@ -34,8 +48,8 @@ def _substitute(text: str, today: date) -> str:
         token = m.group(1)
         if token in ("tomorrow", "tonight"):
             return token
-        if token == "saturday":
-            return (today + timedelta(days=_days_until_saturday(today))).strftime("%A")
+        if token.lower() in _WEEKDAYS:
+            return (today + timedelta(days=_days_until_weekday(today, token))).strftime("%A")
         rel = re.fullmatch(r"(day|date)\+(\d+)", token)
         if rel:
             kind, n = rel.group(1), int(rel.group(2))
@@ -76,17 +90,26 @@ def materialize_case(case: dict, today: date | None = None, now: float | None = 
         "messages": messages,
     }
 
-    expected = dict(case["expected"])
+    expected = _resolve_offsets(dict(case["expected"]), today)
+    if "events" in expected:
+        expected["events"] = [_resolve_offsets(dict(e), today) for e in expected["events"]]
+
+    return thread, expected
+
+
+def _resolve_offsets(expected: dict, today: date) -> dict:
     if "date_offset_days" in expected:
         offset = expected.pop("date_offset_days")
         expected["date"] = (today + timedelta(days=offset)).isoformat()
     if expected.pop("date_offset_saturday", False):
         expected["date"] = (today + timedelta(days=_days_until_saturday(today))).isoformat()
+    if "date_offset_weekday" in expected:
+        weekday_name = expected.pop("date_offset_weekday")
+        expected["date"] = (today + timedelta(days=_days_until_weekday(today, weekday_name))).isoformat()
     if "end_date_offset_days" in expected:
         offset = expected.pop("end_date_offset_days")
         expected["end_date"] = (today + timedelta(days=offset)).isoformat()
-
-    return thread, expected
+    return expected
 
 
 def load_golden(path: Path = GOLDEN_PATH) -> list[dict]:

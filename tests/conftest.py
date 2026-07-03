@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from scheduling_agent import config, detector, reader, state
+from scheduling_agent import config, dedup, detector, reader, state
 from tests.fixtures import chatdb
 
 
@@ -73,6 +73,18 @@ def fake_anthropic(monkeypatch):
     def install(payloads):
         client = FakeClient(payloads)
         monkeypatch.setattr(detector, "_client", client)
+        return client
+
+    return install
+
+
+@pytest.fixture
+def fake_dedup_anthropic(monkeypatch):
+    """Same FakeClient pattern as fake_anthropic, but wired into dedup._client
+    so detector and adjudicator calls can be scripted independently."""
+    def install(payloads):
+        client = FakeClient(payloads)
+        monkeypatch.setattr(dedup, "_client", client)
         return client
 
     return install

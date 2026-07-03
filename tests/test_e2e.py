@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from scheduling_agent import calendar, main, reader, state
+from scheduling_agent import calendar, config, main, reader, state
 
 
 @pytest.fixture
@@ -22,7 +22,7 @@ def spy_osascript(monkeypatch):
 
     def fake_run(args, **kwargs):
         calls.append(args)
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return SimpleNamespace(returncode=0, stdout="FAKE-EVENT-UID", stderr="")
 
     monkeypatch.setattr(calendar.subprocess, "run", fake_run)
     return calls
@@ -35,6 +35,12 @@ def _cfg(**overrides):
         "confidence_threshold": 0.85,
         "tentative_confidence_threshold": 0.6,
         "target_calendar": "Work",
+        "time_confidence_threshold": config.DEFAULTS["time_confidence_threshold"],
+        "dedup_enabled": False,
+        "dedup_model": config.DEFAULTS["dedup_model"],
+        "dedup_day_window": config.DEFAULTS["dedup_day_window"],
+        "dedup_fail_open": config.DEFAULTS["dedup_fail_open"],
+        "max_watermark_retries": config.DEFAULTS["max_watermark_retries"],
     }
     cfg.update(overrides)
     return cfg
@@ -42,16 +48,19 @@ def _cfg(**overrides):
 
 def _event():
     return {
-        "has_event": True,
-        "status": "confirmed",
-        "title": "Dinner at Lucia's",
-        "date": "2099-01-15",
-        "time_start": "19:00",
-        "duration_minutes": 90,
-        "location": "Lucia's",
-        "confidence": 0.95,
-        "recurrence": None,
-        "end_date": None,
+        "events": [{
+            "status": "confirmed",
+            "title": "Dinner at Lucia's",
+            "date": "2099-01-15",
+            "time_start": "19:00",
+            "time_confidence": 0.95,
+            "duration_minutes": 90,
+            "location": "Lucia's",
+            "confidence": 0.95,
+            "recurrence": None,
+            "end_date": None,
+            "evidence": "yes! 7pm",
+        }]
     }
 
 
