@@ -259,12 +259,22 @@ def print_report(results: list[dict], summary: dict, model: str, dedup_results: 
     print(f"  mean confidence by category: {summary['mean_confidence_by_category']}")
     if summary["known_failures"]:
         print(f"  known failures (tracked):    {', '.join(summary['known_failures'])}")
+    if dedup_results is not None:
+        print(f"\n  dedup accuracy:               {summary['dedup_accuracy']:.0%}")
+        if summary["dedup_same_missed"]:
+            print(f"  dedup 'same' missed:          {', '.join(summary['dedup_same_missed'])}")
 
 
-def write_report(results: list[dict], summary: dict, model: str, run_dir: Path) -> Path:
+def write_report(
+    results: list[dict], summary: dict, model: str, run_dir: Path,
+    dedup_results: list[dict] | None = None,
+) -> Path:
     run_dir.mkdir(parents=True, exist_ok=True)
     path = run_dir / "report.json"
-    path.write_text(json.dumps({"model": model, "summary": summary, "results": results}, indent=2))
+    report = {"model": model, "summary": summary, "results": results}
+    if dedup_results is not None:
+        report["dedup_results"] = dedup_results
+    path.write_text(json.dumps(report, indent=2))
     return path
 
 
@@ -315,9 +325,11 @@ def main() -> None:
 
     with stdout_path.open("w") as log_file, _Tee(log_file):
         results = run(cases, model=args.model, judge=args.judge)
-        summary = summarize(results)
-        print_report(results, summary, args.model)
-        path = write_report(results, summary, args.model, run_dir)
+        results_by_id = {r["id"]: r for r in results}
+        dedup_results = score_dedup_pairs(cases, results_by_id, model=args.dedup_model)
+        summary = summarize(results, dedup_results)
+        print_report(results, summary, args.model, dedup_results)
+        path = write_report(results, summary, args.model, run_dir, dedup_results)
         print(f"\n  report: {path}")
         print(f"  stdout log: {stdout_path}")
 
