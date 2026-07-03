@@ -81,6 +81,9 @@ There are two tiers:
 pytest
 ```
 
+These run in CI on every push and pull request against `main` (see
+`.github/workflows/tests.yml`), and must pass before a PR can be merged.
+
 These cover the deterministic plumbing: the chat.db reader and `attributedBody`
 decoding (run against a temporary SQLite fixture database), detector parsing and
 filtering (with the Anthropic client stubbed out), the dedup/state logic, and
