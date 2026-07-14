@@ -12,18 +12,29 @@ DEFAULTS = {
     "target_calendar": "Calendar",
     "lookback_days": 7,
     "confidence_threshold": 0.85,
-    "tentative_confidence_threshold": 0.6,
     # Only keep a specific time_start when the detector's time_confidence
     # meets this bar; otherwise the event is demoted to all-day.
     "time_confidence_threshold": 0.9,
-    # LLM-adjudicated dedup: before creating an event, check nearby existing
-    # events (see dedup.py) and skip if the adjudicator judges it a duplicate.
+    # LLM-adjudicated dedup: the last reconciliation layer (see reconcile.py)
+    # for detections the deterministic layers couldn't match.
     "dedup_enabled": True,
     "dedup_model": "claude-haiku-4-5",
     "dedup_day_window": 1,
     # If the adjudicator call itself fails, create the event rather than risk
     # silently dropping a real plan (a visible duplicate is easy to fix).
     "dedup_fail_open": True,
+    # Include events read back from the target calendar as reconciliation
+    # candidates (catches manually created events and lost state).
+    "calendar_query_enabled": True,
+    # Minimum normalized-title token overlap for the deterministic fuzzy
+    # reconciliation layer to declare a match without consulting the LLM.
+    "fuzzy_title_threshold": 0.6,
+    # Drop detected events whose quoted evidence isn't found verbatim in the
+    # thread (hallucination guard). Disable to log-and-keep instead.
+    "evidence_gate_enabled": True,
+    # Allow reconciliation matches to update the existing calendar event
+    # (reschedules, added locations). Disable to treat updates as skips.
+    "reconcile_update_enabled": True,
     # How many consecutive polls to hold the watermark back for a thread that
     # keeps failing detection, before giving up and advancing past it anyway.
     "max_watermark_retries": 3,

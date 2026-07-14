@@ -16,6 +16,10 @@ def _cfg(**overrides):
         "dedup_model": config.DEFAULTS["dedup_model"],
         "dedup_day_window": config.DEFAULTS["dedup_day_window"],
         "dedup_fail_open": config.DEFAULTS["dedup_fail_open"],
+        "calendar_query_enabled": False,
+        "fuzzy_title_threshold": config.DEFAULTS["fuzzy_title_threshold"],
+        "evidence_gate_enabled": True,
+        "reconcile_update_enabled": True,
         "max_watermark_retries": config.DEFAULTS["max_watermark_retries"],
     }
     cfg.update(overrides)
@@ -63,10 +67,17 @@ def spy_create_event(monkeypatch):
     return state_
 
 
-def _tentative_cfg(**overrides):
-    cfg = _cfg(**overrides)
-    cfg["tentative_confidence_threshold"] = 0.6
-    return cfg
+@pytest.fixture
+def spy_update_event(monkeypatch):
+    """Replace calendar.update_event with a spy returning a configurable bool."""
+    state_ = {"calls": [], "return_value": True}
+
+    def fake(uid, **kwargs):
+        state_["calls"].append({"uid": uid, **kwargs})
+        return state_["return_value"]
+
+    monkeypatch.setattr(calendar, "update_event", fake)
+    return state_
 
 
 @pytest.fixture
@@ -158,24 +169,70 @@ def test_no_threads_does_nothing(fake_chat_db, fake_anthropic, spy_create_event)
     assert state.get_last_timestamp() is None
 
 
-def test_tentative_event_created_for_unanswered_invite(
+def test_tentative_event_created_when_user_hedged(
     one_chat_db, fake_anthropic, spy_create_event
 ):
-    fake_anthropic([_response(_event(status="tentative", confidence=0.7))])
+    # Tentative is a high-confidence classification (the user said "maybe"),
+    # judged against the single confidence threshold.
+    fake_anthropic([_response(_event(status="tentative", confidence=0.95))])
 
-    main.process_new_messages(_tentative_cfg())
+    main.process_new_messages(_cfg())
 
     assert len(spy_create_event["calls"]) == 1
     assert spy_create_event["calls"][0]["tentative"] is True
     assert state.is_duplicate(1, FUTURE_DATE, "19:00", "Dinner") is True
 
 
-def test_tentative_below_threshold_is_skipped(
+def test_tentative_uses_single_confidence_threshold(
     one_chat_db, fake_anthropic, spy_create_event
 ):
-    fake_anthropic([_response(_event(status="tentative", confidence=0.4))])
+    # The old 0.6 tentative threshold is gone: a 0.7 tentative event is now
+    # below the one 0.85 bar and must be skipped.
+    fake_anthropic([_response(_event(status="tentative", confidence=0.7))])
 
-    main.process_new_messages(_tentative_cfg())
+    main.process_new_messages(_cfg())
+
+    assert spy_create_event["calls"] == []
+
+
+def test_unanswered_invitation_is_skipped_and_not_recorded(
+    one_chat_db, fake_anthropic, spy_create_event
+):
+    fake_anthropic([_response(_event(status="unanswered", confidence=0.95))])
+
+    main.process_new_messages(_cfg())
+
+    assert spy_create_event["calls"] == []
+    # Not recorded: a later acceptance must be able to create it.
+    assert state.is_duplicate(1, FUTURE_DATE, "19:00", "Dinner") is False
+
+
+def test_non_participant_event_is_skipped_silently(
+    one_chat_db, fake_anthropic, spy_create_event, caplog
+):
+    fake_anthropic([_response(_event(
+        user_is_participant=False,
+        participation_evidence="The friend is going to the lake house, not the user",
+    ))])
+
+    with caplog.at_level("INFO"):
+        main.process_new_messages(_cfg())
+
+    assert spy_create_event["calls"] == []
+    assert state.is_duplicate(1, FUTURE_DATE, "19:00", "Dinner") is False
+    assert "Skipping non-participant plan" in caplog.text
+
+
+def test_non_participant_gate_beats_confirmed_status(
+    one_chat_db, fake_anthropic, spy_create_event
+):
+    # Even a fully confirmed, high-confidence plan is skipped when the user
+    # isn't part of it.
+    fake_anthropic([_response(_event(
+        status="confirmed", confidence=1.0, user_is_participant=False,
+    ))])
+
+    main.process_new_messages(_cfg())
 
     assert spy_create_event["calls"] == []
 
@@ -256,8 +313,9 @@ def test_two_events_from_one_thread_both_created(one_chat_db, fake_anthropic, sp
 def test_dedup_adjudicator_duplicate_suppresses_creation(
     one_chat_db, fake_anthropic, fake_dedup_anthropic, spy_create_event
 ):
-    # A pre-existing event on a nearby day, described differently.
-    state.record_event(1, "2099-01-14", "19:00", "Dinner with Sam", status="confirmed")
+    # The same plan already recorded from a DIFFERENT chat, described
+    # differently — only the LLM layer can match it.
+    state.record_event(2, FUTURE_DATE, "19:00", "Dinner with Sam", status="confirmed", confidence=0.95)
     fake_anthropic([_response(_event(title="Dinner w/ Samantha"))])
     fake_dedup_anthropic([{"is_duplicate": True, "duplicate_of": 0, "reasoning": "same plan reworded"}])
 
@@ -274,8 +332,8 @@ def test_dedup_adjudicator_records_duplicate_of_uid(
     one_chat_db, fake_anthropic, fake_dedup_anthropic, spy_create_event
 ):
     state.record_event(
-        1, "2099-01-14", "19:00", "Dinner with Sam",
-        status="confirmed", calendar_uid="uid-123",
+        2, FUTURE_DATE, "19:00", "Dinner with Sam",
+        status="confirmed", confidence=0.95, calendar_uid="uid-123",
     )
     fake_anthropic([_response(_event(title="Dinner w/ Samantha"))])
     fake_dedup_anthropic([{"is_duplicate": True, "duplicate_of": 0, "reasoning": "same plan reworded"}])
@@ -286,6 +344,70 @@ def test_dedup_adjudicator_records_duplicate_of_uid(
     suppressed = [e for e in events if e["title"] == "Dinner w/ Samantha"]
     assert len(suppressed) == 1
     assert suppressed[0]["duplicate_of_uid"] == "uid-123"
+
+
+def test_reconcile_match_with_time_drift_updates_calendar_event(
+    one_chat_db, fake_anthropic, spy_create_event, spy_update_event
+):
+    # Same plan re-detected from another chat at a slightly later time: the
+    # existing calendar event moves instead of a duplicate being created.
+    state.record_event(
+        2, FUTURE_DATE, "19:00", "Dinner",
+        status="confirmed", confidence=0.9, calendar_uid="uid-123",
+    )
+    fake_anthropic([_response(_event(time_start="19:30"))])
+
+    main.process_new_messages(_cfg())
+
+    assert spy_create_event["calls"] == []
+    assert len(spy_update_event["calls"]) == 1
+    call = spy_update_event["calls"][0]
+    assert call["uid"] == "uid-123"
+    assert call["time_start"] == "19:30"
+
+    record = next(e for e in state._load()["events"] if e["calendar_uid"] == "uid-123")
+    assert record["time_start"] == "19:30"
+    assert record["chat_ids"] == [2, 1]
+    assert len(record["revisions"]) == 1
+    assert state.get_pending_journal() == []
+
+
+def test_reconcile_update_disabled_treats_update_as_duplicate(
+    one_chat_db, fake_anthropic, spy_create_event, spy_update_event
+):
+    state.record_event(
+        2, FUTURE_DATE, "19:00", "Dinner",
+        status="confirmed", confidence=0.9, calendar_uid="uid-123",
+    )
+    fake_anthropic([_response(_event(time_start="19:30"))])
+
+    main.process_new_messages(_cfg(reconcile_update_enabled=False))
+
+    assert spy_create_event["calls"] == []
+    assert spy_update_event["calls"] == []
+    # Original record untouched; new wording recorded as suppressed.
+    record = next(e for e in state._load()["events"] if e["calendar_uid"] == "uid-123")
+    assert record["time_start"] == "19:00"
+    suppressed = [e for e in state._load()["events"] if e["suppressed"]]
+    assert len(suppressed) == 1
+    assert suppressed[0]["duplicate_of_uid"] == "uid-123"
+
+
+def test_failed_calendar_update_rolls_back_journal_and_state(
+    one_chat_db, fake_anthropic, spy_create_event, spy_update_event
+):
+    spy_update_event["return_value"] = False
+    state.record_event(
+        2, FUTURE_DATE, "19:00", "Dinner",
+        status="confirmed", confidence=0.9, calendar_uid="uid-123",
+    )
+    fake_anthropic([_response(_event(time_start="19:30"))])
+
+    main.process_new_messages(_cfg())
+
+    record = next(e for e in state._load()["events"] if e["calendar_uid"] == "uid-123")
+    assert record["time_start"] == "19:00"  # unchanged, will retry next detection
+    assert state.get_pending_journal() == []
 
 
 def test_dedup_adjudicator_out_of_range_duplicate_of_still_suppresses(
@@ -370,6 +492,84 @@ def test_dedup_no_nearby_candidates_never_calls_adjudicator(
 
     assert len(spy_create_event["calls"]) == 1
     assert client.messages.calls == []
+
+
+def test_crash_between_calendar_and_state_write_cannot_duplicate(
+    one_chat_db, fake_anthropic, spy_create_event, monkeypatch
+):
+    fake_anthropic([_response(_event())])
+    real_commit = state.journal_commit
+
+    def dying_commit(*args, **kwargs):
+        raise RuntimeError("simulated crash before state write")
+
+    monkeypatch.setattr(state, "journal_commit", dying_commit)
+    with pytest.raises(RuntimeError):
+        main.process_new_messages(_cfg())
+
+    # The calendar write happened but state never recorded it — the classic
+    # crash-duplicate window. The intent survives in the journal.
+    assert len(spy_create_event["calls"]) == 1
+    assert len(state.get_pending_journal()) == 1
+
+    # Restart and reprocess the same messages (the watermark never advanced):
+    # the pending journal entry must block a second calendar write.
+    monkeypatch.setattr(state, "journal_commit", real_commit)
+    main.process_new_messages(_cfg())
+
+    assert len(spy_create_event["calls"]) == 1
+
+
+def test_recover_journal_commits_when_event_found_on_calendar(monkeypatch):
+    record = state.make_record(1, FUTURE_DATE, "19:00", "Dinner", confidence=0.9)
+    state.journal_intent(record)
+    monkeypatch.setattr(
+        calendar, "get_events_near",
+        lambda *a, **k: [{"title": "Dinner", "date": FUTURE_DATE, "time_start": "19:00",
+                          "location": None, "calendar_uid": "UID-R", "source": "calendar"}],
+    )
+
+    main.recover_journal(_cfg(calendar_query_enabled=True))
+
+    assert state.get_pending_journal() == []
+    events = state._load()["events"]
+    assert len(events) == 1
+    assert events[0]["calendar_uid"] == "UID-R"
+
+
+def test_recover_journal_drops_create_missing_from_calendar(monkeypatch):
+    record = state.make_record(1, FUTURE_DATE, "19:00", "Dinner", confidence=0.9)
+    state.journal_intent(record)
+    monkeypatch.setattr(calendar, "get_events_near", lambda *a, **k: [])
+
+    main.recover_journal(_cfg(calendar_query_enabled=True))
+
+    # The write never happened: entry dropped so re-detection recreates it.
+    assert state.get_pending_journal() == []
+    assert state._load()["events"] == []
+    assert state.is_duplicate(1, FUTURE_DATE, "19:00", "Dinner") is False
+
+
+def test_recover_journal_commits_without_uid_when_query_disabled():
+    record = state.make_record(1, FUTURE_DATE, "19:00", "Dinner", confidence=0.9)
+    state.journal_intent(record)
+
+    main.recover_journal(_cfg(calendar_query_enabled=False))
+
+    assert state.get_pending_journal() == []
+    events = state._load()["events"]
+    assert len(events) == 1
+    assert events[0]["calendar_uid"] is None
+    # Conservative: the plan stays deduplicated rather than risking a duplicate.
+    assert state.is_duplicate(1, FUTURE_DATE, "19:00", "Dinner") is True
+
+
+def test_recover_journal_drops_interrupted_update():
+    state.journal_intent({"canonical_id": "abc", "changes": {"time_start": "20:00"}}, op="update")
+
+    main.recover_journal(_cfg())
+
+    assert state.get_pending_journal() == []
 
 
 def test_watermark_held_when_thread_fails_then_advanced_after_retries(

@@ -30,8 +30,11 @@ same day, in different conversations.
 Judge by: whether the conversations/participants overlap, whether titles and
 locations describe the same activity, whether the times are identical or plausibly
 the same slot, and what the quoted evidence messages say. When genuinely uncertain,
-answer is_duplicate=false — an occasional duplicate on the calendar is safer than
-silently dropping a real plan.
+answer is_duplicate=true — a plan that reaches you was already detected once, and a
+missed duplicate spams the calendar and erodes trust, while a wrong "same" verdict
+merely merges the mention into the existing event. Only answer is_duplicate=false
+when the plans are clearly distinct activities (different purpose, different people,
+or explicitly separate arrangements).
 
 Respond with JSON only.
 """
