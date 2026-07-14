@@ -23,19 +23,47 @@ def _get_client() -> "anthropic.Anthropic":
 
 SYSTEM_PROMPT = """You are an assistant that analyzes iMessage conversation threads to identify scheduled plans.
 
+The messages labeled "Me" are from the user whose calendar these plans go on.
+
 A thread may contain zero, one, or several DISTINCT plans (e.g. "dinner then the game"
 is two plans). Return one entry in `events` for each distinct plan, and an empty
 `events` array when there are none. Never split a single plan into multiple entries,
 and never invent a plan that no message explicitly proposes.
 
-Plans fall into two categories — set `status` accordingly:
+**Participation — set `user_is_participant`**: true ONLY if the user ("Me") is
+personally expected to attend the plan: they proposed it, were invited to it, or
+clearly included themselves. People constantly text about plans that are NOT the
+user's — set `user_is_participant` to false for those, even when the plan itself is
+specific and confirmed. Examples of NON-participation:
+- A friend describing their own plans: "I'm going to Patty's lake house Saturday"
+- Someone else's event mentioned in passing: "my sister's wedding is in June"
+- A group chat where others arrange something and the user never engages or is
+  addressed ("you two have fun!")
+- The user explicitly declined but others are still going
+Set `participation_evidence` to one sentence citing the message that shows the user
+is (or is not) expected to attend. When in doubt whether "Me" is included, set
+`user_is_participant` to false — a wrong event on the user's calendar is worse than
+a missing one.
 
-**confirmed**: An explicit invitation with a specific date AND all responding parties have explicitly accepted.
-Acceptance includes: "yes!", "sounds good", "I'll be there", "see you then", "k", "I'm down", "sure", "why not", "!!", 👍, or similar clear agreement.
+Plans fall into three categories — set `status` accordingly:
+
+**confirmed**: An explicit invitation or proposal with a specific date, AND the user
+is attending with clear agreement: the user accepted an invitation, or the user
+proposed the plan and the others accepted. Acceptance includes: "yes!", "sounds good",
+"I'll be there", "see you then", "k", "I'm down", "sure", "why not", "!!", 👍, or similar clear agreement.
 Tapback reactions also count: "❤️ Loved your message" or "👍 Liked your message" or "‼️ Emphasized your message" in response to a scheduling message signals acceptance. "👎 Disliked your message" signals rejection.
+If the user clearly accepted, someone ELSE hedging ("I'll try to make it") does not
+make the plan tentative for the user — it is still confirmed.
 
-**tentative**: An explicit invitation with a specific date, but acceptance is incomplete or uncertain.
-This includes: no response yet, mixed responses (some yes, some maybe), "maybe", "I'll try", "hopefully", "we'll see", or any hedged/conditional reply from any party.
+**tentative**: The user was invited and the USER explicitly gave a hedged response:
+"maybe", "I'll try", "hopefully", "we'll see", "let me check", or similar. Also
+tentative: the user proposed the plan and every response so far is hedged. Tentative
+is NOT a lower-confidence guess — it is a definite invitation with a definite hedged
+answer. Judge it with the same confidence you would a confirmed plan.
+
+**unanswered**: An explicit invitation with a specific date that the user has not
+responded to at all (or a plan the user proposed that nobody has answered yet). Emit
+it with this status — do not guess it into tentative or confirmed.
 
 Do NOT emit a plan when:
 - No specific invitation exists ("we should hang out sometime")
@@ -101,8 +129,16 @@ EVENT_ITEM_SCHEMA = {
         },
         "status": {
             "type": "string",
-            "enum": ["confirmed", "tentative"],
-            "description": "confirmed if the user explicitly accepted; tentative if the invite exists but user hasn't clearly responded"
+            "enum": ["confirmed", "tentative", "unanswered"],
+            "description": "confirmed if the user is attending with clear agreement; tentative if the user explicitly hedged ('maybe', 'I'll try'); unanswered if the user has not responded to the invitation"
+        },
+        "user_is_participant": {
+            "type": "boolean",
+            "description": "true only if the user ('Me') is personally expected to attend this plan"
+        },
+        "participation_evidence": {
+            "type": "string",
+            "description": "One sentence citing the message that shows whether the user is expected to attend"
         },
         "recurrence": {
             "anyOf": [
@@ -122,7 +158,8 @@ EVENT_ITEM_SCHEMA = {
     },
     "required": [
         "title", "date", "time_start", "time_confidence", "duration_minutes",
-        "location", "confidence", "status", "recurrence", "end_date", "evidence",
+        "location", "confidence", "status", "user_is_participant",
+        "participation_evidence", "recurrence", "end_date", "evidence",
     ],
 }
 
@@ -166,7 +203,9 @@ def _evidence_found(evidence: str, thread: dict) -> bool:
     return _normalize_for_match(evidence) in haystack
 
 
-def detect_plans(threads: list[dict], model: str = MODEL) -> tuple[list[dict], set]:
+def detect_plans(
+    threads: list[dict], model: str = MODEL, evidence_gate: bool = True
+) -> tuple[list[dict], set]:
     """
     Analyze a list of conversation threads for plans.
 
@@ -174,6 +213,10 @@ def detect_plans(threads: list[dict], model: str = MODEL) -> tuple[list[dict], s
     all threads (a single thread may contribute zero, one, or several), and
     failed_chat_ids is the set of chat_ids whose API call errored or returned
     an unparseable response, so the caller can hold the watermark back.
+
+    When evidence_gate is true, an event whose quoted evidence cannot be found
+    verbatim in the thread is dropped (hallucination guard) instead of merely
+    logged.
     """
     results = []
     failed_chat_ids = set()
@@ -232,6 +275,12 @@ def detect_plans(threads: list[dict], model: str = MODEL) -> tuple[list[dict], s
                         "  -> Evidence not found verbatim in thread %s: %r",
                         thread["chat_id"], evidence,
                     )
+                    if evidence_gate:
+                        logger.warning(
+                            "  -> Dropping event with unverifiable evidence: %s",
+                            event.get("title"),
+                        )
+                        continue
 
                 logger.info(
                     "  -> Detected %s plan: %s on %s (confidence %.2f)",

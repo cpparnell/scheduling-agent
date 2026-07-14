@@ -29,7 +29,8 @@ REPORTS_DIR = LOGS_DIR / "evals"
 
 _GOT_FIELDS = (
     "title", "date", "time_start", "time_confidence", "location",
-    "confidence", "status", "recurrence", "end_date", "evidence",
+    "confidence", "status", "user_is_participant", "participation_evidence",
+    "recurrence", "end_date", "evidence",
 )
 
 
@@ -44,6 +45,10 @@ def _check_event_fields(expected: dict, got: dict) -> list[str]:
         failures.append(f"time_start {got.get('time_start')!r} != {expected['time_start']!r}")
     if "status" in expected and got.get("status") != expected["status"]:
         failures.append(f"status {got.get('status')!r} != {expected['status']!r}")
+    if "user_is_participant" in expected and got.get("user_is_participant") != expected["user_is_participant"]:
+        failures.append(
+            f"user_is_participant {got.get('user_is_participant')!r} != {expected['user_is_participant']!r}"
+        )
     if "title_contains_any" in expected:
         title = (got.get("title") or "").lower()
         if not any(s.lower() in title for s in expected["title_contains_any"]):

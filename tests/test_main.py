@@ -35,6 +35,8 @@ def _event(**overrides):
         "duration_minutes": 60,
         "location": None,
         "confidence": 0.95,
+        "user_is_participant": True,
+        "participation_evidence": "Me accepted the invitation",
         "recurrence": None,
         "end_date": None,
         "evidence": "yes 7pm",
@@ -241,7 +243,7 @@ def test_created_event_records_calendar_uid(one_chat_db, fake_anthropic, spy_cre
 def test_two_events_from_one_thread_both_created(one_chat_db, fake_anthropic, spy_create_event):
     fake_anthropic([_response(
         _event(title="Dinner", date=FUTURE_DATE),
-        _event(title="The Game", date="2099-01-16", evidence="game tomorrow?"),
+        _event(title="The Game", date="2099-01-16", evidence="dinner friday?"),
     )])
 
     main.process_new_messages(_cfg())

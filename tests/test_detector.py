@@ -27,6 +27,8 @@ def _event(**overrides):
         "location": None,
         "confidence": 0.95,
         "status": "confirmed",
+        "user_is_participant": True,
+        "participation_evidence": "Me accepted the invitation",
         "recurrence": None,
         "end_date": None,
         "evidence": "yes 7pm",
@@ -72,8 +74,12 @@ def test_multiple_events_in_one_thread(fake_anthropic):
         _event(title="Dinner", evidence="dinner friday?"),
         _event(title="The Game", date="2026-06-14", evidence="game saturday?"),
     )])
+    thread = _thread(chat_id=7, messages=[
+        {"sender": "+15551234567", "text": "dinner friday? and game saturday?", "from_me": False, "unix_ts": 1700000000.0},
+        {"sender": "me", "text": "yes to both", "from_me": True, "unix_ts": 1700000100.0},
+    ])
 
-    results, failed = detector.detect_plans([_thread(chat_id=7)])
+    results, failed = detector.detect_plans([thread])
 
     assert len(results) == 2
     titles = {r["title"] for r in results}
@@ -140,7 +146,9 @@ def test_message_missing_text_key_is_formatted_as_blank_not_a_crash(fake_anthrop
     thread = _thread(chat_id=1, messages=[
         {"sender": "+15551234567", "from_me": False, "unix_ts": 1700000000.0},
     ])
-    fake_anthropic([_response(_event())])
+    # evidence=None so the evidence gate can't trip on a text-less thread; this
+    # test is only about _format_thread not raising.
+    fake_anthropic([_response(_event(evidence=None))])
 
     results, failed = detector.detect_plans([thread])
 
@@ -167,14 +175,43 @@ def test_format_thread_failure_skips_thread_but_continues(fake_anthropic, monkey
     assert len(client.messages.calls) == 1
 
 
-def test_evidence_not_found_logs_warning_but_keeps_event(fake_anthropic, caplog):
+def test_evidence_not_found_drops_event_by_default(fake_anthropic, caplog):
     fake_anthropic([_response(_event(evidence="this text is nowhere in the thread"))])
 
     with caplog.at_level("WARNING"):
         results, failed = detector.detect_plans([_thread()])
 
-    assert len(results) == 1  # not dropped
+    assert results == []  # hallucination guard: unverifiable evidence drops the event
+    assert failed == set()  # a gated drop is not a thread failure
     assert any("Evidence not found verbatim" in r.message for r in caplog.records)
+
+
+def test_evidence_not_found_kept_when_gate_disabled(fake_anthropic, caplog):
+    fake_anthropic([_response(_event(evidence="this text is nowhere in the thread"))])
+
+    with caplog.at_level("WARNING"):
+        results, failed = detector.detect_plans([_thread()], evidence_gate=False)
+
+    assert len(results) == 1
+    assert any("Evidence not found verbatim" in r.message for r in caplog.records)
+
+
+def test_verbatim_evidence_passes_gate(fake_anthropic):
+    fake_anthropic([_response(_event(evidence="yes 7pm"))])
+
+    results, failed = detector.detect_plans([_thread()])
+
+    assert len(results) == 1
+
+
+def test_new_schema_fields_pass_through(fake_anthropic):
+    fake_anthropic([_response(_event(user_is_participant=False, status="unanswered"))])
+
+    results, failed = detector.detect_plans([_thread()])
+
+    assert len(results) == 1
+    assert results[0]["user_is_participant"] is False
+    assert results[0]["status"] == "unanswered"
 
 
 def test_format_thread_is_deterministic_with_injected_today():
