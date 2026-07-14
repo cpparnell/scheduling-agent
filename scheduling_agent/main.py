@@ -127,14 +127,27 @@ def process_new_messages(cfg: dict) -> None:
                     skipped_count += 1
                     continue
                 if verdict and verdict.get("is_duplicate"):
+                    duplicate_of = verdict.get("duplicate_of")
+                    matched = None
+                    if isinstance(duplicate_of, int) and 0 <= duplicate_of < len(candidates):
+                        matched = candidates[duplicate_of]
+                    else:
+                        logger.warning(
+                            "Adjudicator returned out-of-range duplicate_of=%r for %d candidates: %s",
+                            duplicate_of, len(candidates), title,
+                        )
                     logger.info(
-                        "LLM dedup: '%s' on %s duplicates an existing event — %s",
-                        title, date, verdict.get("reasoning"),
+                        "LLM dedup: '%s' on %s duplicates existing event %r (uid=%s) — %s",
+                        title, date,
+                        matched.get("title") if matched else None,
+                        matched.get("calendar_uid") if matched else None,
+                        verdict.get("reasoning"),
                     )
                     state.record_event(
                         chat_id, date, time_start, title,
                         location=location, status=status, evidence=evidence,
                         suppressed=True,
+                        duplicate_of_uid=matched.get("calendar_uid") if matched else None,
                     )
                     skipped_count += 1
                     continue

@@ -268,6 +268,45 @@ def test_dedup_adjudicator_duplicate_suppresses_creation(
     assert suppressed[0]["suppressed"] is True
 
 
+def test_dedup_adjudicator_records_duplicate_of_uid(
+    one_chat_db, fake_anthropic, fake_dedup_anthropic, spy_create_event
+):
+    state.record_event(
+        1, "2099-01-14", "19:00", "Dinner with Sam",
+        status="confirmed", calendar_uid="uid-123",
+    )
+    fake_anthropic([_response(_event(title="Dinner w/ Samantha"))])
+    fake_dedup_anthropic([{"is_duplicate": True, "duplicate_of": 0, "reasoning": "same plan reworded"}])
+
+    main.process_new_messages(_cfg(dedup_enabled=True))
+
+    events = state._load()["events"]
+    suppressed = [e for e in events if e["title"] == "Dinner w/ Samantha"]
+    assert len(suppressed) == 1
+    assert suppressed[0]["duplicate_of_uid"] == "uid-123"
+
+
+def test_dedup_adjudicator_out_of_range_duplicate_of_still_suppresses(
+    one_chat_db, fake_anthropic, fake_dedup_anthropic, spy_create_event, caplog
+):
+    state.record_event(
+        1, "2099-01-14", "19:00", "Dinner with Sam",
+        status="confirmed", calendar_uid="uid-123",
+    )
+    fake_anthropic([_response(_event(title="Dinner w/ Samantha"))])
+    fake_dedup_anthropic([{"is_duplicate": True, "duplicate_of": 7, "reasoning": "same plan reworded"}])
+
+    with caplog.at_level("WARNING"):
+        main.process_new_messages(_cfg(dedup_enabled=True))
+
+    assert spy_create_event["calls"] == []
+    events = state._load()["events"]
+    suppressed = [e for e in events if e["title"] == "Dinner w/ Samantha"]
+    assert len(suppressed) == 1
+    assert suppressed[0]["duplicate_of_uid"] is None
+    assert "out-of-range duplicate_of" in caplog.text
+
+
 def test_dedup_adjudicator_not_duplicate_creates_event(
     one_chat_db, fake_anthropic, fake_dedup_anthropic, spy_create_event
 ):

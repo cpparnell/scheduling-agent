@@ -145,6 +145,7 @@ def record_event(
     evidence: str | None = None,
     calendar_uid: str | None = None,
     suppressed: bool = False,
+    duplicate_of_uid: str | None = None,
 ) -> None:
     """Record a created event's dedup hash, title key, and descriptive record.
     Timestamp advancement is handled separately by update_timestamp()."""
@@ -174,6 +175,7 @@ def record_event(
         "calendar_uid": calendar_uid,
         "created_at": datetime.now().isoformat(),
         "suppressed": suppressed,
+        "duplicate_of_uid": duplicate_of_uid,
     })
     data["events"] = _prune_old_events(events)
 

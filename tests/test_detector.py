@@ -134,6 +134,39 @@ def test_api_error_skips_thread_but_continues(fake_anthropic):
     assert failed == {1}
 
 
+def test_message_missing_text_key_is_formatted_as_blank_not_a_crash(fake_anthropic):
+    # A message with no "text" key (e.g. an unsupported attachment-only
+    # message) must not raise a KeyError out of _format_thread.
+    thread = _thread(chat_id=1, messages=[
+        {"sender": "+15551234567", "from_me": False, "unix_ts": 1700000000.0},
+    ])
+    fake_anthropic([_response(_event())])
+
+    results, failed = detector.detect_plans([thread])
+
+    assert failed == set()
+    assert len(results) == 1
+
+
+def test_format_thread_failure_skips_thread_but_continues(fake_anthropic, monkeypatch):
+    # Simulate a malformed thread that blows up inside _format_thread itself
+    # (e.g. a non-numeric timestamp). Formatting now happens inside the
+    # per-thread try block, so this must fail in isolation rather than
+    # aborting the whole batch.
+    bad_thread = _thread(chat_id=1, messages=[
+        {"sender": "+15551234567", "text": "hi", "from_me": False, "unix_ts": "not-a-number"},
+    ])
+    client = fake_anthropic([_response(_event())])
+
+    results, failed = detector.detect_plans([bad_thread, _thread(chat_id=2)])
+
+    assert failed == {1}
+    assert len(results) == 1
+    assert results[0]["chat_id"] == 2
+    # Only the healthy second thread reached the API call.
+    assert len(client.messages.calls) == 1
+
+
 def test_evidence_not_found_logs_warning_but_keeps_event(fake_anthropic, caplog):
     fake_anthropic([_response(_event(evidence="this text is nowhere in the thread"))])
 

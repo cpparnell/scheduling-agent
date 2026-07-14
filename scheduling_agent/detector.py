@@ -151,7 +151,7 @@ def _format_thread(thread: dict, today: datetime | None = None) -> str:
         ts = sent_at.strftime("%m/%d %I:%M%p")
         age_days = (now.date() - sent_at.date()).days
         age_suffix = f", sent {age_days} day{'s' if age_days != 1 else ''} ago" if age_days >= 1 else ""
-        lines.append(f"{sender} ({ts}{age_suffix}): {msg['text']}")
+        lines.append(f"{sender} ({ts}{age_suffix}): {msg.get('text', '')}")
     return "\n".join(lines)
 
 
@@ -179,7 +179,6 @@ def detect_plans(threads: list[dict], model: str = MODEL) -> tuple[list[dict], s
     failed_chat_ids = set()
 
     for thread in threads:
-        formatted = _format_thread(thread)
         participants = ", ".join(thread.get("participants", ["unknown"]))
         n_msgs = len(thread.get("messages", []))
         logger.info(
@@ -191,6 +190,7 @@ def detect_plans(threads: list[dict], model: str = MODEL) -> tuple[list[dict], s
         )
 
         try:
+            formatted = _format_thread(thread)
             response = _get_client().messages.create(
                 model=model,
                 max_tokens=2048,
