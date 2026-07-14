@@ -181,6 +181,48 @@ def test_exact_duplicate_short_circuits():
     assert decision.source == "exact"
 
 
+def test_exact_match_still_applies_status_upgrade():
+    # Same chat/date/time (exact hash) but the plan moved tentative -> confirmed:
+    # the match must surface as an update, not a silent skip.
+    state.record_event(1, "2099-01-15", "19:00", "Dinner with Sam", status="tentative", confidence=0.9)
+
+    decision = reconcile.reconcile(_event(status="confirmed"), _cfg())
+
+    assert decision.action == "update"
+    assert decision.source == "exact"
+    assert decision.changes == {"status": "confirmed"}
+
+
+def test_exact_match_still_applies_new_location():
+    state.record_event(1, "2099-01-15", "19:00", "Dinner with Sam", status="confirmed", confidence=0.9)
+
+    decision = reconcile.reconcile(_event(location="Lucia's"), _cfg())
+
+    assert decision.action == "update"
+    assert decision.changes == {"location": "Lucia's"}
+
+
+def test_title_window_match_far_date_never_updates():
+    # Recurring-plan mention weeks out matches via the title window; it is a
+    # duplicate mention, not a reschedule — nothing may change.
+    state.record_event(1, "2099-01-01", "19:00", "Munch at Sinha", status="confirmed", confidence=0.9)
+
+    decision = reconcile.reconcile(
+        _event(date="2099-01-15", title="Munch at Sinha", time_start="20:00"), _cfg()
+    )
+
+    assert decision.action == "skip_duplicate"
+    assert decision.source == "exact"
+
+
+def test_slightly_lower_confidence_can_still_update():
+    # 0.9 vs stored 0.95 is confidence noise, not a weak detection.
+    decision = reconcile._disposition(
+        _event(confidence=0.9, time_start="20:00"), _record(confidence=0.95), "fuzzy", None
+    )
+    assert decision.action == "update"
+
+
 def test_no_candidates_creates():
     decision = reconcile.reconcile(_event(), _cfg())
     assert decision.action == "create"

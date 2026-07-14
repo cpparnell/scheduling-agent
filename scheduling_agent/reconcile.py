@@ -28,6 +28,10 @@ logger = logging.getLogger(__name__)
 # plausibly the same slot by the fuzzy layer (covers small reschedule drift).
 TIME_COMPAT_MINUTES = 120
 
+# A matched detection may update the stored record even when slightly less
+# confident than it; only a clearly weaker detection is blocked from updating.
+UPDATE_CONFIDENCE_TOLERANCE = 0.1
+
 
 @dataclass
 class Decision:
@@ -117,10 +121,15 @@ def _disposition(event: dict, matched: dict, source: str, reasoning: str | None)
     if matched.get("source") == "calendar" or "canonical_id" not in matched:
         return Decision("skip_duplicate", matched=matched, source=source, reasoning=reasoning)
 
-    # A weaker detection never overwrites a stronger record.
+    # A mention far from the stored date (e.g. a title-window match on a
+    # recurring plan weeks out) is a duplicate mention, not a reschedule.
+    if not _dates_within(event["date"], matched.get("date", ""), 1):
+        return Decision("skip_duplicate", matched=matched, source=source, reasoning=reasoning)
+
+    # A clearly weaker detection never overwrites a stronger record.
     stored_confidence = matched.get("confidence") or 0
     new_confidence = event.get("confidence") or 0
-    if new_confidence < stored_confidence:
+    if new_confidence + UPDATE_CONFIDENCE_TOLERANCE < stored_confidence:
         return Decision("skip_duplicate", matched=matched, source=source, reasoning=reasoning)
 
     changes: dict = {}
@@ -148,6 +157,11 @@ def reconcile(event: dict, cfg: dict) -> Decision:
     title = event["title"]
 
     if state.is_duplicate(chat_id, date, time_start, title):
+        # Fetch the matched record so material changes (reschedule, status
+        # upgrade, new location) can still flow through as updates.
+        matched = state.find_record(chat_id, date, time_start, title)
+        if matched is not None:
+            return _disposition(event, matched, "exact", "exact hash/title-window match")
         return Decision("skip_duplicate", source="exact", reasoning="exact hash/title-window match")
 
     candidates = _assemble_candidates(event, cfg)

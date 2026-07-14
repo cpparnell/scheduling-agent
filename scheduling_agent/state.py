@@ -173,6 +173,33 @@ def is_duplicate(chat_id: int, date: str, time_start: str | None, title: str) ->
     return False
 
 
+def find_record(chat_id: int, date: str, time_start: str | None, title: str) -> dict | None:
+    """The committed, non-suppressed canonical record matching this event's
+    dedup identity: exact hash first, then the per-chat title window. Lets the
+    reconciler apply material changes (reschedule, status upgrade) to a record
+    the exact dedup layer already matched."""
+    data = _load()
+    events = [r for r in data.get("events", []) if not r.get("suppressed")]
+
+    h = event_hash(chat_id, date, time_start, title)
+    for record in events:
+        if record.get("hash") == h:
+            return record
+
+    key = _title_key(chat_id, title)
+    for record in events:
+        if record.get("chat_id") != chat_id or _title_key(chat_id, record.get("title", "")) != key:
+            continue
+        try:
+            existing = date_type.fromisoformat(record["date"])
+            new = date_type.fromisoformat(date)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if abs((new - existing).days) < TITLE_DEDUP_WINDOW_DAYS:
+            return record
+    return None
+
+
 def make_record(
     chat_id: int,
     date: str,

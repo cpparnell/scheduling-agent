@@ -17,8 +17,9 @@ Usage:
 import argparse
 import json
 import sys
+import tempfile
 from collections import defaultdict
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 from evals import loader
@@ -95,11 +96,41 @@ def _score_multi_event(expected_events: list[dict], got_events: list[dict]) -> l
     return failures
 
 
+def _would_reach_calendar(event: dict) -> bool:
+    """Mirror the production ownership/status gates: an event only reaches the
+    calendar when the user participates and the invitation isn't unanswered."""
+    return bool(event.get("user_is_participant")) and event.get("status") != "unanswered"
+
+
 def score_case(case: dict, model: str) -> dict:
     thread, expected = loader.materialize_case(case)
     events, failed = detector.detect_plans([thread], model=model)
 
     failures: list[str] = []
+
+    if expected.get("no_calendar_event"):
+        # Bystander cases: the detector may either not emit the third-party
+        # plan at all, or emit it flagged so the participation/status gates
+        # stop it. Both are safe; an event that would reach the calendar fails.
+        leaks = [e for e in events if _would_reach_calendar(e)]
+        for e in leaks:
+            failures.append(
+                f"would reach calendar: {e.get('title')!r} on {e.get('date')} "
+                f"(user_is_participant={e.get('user_is_participant')}, status={e.get('status')!r})"
+            )
+        got = events[0] if events else None
+        return {
+            "id": case["id"],
+            "category": case.get("category", "bystander"),
+            "known_failure": case.get("known_failure", False),
+            "passed": not failures,
+            "predicted_has_event": bool(leaks),
+            "expected_has_event": False,
+            "got": None if got is None else {k: got.get(k) for k in _GOT_FIELDS},
+            "events": events,
+            "confidence": None if got is None else got.get("confidence"),
+            "failures": failures,
+        }
 
     if "events" in expected:
         predicted_has_event = len(events) > 0
@@ -193,7 +224,121 @@ def score_dedup_pairs(cases: list[dict], results_by_id: dict, model: str) -> lis
     return dedup_results
 
 
+class _FakeCalendar:
+    """In-memory stand-in for calendar.py used by the pipeline phase: records
+    creates/updates and serves get_events_near from what has been created, so
+    reconciliation's calendar-query layer works against it."""
+
+    def __init__(self):
+        self.events: dict[str, dict] = {}
+        self.creates = 0
+        self.updates = 0
+
+    def create_event(self, title, date_str, time_start, duration_minutes, location,
+                     calendar_name="Calendar", tentative=False, recurrence=None, end_date=None):
+        uid = f"uid-{self.creates}"
+        self.creates += 1
+        self.events[uid] = {
+            "title": title, "date": date_str, "time_start": time_start,
+            "location": location, "tentative": tentative,
+        }
+        return uid
+
+    def update_event(self, uid, title, date_str, time_start, duration_minutes, location,
+                     calendar_name="Calendar", tentative=False, end_date=None):
+        self.updates += 1
+        if uid not in self.events:
+            return False
+        self.events[uid].update({
+            "title": title, "date": date_str, "time_start": time_start,
+            "location": location, "tentative": tentative,
+        })
+        return True
+
+    def get_events_near(self, date_str, window_days=1, calendar_name="Calendar"):
+        try:
+            target = date.fromisoformat(date_str)
+        except ValueError:
+            return []
+        out = []
+        for uid, e in self.events.items():
+            try:
+                if abs((date.fromisoformat(e["date"]) - target).days) <= window_days:
+                    out.append({**e, "calendar_uid": uid, "source": "calendar"})
+            except ValueError:
+                continue
+        return out
+
+
+def score_pipeline_case(case: dict, model: str, dedup_model: str) -> dict:
+    """Run a multi-poll golden case through the REAL pipeline gates: detection
+    (real LLM) -> main.process_event -> reconcile (real adjudicator), against
+    isolated state and a fake calendar. Scores final create/update counts and,
+    optionally, the final calendar event's fields."""
+    from scheduling_agent import calendar as calendar_mod, config, main, state as state_mod
+
+    threads = loader.materialize_polls(case)
+    expected = loader._resolve_offsets(dict(case["expected_pipeline"]), date.today())
+    final_expected = expected.get("final")
+    if final_expected:
+        final_expected = loader._resolve_offsets(dict(final_expected), date.today())
+
+    fake_calendar = _FakeCalendar()
+    tmp_dir = Path(tempfile.mkdtemp(prefix=f"eval-state-{case['id']}-"))
+    saved = {
+        "STATE_DIR": state_mod.STATE_DIR,
+        "STATE_FILE": state_mod.STATE_FILE,
+        "create_event": calendar_mod.create_event,
+        "update_event": calendar_mod.update_event,
+        "get_events_near": calendar_mod.get_events_near,
+    }
+    state_mod.STATE_DIR = tmp_dir
+    state_mod.STATE_FILE = tmp_dir / "state.json"
+    calendar_mod.create_event = fake_calendar.create_event
+    calendar_mod.update_event = fake_calendar.update_event
+    calendar_mod.get_events_near = fake_calendar.get_events_near
+
+    cfg = {**config.DEFAULTS, "dedup_model": dedup_model}
+    outcomes: list[str] = []
+    try:
+        for thread in threads:
+            events, _failed = detector.detect_plans(
+                [thread], model=model, evidence_gate=cfg["evidence_gate_enabled"]
+            )
+            for event in events:
+                outcomes.append(main.process_event(event, cfg))
+    finally:
+        state_mod.STATE_DIR = saved["STATE_DIR"]
+        state_mod.STATE_FILE = saved["STATE_FILE"]
+        calendar_mod.create_event = saved["create_event"]
+        calendar_mod.update_event = saved["update_event"]
+        calendar_mod.get_events_near = saved["get_events_near"]
+
+    failures: list[str] = []
+    if fake_calendar.creates != expected.get("creates", 0):
+        failures.append(f"creates {fake_calendar.creates} != {expected.get('creates', 0)}")
+    if fake_calendar.updates != expected.get("updates", 0):
+        failures.append(f"updates {fake_calendar.updates} != {expected.get('updates', 0)}")
+    if final_expected and not failures:
+        finals = list(fake_calendar.events.values())
+        if not any(not _check_event_fields(final_expected, e) for e in finals):
+            failures.append(f"no final calendar event matches {final_expected}; got {finals}")
+
+    return {
+        "id": case["id"],
+        "category": case.get("category", "pipeline"),
+        "known_failure": case.get("known_failure", False),
+        "passed": not failures,
+        "outcomes": outcomes,
+        "creates": fake_calendar.creates,
+        "updates": fake_calendar.updates,
+        "calendar_events": list(fake_calendar.events.values()),
+        "failures": failures,
+    }
+
+
 def run(cases: list[dict], model: str = detector.MODEL, judge: bool = False) -> list[dict]:
+    cases = [c for c in cases if "polls" not in c]  # pipeline cases score separately
     results = [score_case(c, model) for c in cases]
     if judge:
         from evals import judge as judge_mod
@@ -204,10 +349,19 @@ def run(cases: list[dict], model: str = detector.MODEL, judge: bool = False) -> 
     return results
 
 
-def summarize(results: list[dict], dedup_results: list[dict] | None = None) -> dict:
+def run_pipeline(cases: list[dict], model: str, dedup_model: str) -> list[dict]:
+    return [score_pipeline_case(c, model, dedup_model) for c in cases if "polls" in c]
+
+
+def summarize(
+    results: list[dict],
+    dedup_results: list[dict] | None = None,
+    pipeline_results: list[dict] | None = None,
+) -> dict:
     gated = [r for r in results if not r["known_failure"]]
     negatives = [r for r in results if r["category"] == "hard_negative"]
     tentatives = [r for r in gated if r["category"] == "tentative"]
+    bystanders = [r for r in results if r["category"] == "bystander"]
     positives = [r for r in gated if r["expected_has_event"] and r["category"] != "tentative"]
     fps = sum(1 for r in negatives if r["predicted_has_event"])
 
@@ -227,7 +381,17 @@ def summarize(results: list[dict], dedup_results: list[dict] | None = None) -> d
         "n_passed_gated": sum(r["passed"] for r in gated),
         "known_failures": [r["id"] for r in results if r["known_failure"]],
         "mean_confidence_by_category": {k: round(sum(v) / len(v), 3) for k, v in conf.items()},
+        # Bystander leaks are third-party plans that would have reached the
+        # user's calendar — the ownership-hallucination bug. Gate at zero.
+        "bystander_leaks": [r["id"] for r in bystanders if r["predicted_has_event"]],
     }
+
+    if pipeline_results is not None:
+        summary["pipeline_accuracy"] = (
+            sum(r["passed"] for r in pipeline_results) / len(pipeline_results)
+            if pipeline_results else 0.0
+        )
+        summary["pipeline_failed"] = [r["id"] for r in pipeline_results if not r["passed"]]
 
     if dedup_results is not None:
         summary["dedup_accuracy"] = (
@@ -240,7 +404,11 @@ def summarize(results: list[dict], dedup_results: list[dict] | None = None) -> d
     return summary
 
 
-def print_report(results: list[dict], summary: dict, model: str, dedup_results: list[dict] | None = None) -> None:
+def print_report(
+    results: list[dict], summary: dict, model: str,
+    dedup_results: list[dict] | None = None,
+    pipeline_results: list[dict] | None = None,
+) -> None:
     print(f"\n=== Detector eval — model={model} ===")
     for r in results:
         status = "PASS" if r["passed"] else "FAIL"
@@ -264,6 +432,17 @@ def print_report(results: list[dict], summary: dict, model: str, dedup_results: 
     print(f"  mean confidence by category: {summary['mean_confidence_by_category']}")
     if summary["known_failures"]:
         print(f"  known failures (tracked):    {', '.join(summary['known_failures'])}")
+    if summary.get("bystander_leaks"):
+        print(f"  BYSTANDER LEAKS:             {', '.join(summary['bystander_leaks'])}")
+    if pipeline_results is not None:
+        print(f"\n=== Pipeline eval (multi-poll, real reconcile) ===")
+        for r in pipeline_results:
+            status = "PASS" if r["passed"] else "FAIL"
+            line = f"  [{status}] {r['id']}  creates={r['creates']} updates={r['updates']}"
+            if r["failures"]:
+                line += "  — " + "; ".join(r["failures"])
+            print(line)
+        print(f"\n  pipeline accuracy:            {summary['pipeline_accuracy']:.0%}")
     if dedup_results is not None:
         print(f"\n  dedup accuracy:               {summary['dedup_accuracy']:.0%}")
         if summary["dedup_same_missed"]:
@@ -273,12 +452,15 @@ def print_report(results: list[dict], summary: dict, model: str, dedup_results: 
 def write_report(
     results: list[dict], summary: dict, model: str, run_dir: Path,
     dedup_results: list[dict] | None = None,
+    pipeline_results: list[dict] | None = None,
 ) -> Path:
     run_dir.mkdir(parents=True, exist_ok=True)
     path = run_dir / "report.json"
     report = {"model": model, "summary": summary, "results": results}
     if dedup_results is not None:
         report["dedup_results"] = dedup_results
+    if pipeline_results is not None:
+        report["pipeline_results"] = pipeline_results
     path.write_text(json.dumps(report, indent=2))
     return path
 
@@ -332,9 +514,10 @@ def main() -> None:
         results = run(cases, model=args.model, judge=args.judge)
         results_by_id = {r["id"]: r for r in results}
         dedup_results = score_dedup_pairs(cases, results_by_id, model=args.dedup_model)
-        summary = summarize(results, dedup_results)
-        print_report(results, summary, args.model, dedup_results)
-        path = write_report(results, summary, args.model, run_dir, dedup_results)
+        pipeline_results = run_pipeline(cases, model=args.model, dedup_model=args.dedup_model)
+        summary = summarize(results, dedup_results, pipeline_results)
+        print_report(results, summary, args.model, dedup_results, pipeline_results)
+        path = write_report(results, summary, args.model, run_dir, dedup_results, pipeline_results)
         print(f"\n  report: {path}")
         print(f"  stdout log: {stdout_path}")
 
