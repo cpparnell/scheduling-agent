@@ -2,8 +2,10 @@
 
 Runs each golden case through the real ``detector.detect_plans`` and scores the
 structured output programmatically (exact-match on has_event/date/time, substring
-on title/location). Prints a per-case table + aggregate metrics and writes a
-diffable JSON report so prompt/model changes can be compared.
+on title/location). A separate phase adjudicates the "dedup" pairs through the
+real ``dedup.adjudicate`` and scores same/different verdicts. Prints a per-case
+table + aggregate metrics and writes a diffable JSON report so prompt/model
+changes can be compared.
 
 Usage:
     python -m evals.run                          # baseline on the default model
@@ -20,52 +22,102 @@ from datetime import datetime
 from pathlib import Path
 
 from evals import loader
-from scheduling_agent import detector
+from scheduling_agent import dedup, detector
 
 LOGS_DIR = Path(__file__).parent.parent / "logs"
 REPORTS_DIR = LOGS_DIR / "evals"
 
-_GOT_FIELDS = ("title", "date", "time_start", "location", "confidence", "status", "recurrence", "end_date")
+_GOT_FIELDS = (
+    "title", "date", "time_start", "time_confidence", "location",
+    "confidence", "status", "recurrence", "end_date", "evidence",
+)
+
+
+def _check_event_fields(expected: dict, got: dict) -> list[str]:
+    """Field-level checks shared by single- and multi-event scoring. `expected`
+    may omit any key to skip that check (matches the existing golden.jsonl
+    convention of only asserting what matters for a given case)."""
+    failures: list[str] = []
+    if "date" in expected and got.get("date") != expected["date"]:
+        failures.append(f"date {got.get('date')} != {expected['date']}")
+    if "time_start" in expected and got.get("time_start") != expected["time_start"]:
+        failures.append(f"time_start {got.get('time_start')!r} != {expected['time_start']!r}")
+    if "status" in expected and got.get("status") != expected["status"]:
+        failures.append(f"status {got.get('status')!r} != {expected['status']!r}")
+    if "title_contains_any" in expected:
+        title = (got.get("title") or "").lower()
+        if not any(s.lower() in title for s in expected["title_contains_any"]):
+            failures.append(
+                f"title {got.get('title')!r} missing any of {expected['title_contains_any']}"
+            )
+    if "location_contains_any" in expected:
+        loc = (got.get("location") or "").lower()
+        if not any(s.lower() in loc for s in expected["location_contains_any"]):
+            failures.append(
+                f"location {got.get('location')!r} missing any of {expected['location_contains_any']}"
+            )
+    if "recurrence" in expected and got.get("recurrence") != expected["recurrence"]:
+        failures.append(f"recurrence {got.get('recurrence')!r} != {expected['recurrence']!r}")
+    if "end_date" in expected and got.get("end_date") != expected["end_date"]:
+        failures.append(f"end_date {got.get('end_date')!r} != {expected['end_date']!r}")
+    return failures
+
+
+def _matches_loosely(expected: dict, got: dict) -> bool:
+    """Cheap candidate-matching key for greedy multi-event pairing: same date
+    (when asserted) and at least one expected title substring (when asserted)."""
+    if "date" in expected and got.get("date") != expected["date"]:
+        return False
+    if "title_contains_any" in expected:
+        title = (got.get("title") or "").lower()
+        if not any(s.lower() in title for s in expected["title_contains_any"]):
+            return False
+    return True
+
+
+def _score_multi_event(expected_events: list[dict], got_events: list[dict]) -> list[str]:
+    failures: list[str] = []
+    remaining = list(got_events)
+    for i, exp_ev in enumerate(expected_events):
+        match = next((g for g in remaining if _matches_loosely(exp_ev, g)), None)
+        if match is None:
+            failures.append(f"expected event #{i} not detected: {exp_ev}")
+            continue
+        remaining.remove(match)
+        failures.extend(_check_event_fields(exp_ev, match))
+    for g in remaining:
+        failures.append(f"hallucinated extra event: {g.get('title')!r} on {g.get('date')}")
+    return failures
 
 
 def score_case(case: dict, model: str) -> dict:
     thread, expected = loader.materialize_case(case)
-    events = detector.detect_plans([thread], model=model)
-    got = events[0] if events else None
+    events, failed = detector.detect_plans([thread], model=model)
 
     failures: list[str] = []
-    predicted_has_event = got is not None
 
-    if predicted_has_event != expected["has_event"]:
-        failures.append(
-            "expected an event, none produced" if expected["has_event"]
-            else "false positive: event produced for a non-plan"
-        )
+    if "events" in expected:
+        predicted_has_event = len(events) > 0
+        expected_has_event = True
+        if not events:
+            failures.append("expected event(s), none produced")
+        else:
+            failures.extend(_score_multi_event(expected["events"], events))
+        got = events[0] if events else None
+    else:
+        got = events[0] if events else None
+        predicted_has_event = got is not None
+        expected_has_event = expected["has_event"]
 
-    if expected["has_event"] and got is not None:
-        if "date" in expected and got.get("date") != expected["date"]:
-            failures.append(f"date {got.get('date')} != {expected['date']}")
-        exp_time = expected.get("time_start")
-        if exp_time and got.get("time_start") != exp_time:
-            failures.append(f"time_start {got.get('time_start')} != {exp_time}")
-        if "status" in expected and got.get("status") != expected["status"]:
-            failures.append(f"status {got.get('status')!r} != {expected['status']!r}")
-        if "title_contains_any" in expected:
-            title = (got.get("title") or "").lower()
-            if not any(s.lower() in title for s in expected["title_contains_any"]):
-                failures.append(
-                    f"title {got.get('title')!r} missing any of {expected['title_contains_any']}"
-                )
-        if "location_contains_any" in expected:
-            loc = (got.get("location") or "").lower()
-            if not any(s.lower() in loc for s in expected["location_contains_any"]):
-                failures.append(
-                    f"location {got.get('location')!r} missing any of {expected['location_contains_any']}"
-                )
-        if "recurrence" in expected and got.get("recurrence") != expected["recurrence"]:
-            failures.append(f"recurrence {got.get('recurrence')!r} != {expected['recurrence']!r}")
-        if "end_date" in expected and got.get("end_date") != expected["end_date"]:
-            failures.append(f"end_date {got.get('end_date')!r} != {expected['end_date']!r}")
+        if predicted_has_event != expected_has_event:
+            failures.append(
+                "expected an event, none produced" if expected_has_event
+                else "false positive: event produced for a non-plan"
+            )
+        if expected_has_event and got is not None:
+            failures.extend(_check_event_fields(expected, got))
+        if len(events) > 1:
+            failures.append(f"hallucinated {len(events) - 1} extra event(s) beyond the expected one")
 
     return {
         "id": case["id"],
@@ -73,11 +125,67 @@ def score_case(case: dict, model: str) -> dict:
         "known_failure": case.get("known_failure", False),
         "passed": not failures,
         "predicted_has_event": predicted_has_event,
-        "expected_has_event": expected["has_event"],
+        "expected_has_event": expected_has_event,
         "got": None if got is None else {k: got.get(k) for k in _GOT_FIELDS},
+        "events": events,  # full event dicts, used by the dedup-scoring phase
         "confidence": None if got is None else got.get("confidence"),
         "failures": failures,
     }
+
+
+def score_dedup_pairs(cases: list[dict], results_by_id: dict, model: str) -> list[dict]:
+    """For golden cases annotated with dedup_with/dedup_verdict, treat the
+    referenced case's detected event as an "existing calendar event" and run
+    the real dedup.find_candidates + dedup.adjudicate against this case's
+    detected event(s), scoring the resulting same/different verdict."""
+    dedup_results = []
+
+    for case in cases:
+        if "dedup_with" not in case:
+            continue
+
+        ref_id = case["dedup_with"]
+        expected_verdict = case["dedup_verdict"]
+        b_events = results_by_id[case["id"]]["events"]
+        a_events = results_by_id[ref_id]["events"]
+
+        if not a_events or not b_events:
+            dedup_results.append({
+                "id": case["id"], "dedup_with": ref_id, "expected_verdict": expected_verdict,
+                "got_verdict": None, "passed": False,
+                "note": "missing detection on one side of the pair",
+            })
+            continue
+
+        existing_records = [{**a, "hash": f"eval-{ref_id}", "created_at": "2020-01-01T00:00:00"}
+                             for a in a_events]
+
+        called_llm = False
+        any_duplicate = False
+        reasoning = None
+        for b in b_events:
+            candidates = dedup.find_candidates(b, existing_records)
+            if not candidates:
+                continue
+            called_llm = True
+            verdict = dedup.adjudicate(b, candidates, model=model)
+            if verdict and verdict.get("is_duplicate"):
+                any_duplicate = True
+                reasoning = verdict.get("reasoning")
+                break
+
+        got_verdict = "same" if any_duplicate else "different"
+        dedup_results.append({
+            "id": case["id"],
+            "dedup_with": ref_id,
+            "expected_verdict": expected_verdict,
+            "got_verdict": got_verdict,
+            "called_llm": called_llm,
+            "reasoning": reasoning,
+            "passed": got_verdict == expected_verdict,
+        })
+
+    return dedup_results
 
 
 def run(cases: list[dict], model: str = detector.MODEL, judge: bool = False) -> list[dict]:
@@ -91,7 +199,7 @@ def run(cases: list[dict], model: str = detector.MODEL, judge: bool = False) -> 
     return results
 
 
-def summarize(results: list[dict]) -> dict:
+def summarize(results: list[dict], dedup_results: list[dict] | None = None) -> dict:
     gated = [r for r in results if not r["known_failure"]]
     negatives = [r for r in results if r["category"] == "hard_negative"]
     tentatives = [r for r in gated if r["category"] == "tentative"]
@@ -103,7 +211,7 @@ def summarize(results: list[dict]) -> dict:
         if r["confidence"] is not None:
             conf[r["category"]].append(r["confidence"])
 
-    return {
+    summary = {
         "accuracy": (sum(r["passed"] for r in gated) / len(gated)) if gated else 0.0,
         "positive_recall": (sum(r["passed"] for r in positives) / len(positives)) if positives else 0.0,
         "tentative_recall": (sum(r["passed"] for r in tentatives) / len(tentatives)) if tentatives else 0.0,
@@ -116,8 +224,18 @@ def summarize(results: list[dict]) -> dict:
         "mean_confidence_by_category": {k: round(sum(v) / len(v), 3) for k, v in conf.items()},
     }
 
+    if dedup_results is not None:
+        summary["dedup_accuracy"] = (
+            sum(r["passed"] for r in dedup_results) / len(dedup_results) if dedup_results else 0.0
+        )
+        summary["dedup_same_missed"] = [
+            r["id"] for r in dedup_results if r["expected_verdict"] == "same" and not r["passed"]
+        ]
 
-def print_report(results: list[dict], summary: dict, model: str) -> None:
+    return summary
+
+
+def print_report(results: list[dict], summary: dict, model: str, dedup_results: list[dict] | None = None) -> None:
     print(f"\n=== Detector eval — model={model} ===")
     for r in results:
         status = "PASS" if r["passed"] else "FAIL"
@@ -141,12 +259,22 @@ def print_report(results: list[dict], summary: dict, model: str) -> None:
     print(f"  mean confidence by category: {summary['mean_confidence_by_category']}")
     if summary["known_failures"]:
         print(f"  known failures (tracked):    {', '.join(summary['known_failures'])}")
+    if dedup_results is not None:
+        print(f"\n  dedup accuracy:               {summary['dedup_accuracy']:.0%}")
+        if summary["dedup_same_missed"]:
+            print(f"  dedup 'same' missed:          {', '.join(summary['dedup_same_missed'])}")
 
 
-def write_report(results: list[dict], summary: dict, model: str, ts: str) -> Path:
-    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    path = REPORTS_DIR / f"{ts}_{model.replace('/', '_')}.json"
-    path.write_text(json.dumps({"model": model, "summary": summary, "results": results}, indent=2))
+def write_report(
+    results: list[dict], summary: dict, model: str, run_dir: Path,
+    dedup_results: list[dict] | None = None,
+) -> Path:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    path = run_dir / "report.json"
+    report = {"model": model, "summary": summary, "results": results}
+    if dedup_results is not None:
+        report["dedup_results"] = dedup_results
+    path.write_text(json.dumps(report, indent=2))
     return path
 
 
@@ -177,6 +305,7 @@ class _Tee:
 def main() -> None:
     ap = argparse.ArgumentParser(description="Run the detector eval suite.")
     ap.add_argument("--model", default=detector.MODEL)
+    ap.add_argument("--dedup-model", default="claude-haiku-4-5")
     ap.add_argument("--judge", action="store_true", help="add LLM title-quality scoring")
     ap.add_argument("-k", "--filter", default=None, help="only run cases whose id contains this")
     ap.add_argument("--golden", default=str(loader.GOLDEN_PATH))
@@ -190,14 +319,17 @@ def main() -> None:
         return
 
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    stdout_path = REPORTS_DIR / f"{ts}_{args.model.replace('/', '_')}.log"
+    run_dir = REPORTS_DIR / f"{ts}_{args.model.replace('/', '_')}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    stdout_path = run_dir / "stdout.log"
 
     with stdout_path.open("w") as log_file, _Tee(log_file):
         results = run(cases, model=args.model, judge=args.judge)
-        summary = summarize(results)
-        print_report(results, summary, args.model)
-        path = write_report(results, summary, args.model, ts)
+        results_by_id = {r["id"]: r for r in results}
+        dedup_results = score_dedup_pairs(cases, results_by_id, model=args.dedup_model)
+        summary = summarize(results, dedup_results)
+        print_report(results, summary, args.model, dedup_results)
+        path = write_report(results, summary, args.model, run_dir, dedup_results)
         print(f"\n  report: {path}")
         print(f"  stdout log: {stdout_path}")
 

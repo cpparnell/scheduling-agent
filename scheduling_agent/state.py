@@ -2,7 +2,7 @@ import hashlib
 import json
 import re
 import time
-from datetime import date as date_type
+from datetime import date as date_type, datetime, timedelta
 from pathlib import Path
 
 STATE_DIR = Path.home() / ".scheduling-agent"
@@ -10,11 +10,15 @@ STATE_FILE = STATE_DIR / "state.json"
 
 # Bump this whenever the on-disk state shape changes, and add a corresponding
 # step in _migrate(). Files written before versioning are treated as version 0.
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 # Events with the same chat + normalized title within this many days are treated
 # as the same occurrence and deduplicated.
 TITLE_DEDUP_WINDOW_DAYS = 28
+
+# Descriptive event records older than this are pruned on write to keep
+# state.json small; they're no longer useful for dedup/adjudication.
+EVENT_RECORD_RETENTION_DAYS = 90
 
 
 def _new_state() -> dict:
@@ -25,6 +29,14 @@ def _new_state() -> dict:
         # Maps "{chat_id}:{normalized_title}" -> most-recent ISO date recorded.
         # Used to catch the same event being detected with a different date.
         "title_events": {},
+        # Descriptive records (title/date/time/evidence/calendar_uid/...) used
+        # by the LLM dedup adjudicator to compare a new detection against
+        # recently created events. suppressed=True means the adjudicator
+        # ruled it a duplicate, so no calendar event was actually created.
+        "events": [],
+        # Tracks how many consecutive polls have failed to advance the
+        # watermark past a bad thread, so main.py can cap retries.
+        "watermark_hold": {"ts": None, "count": 0},
     }
 
 
@@ -45,6 +57,10 @@ def _migrate(data: dict) -> dict:
     if version < 2:
         data.setdefault("title_events", {})
         version = 2
+    if version < 3:
+        data.setdefault("events", [])
+        data.setdefault("watermark_hold", {"ts": None, "count": 0})
+        version = 3
     data["schema_version"] = CURRENT_SCHEMA_VERSION
     return data
 
@@ -118,9 +134,21 @@ def is_duplicate(chat_id: int, date: str, time_start: str | None, title: str) ->
     return False
 
 
-def record_event(chat_id: int, date: str, time_start: str | None, title: str) -> None:
-    """Record a created event's dedup hash and title key. Timestamp advancement
-    is handled separately by update_timestamp()."""
+def record_event(
+    chat_id: int,
+    date: str,
+    time_start: str | None,
+    title: str,
+    *,
+    location: str | None = None,
+    status: str | None = None,
+    evidence: str | None = None,
+    calendar_uid: str | None = None,
+    suppressed: bool = False,
+    duplicate_of_uid: str | None = None,
+) -> None:
+    """Record a created event's dedup hash, title key, and descriptive record.
+    Timestamp advancement is handled separately by update_timestamp()."""
     data = _load()
     h = event_hash(chat_id, date, time_start, title)
     created = set(data.get("created_events", []))
@@ -134,6 +162,67 @@ def record_event(chat_id: int, date: str, time_start: str | None, title: str) ->
     if not existing or date > existing:
         title_events[key] = date
 
+    events = data.setdefault("events", [])
+    events.append({
+        "hash": h,
+        "chat_id": chat_id,
+        "date": date,
+        "time_start": time_start,
+        "title": title,
+        "location": location,
+        "status": status,
+        "evidence": evidence,
+        "calendar_uid": calendar_uid,
+        "created_at": datetime.now().isoformat(),
+        "suppressed": suppressed,
+        "duplicate_of_uid": duplicate_of_uid,
+    })
+    data["events"] = _prune_old_events(events)
+
+    _save(data)
+
+
+def _prune_old_events(events: list[dict]) -> list[dict]:
+    cutoff = date_type.today() - timedelta(days=EVENT_RECORD_RETENTION_DAYS)
+    kept = []
+    for record in events:
+        try:
+            if date_type.fromisoformat(record["date"]) >= cutoff:
+                kept.append(record)
+        except (KeyError, ValueError, TypeError):
+            kept.append(record)
+    return kept
+
+
+def get_events_near(date_str: str, window_days: int = 1) -> list[dict]:
+    """Non-suppressed descriptive event records within window_days of date_str,
+    across all chats. Used to build dedup-adjudication candidates."""
+    try:
+        target = date_type.fromisoformat(date_str)
+    except ValueError:
+        return []
+
+    data = _load()
+    matches = []
+    for record in data.get("events", []):
+        if record.get("suppressed"):
+            continue
+        try:
+            record_date = date_type.fromisoformat(record["date"])
+        except (KeyError, ValueError, TypeError):
+            continue
+        if abs((record_date - target).days) <= window_days:
+            matches.append(record)
+    return matches
+
+
+def get_watermark_hold() -> dict:
+    return _load().get("watermark_hold", {"ts": None, "count": 0})
+
+
+def set_watermark_hold(ts: int | None, count: int) -> None:
+    data = _load()
+    data["watermark_hold"] = {"ts": ts, "count": count}
     _save(data)
 
 

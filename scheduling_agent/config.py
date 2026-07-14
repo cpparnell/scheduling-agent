@@ -13,6 +13,20 @@ DEFAULTS = {
     "lookback_days": 7,
     "confidence_threshold": 0.85,
     "tentative_confidence_threshold": 0.6,
+    # Only keep a specific time_start when the detector's time_confidence
+    # meets this bar; otherwise the event is demoted to all-day.
+    "time_confidence_threshold": 0.9,
+    # LLM-adjudicated dedup: before creating an event, check nearby existing
+    # events (see dedup.py) and skip if the adjudicator judges it a duplicate.
+    "dedup_enabled": True,
+    "dedup_model": "claude-haiku-4-5",
+    "dedup_day_window": 1,
+    # If the adjudicator call itself fails, create the event rather than risk
+    # silently dropping a real plan (a visible duplicate is easy to fix).
+    "dedup_fail_open": True,
+    # How many consecutive polls to hold the watermark back for a thread that
+    # keeps failing detection, before giving up and advancing past it anyway.
+    "max_watermark_retries": 3,
 }
 
 

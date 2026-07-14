@@ -131,3 +131,89 @@ def test_migrate_is_noop_for_current_version():
         "created_events": ["x"],
     }
     assert state._migrate(dict(data)) == data
+
+
+def test_v2_to_v3_migration_preserves_existing_data_and_adds_events():
+    legacy = {
+        "schema_version": 2,
+        "last_processed_timestamp": 999,
+        "created_events": ["abc123"],
+        "title_events": {"1:dinner": "2026-06-01"},
+    }
+    migrated = state._migrate(dict(legacy))
+    assert migrated["schema_version"] == state.CURRENT_SCHEMA_VERSION
+    assert migrated["last_processed_timestamp"] == 999
+    assert migrated["created_events"] == ["abc123"]
+    assert migrated["title_events"] == {"1:dinner": "2026-06-01"}
+    assert migrated["events"] == []
+    assert migrated["watermark_hold"] == {"ts": None, "count": 0}
+
+
+def test_v0_to_v3_migration_chain():
+    legacy = {"last_processed_timestamp": 42, "created_events": ["x"]}
+    migrated = state._migrate(dict(legacy))
+    assert migrated["schema_version"] == state.CURRENT_SCHEMA_VERSION
+    assert migrated["last_processed_timestamp"] == 42
+    assert migrated["created_events"] == ["x"]
+    assert migrated["title_events"] == {}
+    assert migrated["events"] == []
+    assert migrated["watermark_hold"] == {"ts": None, "count": 0}
+
+
+def test_record_event_stores_descriptive_record():
+    state.record_event(
+        1, "2026-06-13", "19:00", "Dinner with Sam",
+        location="Dicey's", status="confirmed",
+        evidence="dinner at 7?", calendar_uid="ABC-123",
+    )
+    events = state._load()["events"]
+    assert len(events) == 1
+    record = events[0]
+    assert record["chat_id"] == 1
+    assert record["date"] == "2026-06-13"
+    assert record["time_start"] == "19:00"
+    assert record["title"] == "Dinner with Sam"
+    assert record["location"] == "Dicey's"
+    assert record["status"] == "confirmed"
+    assert record["evidence"] == "dinner at 7?"
+    assert record["calendar_uid"] == "ABC-123"
+    assert record["suppressed"] is False
+    assert "created_at" in record
+
+
+def test_get_events_near_same_day():
+    state.record_event(1, "2026-06-13", "19:00", "Dinner")
+    matches = state.get_events_near("2026-06-13", window_days=1)
+    assert len(matches) == 1
+    assert matches[0]["title"] == "Dinner"
+
+
+def test_get_events_near_within_window():
+    state.record_event(1, "2026-06-12", "19:00", "Dinner")
+    state.record_event(1, "2026-06-14", "19:00", "Lunch")
+    matches = state.get_events_near("2026-06-13", window_days=1)
+    titles = {m["title"] for m in matches}
+    assert titles == {"Dinner", "Lunch"}
+
+
+def test_get_events_near_outside_window_excluded():
+    state.record_event(1, "2026-06-01", "19:00", "Dinner")
+    matches = state.get_events_near("2026-06-13", window_days=1)
+    assert matches == []
+
+
+def test_get_events_near_excludes_suppressed():
+    state.record_event(1, "2026-06-13", "19:00", "Dinner", suppressed=True)
+    matches = state.get_events_near("2026-06-13", window_days=1)
+    assert matches == []
+
+
+def test_suppressed_record_still_trips_is_duplicate():
+    state.record_event(1, "2026-06-13", "19:00", "Dinner", suppressed=True)
+    assert state.is_duplicate(1, "2026-06-13", "19:00", "Dinner") is True
+
+
+def test_watermark_hold_default_and_round_trip():
+    assert state.get_watermark_hold() == {"ts": None, "count": 0}
+    state.set_watermark_hold(1000, 2)
+    assert state.get_watermark_hold() == {"ts": 1000, "count": 2}

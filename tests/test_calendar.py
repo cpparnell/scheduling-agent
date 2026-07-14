@@ -10,35 +10,36 @@ from scheduling_agent import calendar
 def capture_osascript(monkeypatch):
     """Replace subprocess.run with a stub that records the AppleScript and
     returns a configurable result."""
-    state = {"script": None, "returncode": 0, "stderr": "", "raise": None}
+    state = {"script": None, "returncode": 0, "stdout": "FAKE-UID-123", "stderr": "", "raise": None}
 
     def fake_run(args, **kwargs):
         # args == ["osascript", "-e", script]
         state["script"] = args[2]
         if state["raise"] is not None:
             raise state["raise"]
-        return SimpleNamespace(returncode=state["returncode"], stderr=state["stderr"])
+        return SimpleNamespace(returncode=state["returncode"], stdout=state["stdout"], stderr=state["stderr"])
 
     monkeypatch.setattr(calendar.subprocess, "run", fake_run)
     return state
 
 
-def test_success_returns_true(capture_osascript):
-    ok = calendar.create_event("Dinner", "2026-06-13", "19:00", 90, None, "Home")
-    assert ok is True
+def test_success_returns_uid(capture_osascript):
+    uid = calendar.create_event("Dinner", "2026-06-13", "19:00", 90, None, "Home")
+    assert uid == "FAKE-UID-123"
     assert "Dinner" in capture_osascript["script"]
     assert 'first calendar whose name is "Home"' in capture_osascript["script"]
+    assert "return uid of newEvent" in capture_osascript["script"]
 
 
-def test_nonzero_returncode_returns_false(capture_osascript):
+def test_nonzero_returncode_returns_none(capture_osascript):
     capture_osascript["returncode"] = 1
     capture_osascript["stderr"] = "no such calendar"
-    assert calendar.create_event("Dinner", "2026-06-13", "19:00", 60, None) is False
+    assert calendar.create_event("Dinner", "2026-06-13", "19:00", 60, None) is None
 
 
-def test_timeout_returns_false(capture_osascript):
+def test_timeout_returns_none(capture_osascript):
     capture_osascript["raise"] = subprocess.TimeoutExpired(cmd="osascript", timeout=15)
-    assert calendar.create_event("Dinner", "2026-06-13", "19:00", 60, None) is False
+    assert calendar.create_event("Dinner", "2026-06-13", "19:00", 60, None) is None
 
 
 def test_quotes_in_title_and_location_are_escaped(capture_osascript):
@@ -56,9 +57,22 @@ def test_date_and_time_render_expected_applescript_literal(capture_osascript):
     assert 'date "June 13, 2026 at 08:00:00 PM"' in script
 
 
-def test_no_time_defaults_to_noon(capture_osascript):
+def test_no_time_creates_allday_event(capture_osascript):
     calendar.create_event("All day thing", "2026-06-13", None, 60, None)
-    assert 'date "June 13, 2026 at 12:00:00 PM"' in capture_osascript["script"]
+    script = capture_osascript["script"]
+    assert "allday event:true" in script
+    # Start at midnight June 13; end at midnight June 14 (exclusive end).
+    assert 'date "June 13, 2026 at 12:00:00 AM"' in script
+    assert 'date "June 14, 2026 at 12:00:00 AM"' in script
+
+
+def test_no_time_multiday_allday_end_is_exclusive(capture_osascript):
+    calendar.create_event("NYC Trip", "2026-06-13", None, 60, None, end_date="2026-06-16")
+    script = capture_osascript["script"]
+    assert "allday event:true" in script
+    assert 'date "June 13, 2026 at 12:00:00 AM"' in script
+    # Last day is June 16; all-day end date must be the midnight *after* it.
+    assert 'date "June 17, 2026 at 12:00:00 AM"' in script
 
 
 def test_none_duration_defaults_to_60_minutes(capture_osascript):
@@ -88,14 +102,6 @@ def test_biweekly_recurrence_sets_rrule(capture_osascript):
 def test_no_recurrence_omits_rrule_line(capture_osascript):
     calendar.create_event("Dinner", "2026-06-13", "19:00", 60, None, recurrence=None)
     assert "recurrence" not in capture_osascript["script"]
-
-
-def test_end_date_overrides_duration_based_end(capture_osascript):
-    calendar.create_event("NYC Trip", "2026-06-13", None, 60, None, end_date="2026-06-16")
-    script = capture_osascript["script"]
-    # Start: June 13 at noon; end: June 16 at noon (same time, end_date day)
-    assert 'date "June 13, 2026 at 12:00:00 PM"' in script
-    assert 'date "June 16, 2026 at 12:00:00 PM"' in script
 
 
 def test_end_date_with_time_start(capture_osascript):

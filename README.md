@@ -1,6 +1,6 @@
 # scheduling-agent
 
-An iMessage-to-Calendar scheduling agent for macOS. It watches your iMessage database (`~/Library/Messages/chat.db`) for new messages, uses Claude Haiku to detect confirmed plans (an explicit invite, an explicit acceptance, and a specific date), and automatically creates Apple Calendar events — no confirmation step.
+An iMessage-to-Calendar scheduling agent for macOS. It watches your iMessage database (`~/Library/Messages/chat.db`) for new messages, uses Claude Haiku to detect plans (an explicit invite, plus a specific date), and automatically creates Apple Calendar events — no confirmation step.
 
 ## How it works
 
@@ -8,13 +8,22 @@ An iMessage-to-Calendar scheduling agent for macOS. It watches your iMessage dat
 chat.db changes
   → watcher.py   (watchdog, 5-second debounce)
   → reader.py    (read-only SQLite read of new messages)
-  → detector.py  (Claude Haiku extracts confirmed plans as structured JSON)
-  → state.py     (dedup check via SHA-256 hash)
-  → calendar.py  (creates the event via AppleScript)
-  → state.py     (records the event hash and updates the checkpoint)
+  → detector.py  (Claude Haiku extracts zero or more plans per thread as structured JSON)
+  → main.py      (confidence gate, past-event guard, time-confidence gate for all-day events)
+  → state.py     (exact-hash + title-window dedup check)
+  → dedup.py     (LLM adjudicator: is this the same plan as a nearby existing event?)
+  → calendar.py  (creates the event — timed or all-day — via AppleScript)
+  → state.py     (records the descriptive event record + calendar UID, updates the checkpoint)
 ```
 
-Only plans that meet the confidence threshold are created, and each event is deduplicated by chat, date, and title so re-scans never create duplicates.
+Only plans that meet the confidence threshold are created. A specific start time is only kept
+when the detector is highly confident about it (`time_confidence_threshold`); otherwise the event
+is created as all-day. Before creating an event, a second Claude call checks nearby existing
+events and skips creation if it judges the new detection to be the same real-world plan, reworded
+— this is what catches the same plan being added twice with slightly different wording. If a
+thread's detection fails (API error, malformed response), the watermark is held back and the
+thread is retried on the next poll, up to a bounded number of retries, so a transient failure
+doesn't silently and permanently drop a plan.
 
 ## Requirements
 
@@ -60,9 +69,18 @@ The config file lives at `~/.scheduling-agent/config.json` and is created with d
 | `blocked_contacts` | `[]` | Phone numbers / emails to ignore |
 | `target_calendar` | `"Calendar"` | Apple Calendar name to create events in |
 | `lookback_days` | `7` | How far back to scan on first run |
-| `confidence_threshold` | `0.85` | Minimum Claude confidence to auto-create an event |
+| `confidence_threshold` | `0.85` | Minimum Claude confidence to auto-create a confirmed event |
+| `tentative_confidence_threshold` | `0.6` | Minimum confidence for a tentative (unanswered/hedged) plan |
+| `time_confidence_threshold` | `0.9` | Minimum confidence in the extracted clock time to keep it; below this the event is created all-day instead |
+| `dedup_enabled` | `true` | Whether the LLM dedup adjudicator runs before creating an event |
+| `dedup_model` | `"claude-haiku-4-5"` | Model used for dedup adjudication |
+| `dedup_day_window` | `1` | How many days on either side of a new plan's date count as "nearby" for dedup candidates |
+| `dedup_fail_open` | `true` | If the adjudicator call itself fails, create the event rather than risk dropping a real plan |
+| `max_watermark_retries` | `3` | How many consecutive polls to retry a thread whose detection failed before giving up and advancing past it |
 
-State (the last-processed message timestamp and hashes of created events) is stored in `~/.scheduling-agent/state.json`.
+State (the last-processed message timestamp, dedup hashes, and descriptive records of created
+events — including the calendar event UID — used for dedup adjudication) is stored in
+`~/.scheduling-agent/state.json`.
 
 ## Testing
 
@@ -86,14 +104,19 @@ These run in CI on every push and pull request against `main` (see
 
 These cover the deterministic plumbing: the chat.db reader and `attributedBody`
 decoding (run against a temporary SQLite fixture database), detector parsing and
-filtering (with the Anthropic client stubbed out), the dedup/state logic, and
-AppleScript event assembly. All on-disk state is redirected to a temp directory,
-so your real `~/.scheduling-agent` is never touched.
+filtering (with the Anthropic client stubbed out), the dedup adjudicator's
+candidate-filtering and verdict-handling logic (with its client stubbed out),
+the state/dedup logic, and AppleScript event assembly (timed and all-day). All
+on-disk state is redirected to a temp directory, so your real `~/.scheduling-agent`
+is never touched. Every run's console output (pass/fail per file, the final
+summary line) is also mirrored to a timestamped file in `logs/tests/`.
 
-**Detection eval** — measures the Claude detector against a golden dataset of
-synthetic threads (confirmed plans plus hard negatives like vague or
-cancelled invites). This calls the real model, so it needs `ANTHROPIC_API_KEY`
-and costs roughly $0.05 per run.
+**Detection eval** — measures the Claude detector (and the dedup adjudicator)
+against a golden dataset of synthetic threads: confirmed/tentative plans, hard
+negatives like vague/cancelled/past-recap threads, multi-event threads, stale
+relative-date resolution, all-day vs. timed extraction, and dedup pairs (the
+same plan reworded, or two different plans sharing a date/time). This calls
+the real model, so it needs `ANTHROPIC_API_KEY` and costs roughly $0.05 per run.
 
 ```bash
 python -m evals.run                     # baseline on the default model
@@ -102,11 +125,19 @@ python -m evals.run --judge             # add an LLM title-quality score
 pytest -m eval                          # run it as a pass/fail gate
 ```
 
-It prints per-case results plus aggregate accuracy and the false-positive rate
-on hard negatives, and writes a timestamped report to `evals/reports/` so runs
-can be diffed across prompt or model changes. The golden cases (`evals/golden.jsonl`)
-use date placeholders that are resolved relative to the current day at runtime,
-so they never go stale.
+It prints per-case detection results plus a separate dedup-adjudication report
+(same/different verdicts against the golden dedup pairs), aggregate accuracy,
+dedup accuracy, and the false-positive rate on hard negatives. Each run writes
+its two output files into its own timestamped folder under `logs/evals/`
+(e.g. `logs/evals/20260702-162344_claude-haiku-4-5/`): `report.json` (for
+diffing across prompt or model changes) and `stdout.log`, mirroring everything
+printed to the console. The golden cases (`evals/golden.jsonl`) use date
+placeholders that are resolved relative to the current day at runtime, so they
+never go stale.
+
+**Log directories** — three separate locations, one per entry point: `logs/stdout/`
+(the live agent, `python main.py`), `logs/evals/` (`python -m evals.run`), and
+`logs/tests/` (`pytest`).
 
 ## Project structure
 
@@ -115,17 +146,18 @@ main.py                # Thin entry point
 scheduling_agent/
 ├── main.py            # process_new_messages() and the watcher loop
 ├── config.py          # Loads ~/.scheduling-agent/config.json
-├── state.py           # Checkpoint timestamp + event dedup hashes
+├── state.py           # Checkpoint timestamp, dedup hashes, descriptive event records
 ├── reader.py          # Reads iMessage threads from chat.db
-├── detector.py        # Claude Haiku plan detection (JSON schema output)
-├── calendar.py        # Apple Calendar event creation via osascript
+├── detector.py        # Claude Haiku plan detection (JSON schema output, events array)
+├── dedup.py           # LLM adjudicator: is a new detection the same plan as an existing event?
+├── calendar.py        # Apple Calendar event creation via osascript (timed + all-day)
 └── watcher.py         # Filesystem watcher with debounce
 tests/                 # Offline unit/integration tests (pytest)
 └── fixtures/chatdb.py # Builds a temp chat.db + encodes attributedBody blobs
 evals/                 # Paid detection eval (golden dataset + runner)
-├── golden.jsonl       # ~20 labeled threads (positives + hard negatives)
+├── golden.jsonl       # Labeled threads: positives, hard negatives, dedup pairs, etc.
 ├── loader.py          # Materializes runtime-relative dates
-└── run.py             # Scorer + report writer
+└── run.py             # Detection scorer + dedup-adjudication scorer + report writer
 ```
 
 ## Privacy notes
