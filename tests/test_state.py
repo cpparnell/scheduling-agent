@@ -217,3 +217,124 @@ def test_watermark_hold_default_and_round_trip():
     assert state.get_watermark_hold() == {"ts": None, "count": 0}
     state.set_watermark_hold(1000, 2)
     assert state.get_watermark_hold() == {"ts": 1000, "count": 2}
+
+
+# --- v4: canonical store + write-ahead journal -------------------------------
+
+
+def test_v3_to_v4_migration_upgrades_records_and_adds_journal():
+    legacy = {
+        "schema_version": 3,
+        "last_processed_timestamp": 999,
+        "created_events": ["abc123"],
+        "title_events": {"1:dinner": "2026-06-01"},
+        "events": [{
+            "hash": "abc123",
+            "chat_id": 1,
+            "date": "2026-06-01",
+            "time_start": "19:00",
+            "title": "Dinner",
+            "created_at": "2026-06-01T10:00:00",
+            "suppressed": False,
+        }],
+        "watermark_hold": {"ts": None, "count": 0},
+    }
+    migrated = state._migrate(dict(legacy))
+    assert migrated["schema_version"] == state.CURRENT_SCHEMA_VERSION
+    assert migrated["journal"] == []
+    record = migrated["events"][0]
+    assert record["chat_id"] == 1
+    assert record["chat_ids"] == [1]
+    assert record["confidence"] is None
+    assert record["updated_at"] == "2026-06-01T10:00:00"
+    assert record["revisions"] == []
+    assert len(record["canonical_id"]) == 32
+
+
+def test_v0_to_v4_migration_chain():
+    legacy = {"last_processed_timestamp": 42, "created_events": ["x"]}
+    migrated = state._migrate(dict(legacy))
+    assert migrated["schema_version"] == state.CURRENT_SCHEMA_VERSION
+    assert migrated["created_events"] == ["x"]
+    assert migrated["events"] == []
+    assert migrated["journal"] == []
+
+
+def test_pending_journal_entry_trips_is_duplicate():
+    record = state.make_record(1, "2026-06-13", "19:00", "Dinner")
+    state.journal_intent(record)
+    # Exact hash match against the pending record.
+    assert state.is_duplicate(1, "2026-06-13", "19:00", "Dinner") is True
+    # Title-window match against the pending record.
+    assert state.is_duplicate(1, "2026-06-20", None, "Dinner") is True
+    # Unrelated event is not blocked.
+    assert state.is_duplicate(2, "2026-06-13", "19:00", "Dinner") is False
+
+
+def test_pending_journal_entry_appears_in_get_events_near():
+    record = state.make_record(1, "2026-06-13", "19:00", "Dinner")
+    state.journal_intent(record)
+    matches = state.get_events_near("2026-06-13", window_days=1)
+    assert [m["title"] for m in matches] == ["Dinner"]
+
+
+def test_journal_commit_lands_record_and_clears_journal():
+    record = state.make_record(1, "2026-06-13", "19:00", "Dinner")
+    jid = state.journal_intent(record)
+    state.journal_commit(jid, calendar_uid="UID-1")
+
+    assert state.get_pending_journal() == []
+    data = state._load()
+    assert len(data["events"]) == 1
+    assert data["events"][0]["calendar_uid"] == "UID-1"
+    assert record["hash"] in data["created_events"]
+    assert state.is_duplicate(1, "2026-06-13", "19:00", "Dinner") is True
+
+
+def test_journal_drop_removes_entry_without_committing():
+    record = state.make_record(1, "2026-06-13", "19:00", "Dinner")
+    jid = state.journal_intent(record)
+    state.journal_drop(jid)
+
+    assert state.get_pending_journal() == []
+    assert state._load()["events"] == []
+    assert state.is_duplicate(1, "2026-06-13", "19:00", "Dinner") is False
+
+
+def test_journal_commit_unknown_id_is_noop():
+    state.journal_commit("nope", calendar_uid="UID-1")
+    assert state._load()["events"] == []
+
+
+def test_update_record_applies_changes_and_keeps_old_hash():
+    state.record_event(1, "2026-06-13", "19:00", "Dinner", calendar_uid="UID-1")
+    record = state._load()["events"][0]
+
+    ok = state.update_record(
+        record["canonical_id"],
+        {"time_start": "20:00"},
+        reason="rescheduled in chat",
+        chat_id=2,
+    )
+    assert ok is True
+
+    updated = state._load()["events"][0]
+    assert updated["time_start"] == "20:00"
+    assert updated["chat_ids"] == [1, 2]
+    assert len(updated["revisions"]) == 1
+    assert updated["revisions"][0]["changed"] == {"time_start": ["19:00", "20:00"]}
+    assert updated["revisions"][0]["reason"] == "rescheduled in chat"
+    # Both the old and new wording/time stay deduplicated.
+    assert state.is_duplicate(1, "2026-06-13", "19:00", "Dinner") is True
+    assert state.is_duplicate(1, "2026-06-13", "20:00", "Dinner") is True
+
+
+def test_update_record_no_material_change_records_no_revision():
+    state.record_event(1, "2026-06-13", "19:00", "Dinner")
+    record = state._load()["events"][0]
+    state.update_record(record["canonical_id"], {"time_start": "19:00"})
+    assert state._load()["events"][0]["revisions"] == []
+
+
+def test_update_record_unknown_id_returns_false():
+    assert state.update_record("missing", {"time_start": "20:00"}) is False

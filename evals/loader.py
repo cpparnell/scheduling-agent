@@ -62,14 +62,9 @@ def _substitute(text: str, today: date) -> str:
     return _PLACEHOLDER.sub(repl, text)
 
 
-def materialize_case(case: dict, today: date | None = None, now: float | None = None):
-    """Return ``(thread, expected)`` ready for ``detector.detect_plans``."""
-    today = today or date.today()
-    now = time.time() if now is None else now
-
-    participants = case.get("participants", ["+15550000000"])
+def _materialize_messages(raw_messages: list[dict], participants: list[str], today: date, now: float) -> list[dict]:
     messages = []
-    for msg in case["messages"]:
+    for msg in raw_messages:
         if msg.get("from_me"):
             sender = "me"
         else:
@@ -83,11 +78,19 @@ def materialize_case(case: dict, today: date | None = None, now: float | None = 
             "from_me": msg.get("from_me", False),
             "unix_ts": now - msg.get("hours_ago", 1) * 3600,
         })
+    return messages
 
+
+def materialize_case(case: dict, today: date | None = None, now: float | None = None):
+    """Return ``(thread, expected)`` ready for ``detector.detect_plans``."""
+    today = today or date.today()
+    now = time.time() if now is None else now
+
+    participants = case.get("participants", ["+15550000000"])
     thread = {
         "chat_id": case["id"],
         "participants": participants,
-        "messages": messages,
+        "messages": _materialize_messages(case["messages"], participants, today, now),
     }
 
     expected = _resolve_offsets(dict(case["expected"]), today)
@@ -95,6 +98,35 @@ def materialize_case(case: dict, today: date | None = None, now: float | None = 
         expected["events"] = [_resolve_offsets(dict(e), today) for e in expected["events"]]
 
     return thread, expected
+
+
+def materialize_polls(case: dict, today: date | None = None, now: float | None = None) -> list[dict]:
+    """Materialize a multi-poll pipeline case (``"polls": [{...}, ...]``) into
+    one thread per poll.
+
+    Poll N's thread contains ALL messages from polls 1..N that belong to the
+    same chat, mimicking reader._prepend_context re-feeding prior context on
+    every incremental poll — the exact replay behavior that causes duplicate
+    re-detections in production. A poll may set ``chat_id`` to simulate the
+    same plan surfacing in a different conversation (default: the case id).
+    """
+    today = today or date.today()
+    now = time.time() if now is None else now
+
+    participants = case.get("participants", ["+15550000000"])
+    threads = []
+    for i, poll in enumerate(case["polls"]):
+        chat_id = poll.get("chat_id", case["id"])
+        raw = []
+        for prior in case["polls"][: i + 1]:
+            if prior.get("chat_id", case["id"]) == chat_id:
+                raw.extend(prior["messages"])
+        threads.append({
+            "chat_id": chat_id,
+            "participants": poll.get("participants", participants),
+            "messages": _materialize_messages(raw, poll.get("participants", participants), today, now),
+        })
+    return threads
 
 
 def _resolve_offsets(expected: dict, today: date) -> dict:

@@ -377,3 +377,53 @@ watermarks and event-update-via-UID (reschedule handling) as v0.5.
    reworded** from another thread → verify the log shows the adjudicator suppressing it with
    reasoning; inspect `~/.scheduling-agent/state.json` for the descriptive record with
    `calendar_uid` populated.
+
+---
+
+# v0.5 — Hardening: Canonical Event Store, Ownership Gating, Eval Coverage (SHIPPED)
+
+Field-reported failures this iteration fixed:
+
+1. **Duplication** — the same real-world plan landed multiple times with different wording.
+   Root causes: every poll re-feeds up to 30 prior messages of context, so the same plan is
+   re-detected on nearly every poll; the exact hash breaks on any rewording/time drift; the
+   adjudicator was biased toward "not duplicate" when uncertain; a crash between the calendar
+   write and the state write left no record to dedup against; dedup never looked at the
+   actual calendar.
+2. **Ownership hallucination** — a friend's own plan ("SHE is going to Patty's lake house")
+   was created on the user's calendar. Nothing anywhere modeled whether the user participates.
+3. **Evals caught neither** — no bystander cases, no multi-poll re-detection cases, and the
+   dedup eval was report-only.
+
+What shipped (see README for the user-facing description):
+
+- **state.py schema v4** — events are a canonical store (`canonical_id`, `chat_ids`
+  provenance, `confidence`, `revisions` audit trail) plus a **write-ahead journal**:
+  intent persisted before every calendar write, committed after the state write, pending
+  entries counted by the dedup lookups, and startup recovery (`main.recover_journal`)
+  resolving interrupted writes against the calendar.
+- **reconcile.py** — detections are matched before any calendar write: exact
+  hash/title-window (now returning the matched record so material changes still apply) →
+  deterministic fuzzy layer (normalized-title Jaccard + compatible date/time, cross-chat)
+  → LLM adjudicator with the uncertainty bias flipped to "same" (the v0.4 Risk-2 tradeoff
+  inverted deliberately: a wrong merge now updates the existing event rather than dropping
+  data). Matches with material diffs (reschedule, new location, tentative→confirmed)
+  **update** the calendar event via the stored UID; `calendar.get_events_near` feeds
+  manually created / lost-state events into the candidate set (the v0.4 out-of-scope item).
+- **detector.py** — `user_is_participant` + `participation_evidence` required fields with a
+  hard silent gate in main.py; `status` gained `unanswered` (invitations with no response
+  never create events); **tentative redefined** as "the user explicitly hedged" — a
+  classification judged at the single confidence bar, `tentative_confidence_threshold`
+  deleted; the verbatim-evidence check is now gating (config: `evidence_gate_enabled`).
+- **Evals** — bystander category (zero-leak hard gate + participant-positive controls),
+  pairwise "different" adjudicator controls against over-merging, and a multi-poll
+  **pipeline phase** (`"polls"` golden cases) replaying growing context / rewording /
+  cross-chat / reschedule / cancellation scenarios through the real gates + reconciliation,
+  gated on exact create/update counts. The dedup gate is now a hard assert. Offline
+  harness tests cover the plumbing with the LLM faked.
+
+Verification: `pytest` green offline (197 tests); `python -m evals.run` + `pytest -m eval`
+require `ANTHROPIC_API_KEY` (re-baseline needed after the prompt/schema changes). Manual
+real-Mac checks before trusting the new AppleScript surface: time `get_events_near` on a
+large calendar, verify `update_event` moves an event by UID, and kill -9 between the
+"Created calendar event" log line and the next state write to watch recovery run.
