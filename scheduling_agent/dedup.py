@@ -27,6 +27,13 @@ time drift after a reschedule (7:00 vs 7:30). Different plans can legitimately s
 a date and even a time — lunch with mom and a work call can both be at noon on the
 same day, in different conversations.
 
+A new detection can also be a RE-MENTION of an already-recorded event far in the
+future, where a bare weekday ("on Friday we...") was mis-resolved to a near-term
+date. If the evidence indicates the same real-world plan as an existing event on a
+distant date, answer is_duplicate=true — it is a mis-dated mention, not a new plan.
+But a recurring activity genuinely happening again (same title, clearly a new
+occurrence like next month's book club) is NOT a duplicate.
+
 Judge by: whether the conversations/participants overlap, whether titles and
 locations describe the same activity, whether the times are identical or plausibly
 the same slot, and what the quoted evidence messages say. When genuinely uncertain,

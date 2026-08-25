@@ -11,6 +11,11 @@ DEFAULTS = {
     "blocked_contacts": [],
     "target_calendar": "Calendar",
     "lookback_days": 7,
+    # Beyond the fixed 30-message context prepend, also prepend older messages
+    # that mention an explicit date (anchors like "the trip is Oct 10!"), up to
+    # this many days before the watermark and this many messages per chat.
+    "date_context_lookback_days": 90,
+    "date_context_max_messages": 10,
     "confidence_threshold": 0.85,
     # Only keep a specific time_start when the detector's time_confidence
     # meets this bar; otherwise the event is demoted to all-day.
@@ -29,6 +34,11 @@ DEFAULTS = {
     # Minimum normalized-title token overlap for the deterministic fuzzy
     # reconciliation layer to declare a match without consulting the LLM.
     "fuzzy_title_threshold": 0.6,
+    # Screening bar for the far-date layer: same-chat records with at least
+    # this much title overlap but a distant date are sent to the LLM
+    # adjudicator (catches a bare weekday mis-resolved to a near-term date).
+    # Looser than fuzzy_title_threshold because the LLM makes the final call.
+    "far_title_similarity": 0.4,
     # Drop detected events whose quoted evidence isn't found verbatim in the
     # thread (hallucination guard). Disable to log-and-keep instead.
     "evidence_gate_enabled": True,

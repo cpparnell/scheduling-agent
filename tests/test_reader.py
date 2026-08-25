@@ -223,3 +223,78 @@ def test_tapback_with_existing_text_uses_text_column(fake_chat_db):
     threads = reader.get_threads_since(None, lookback_days=7, blocked=[])
 
     assert threads[0]["messages"][0]["text"] == 'Loved "dinner friday at 7?"'
+
+
+# --- date-bearing context beyond the 30-message window -------------------------
+
+
+def _windowed_chat(anchor_text, anchor_hours_ago, n_fillers=31):
+    """One chat: an old anchor message, enough pre-cutoff fillers to push it
+    out of the regular 30-message context window, and one post-cutoff message."""
+    messages = [{"text": anchor_text, "from_me": False, "unix_ts": _recent(anchor_hours_ago)}]
+    for i in range(n_fillers):
+        # Fillers sit between the anchor and the cutoff (cutoff = 24h ago).
+        messages.append({"text": f"filler {i}", "from_me": False, "unix_ts": _recent(48 - i * 0.5)})
+    messages.append({"text": "on friday we leave", "from_me": False, "unix_ts": _recent(1)})
+    return {"participants": ["+15551234567"], "messages": messages}
+
+
+def test_date_bearing_message_beyond_window_is_prepended(fake_chat_db):
+    fake_chat_db([_windowed_chat("the trip is October 10!", anchor_hours_ago=24 * 20)])
+
+    cutoff = reader.unix_to_apple(_recent(24))
+    threads = reader.get_threads_since(cutoff, lookback_days=7, blocked=[])
+
+    msgs = [m["text"] for m in threads[0]["messages"]]
+    assert "the trip is October 10!" in msgs
+    assert msgs[0] == "the trip is October 10!"  # date context comes first
+    assert msgs[-1] == "on friday we leave"
+
+
+def test_non_date_message_beyond_window_is_excluded(fake_chat_db):
+    fake_chat_db([_windowed_chat("just catching up, nothing new", anchor_hours_ago=24 * 20)])
+
+    cutoff = reader.unix_to_apple(_recent(24))
+    threads = reader.get_threads_since(cutoff, lookback_days=7, blocked=[])
+
+    msgs = [m["text"] for m in threads[0]["messages"]]
+    assert "just catching up, nothing new" not in msgs
+
+
+def test_date_context_capped_at_max(fake_chat_db):
+    chat = _windowed_chat("the trip is October 10!", anchor_hours_ago=24 * 20)
+    for i in range(14):
+        chat["messages"].append(
+            {"text": f"we land June {i + 1}", "from_me": False, "unix_ts": _recent(24 * 19 - i)}
+        )
+    fake_chat_db([chat])
+
+    cutoff = reader.unix_to_apple(_recent(24))
+    threads = reader.get_threads_since(cutoff, lookback_days=7, blocked=[], date_context_max=10)
+
+    date_msgs = [m["text"] for m in threads[0]["messages"] if "June" in m["text"] or "October" in m["text"]]
+    assert len(date_msgs) == 10
+    # The most recent date-bearing messages win; the oldest (the anchor) is cut.
+    assert "the trip is October 10!" not in date_msgs
+
+
+def test_date_context_respects_lookback(fake_chat_db):
+    fake_chat_db([_windowed_chat("the trip is October 10!", anchor_hours_ago=24 * 100)])
+
+    cutoff = reader.unix_to_apple(_recent(24))
+    threads = reader.get_threads_since(
+        cutoff, lookback_days=7, blocked=[], date_context_lookback_days=90
+    )
+
+    msgs = [m["text"] for m in threads[0]["messages"]]
+    assert "the trip is October 10!" not in msgs
+
+
+def test_lowercase_may_is_not_a_date(fake_chat_db):
+    fake_chat_db([_windowed_chat("we may want to hang out sometime", anchor_hours_ago=24 * 20)])
+
+    cutoff = reader.unix_to_apple(_recent(24))
+    threads = reader.get_threads_since(cutoff, lookback_days=7, blocked=[])
+
+    msgs = [m["text"] for m in threads[0]["messages"]]
+    assert "we may want to hang out sometime" not in msgs

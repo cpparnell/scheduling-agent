@@ -1,3 +1,4 @@
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -58,8 +59,27 @@ def _decode_attributed_body(data: bytes | None) -> str | None:
 
 CONTEXT_WINDOW = 30  # prior messages to prepend per thread for context
 
+# Beyond CONTEXT_WINDOW, older messages that mention an explicit date are also
+# prepended (capped), so a plan anchored far back in the chat ("the trip is
+# Oct 10!") stays visible when someone later says just "on Friday we...".
+DATE_CONTEXT_WINDOW = 10         # max extra date-bearing messages per chat
+DATE_CONTEXT_LOOKBACK_DAYS = 90  # how far back to scan for them
+_DATE_PATTERN = re.compile(
+    r"(?i:\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|jun(?:e)?|jul(?:y)?|"
+    r"aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b)"
+    r"|\bMay\b"                    # only capitalized — 'you may want' is not a date
+    r"|\b\d{1,2}[/.-]\d{1,2}\b"    # 10/14, 10-14
+    r"|\b\d{1,2}(?:st|nd|rd|th)\b" # the 14th
+)
 
-def get_threads_since(last_apple_ts: int | None, lookback_days: int, blocked: list[str]) -> list[dict]:
+
+def get_threads_since(
+    last_apple_ts: int | None,
+    lookback_days: int,
+    blocked: list[str],
+    date_context_lookback_days: int = DATE_CONTEXT_LOOKBACK_DAYS,
+    date_context_max: int = DATE_CONTEXT_WINDOW,
+) -> list[dict]:
     if last_apple_ts is None:
         cutoff = unix_to_apple(time.time() - lookback_days * 86400)
     else:
@@ -149,7 +169,10 @@ def get_threads_since(last_apple_ts: int | None, lookback_days: int, blocked: li
     # prepend prior messages as context so the LLM can see what was actually
     # confirmed rather than inferring from a fragment.
     if threads and last_apple_ts is not None:
-        _prepend_context(threads, cutoff, blocked_set, participants_by_chat)
+        _prepend_context(
+            threads, cutoff, blocked_set, participants_by_chat,
+            date_context_lookback_days, date_context_max,
+        )
 
     return list(threads.values())
 
@@ -159,8 +182,13 @@ def _prepend_context(
     cutoff: int,
     blocked_set: set[str],
     participants_by_chat: dict[int, list[str]],
+    date_context_lookback_days: int = DATE_CONTEXT_LOOKBACK_DAYS,
+    date_context_max: int = DATE_CONTEXT_WINDOW,
 ) -> None:
-    """Fetch up to CONTEXT_WINDOW prior messages per thread and prepend them."""
+    """Prepend up to CONTEXT_WINDOW prior messages per thread, plus up to
+    date_context_max older date-bearing messages (within
+    date_context_lookback_days of the cutoff) so far-back anchoring messages
+    stay visible to the detector."""
     try:
         conn = sqlite3.connect(f"file:{CHAT_DB}?mode=ro", uri=True, timeout=5)
     except sqlite3.OperationalError:
@@ -196,13 +224,20 @@ def _prepend_context(
     finally:
         conn.close()
 
-    # Take the most recent CONTEXT_WINDOW messages per chat (rows are DESC)
+    # Take the most recent CONTEXT_WINDOW messages per chat (rows are DESC).
+    # Older rows that mention an explicit date are collected separately, up to
+    # date_context_max per chat and no older than date_context_lookback_days
+    # before the cutoff; they end up prepended before the regular window.
+    date_lookback_ns = int(date_context_lookback_days * 86400 * 1e9)
     counts: dict[int, int] = {}
+    date_counts: dict[int, int] = {}
     context_by_chat: dict[int, list[dict]] = {}
+    date_context_by_chat: dict[int, list[dict]] = {}
     for chat_id, text, attributed_body, sender, from_me, apple_ts, tapback_type in ctx_rows:
         if any(p in blocked_set for p in participants_by_chat.get(chat_id, [])):
             continue
-        if counts.get(chat_id, 0) >= CONTEXT_WINDOW:
+        in_window = counts.get(chat_id, 0) < CONTEXT_WINDOW
+        if not in_window and date_counts.get(chat_id, 0) >= date_context_max:
             continue
         if not text:
             text = _decode_attributed_body(attributed_body)
@@ -210,14 +245,22 @@ def _prepend_context(
             text = TAPBACK_LABELS.get(tapback_type)
         if not text:
             continue
-        context_by_chat.setdefault(chat_id, []).append({
+        msg = {
             "sender": sender,
             "text": text,
             "from_me": bool(from_me),
             "unix_ts": apple_to_unix(apple_ts),
-        })
-        counts[chat_id] = counts.get(chat_id, 0) + 1
+        }
+        if in_window:
+            context_by_chat.setdefault(chat_id, []).append(msg)
+            counts[chat_id] = counts.get(chat_id, 0) + 1
+        elif apple_ts >= cutoff - date_lookback_ns and _DATE_PATTERN.search(text):
+            date_context_by_chat.setdefault(chat_id, []).append(msg)
+            date_counts[chat_id] = date_counts.get(chat_id, 0) + 1
 
-    for chat_id, ctx_msgs in context_by_chat.items():
+    for chat_id in set(context_by_chat) | set(date_context_by_chat):
+        ctx_msgs = context_by_chat.get(chat_id, [])
+        date_ctx = date_context_by_chat.get(chat_id, [])
         ctx_msgs.reverse()  # restore chronological order
-        threads[chat_id]["messages"] = ctx_msgs + threads[chat_id]["messages"]
+        date_ctx.reverse()
+        threads[chat_id]["messages"] = date_ctx + ctx_msgs + threads[chat_id]["messages"]

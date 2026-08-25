@@ -338,3 +338,13 @@ def test_update_record_no_material_change_records_no_revision():
 
 def test_update_record_unknown_id_returns_false():
     assert state.update_record("missing", {"time_start": "20:00"}) is False
+
+
+def test_get_active_events_excludes_suppressed_includes_pending():
+    state.record_event(1, "2026-06-13", "19:00", "Dinner")
+    state.record_event(1, "2026-07-01", None, "Trip", suppressed=True)
+    state.journal_intent(state.make_record(2, "2026-08-01", None, "Concert"))
+
+    titles = {r["title"] for r in state.get_active_events()}
+
+    assert titles == {"Dinner", "Concert"}

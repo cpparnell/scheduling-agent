@@ -94,6 +94,32 @@ def fuzzy_match(event: dict, candidates: list[dict], title_threshold: float) -> 
     return best
 
 
+def far_candidates(event: dict, cfg: dict) -> list[dict]:
+    """Same-chat records whose titles resemble the detection but whose dates
+    are far away. Catches a bare weekday mis-resolved to a near-term date when
+    the real plan is already recorded months out ("on Friday we..." about the
+    October trip). Title alone is too weak a tie cross-chat, so only records
+    from the same conversation qualify. The verdict is always left to the LLM
+    adjudicator — a same-title far date can also be a genuinely new occurrence
+    of a recurring plan."""
+    event_hash = state.event_hash(
+        event["chat_id"], event["date"], event.get("time_start"), event["title"]
+    )
+    scored = []
+    for record in state.get_active_events():
+        if record.get("chat_id") != event["chat_id"]:
+            continue
+        if record.get("hash") == event_hash:
+            continue
+        if _dates_within(event["date"], record.get("date", ""), cfg["dedup_day_window"]):
+            continue  # near dates are the near layer's job
+        score = _title_similarity(event.get("title", ""), record.get("title", ""))
+        if score >= cfg["far_title_similarity"]:
+            scored.append((score, record))
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [record for _, record in scored[:dedup.MAX_CANDIDATES]]
+
+
 def _assemble_candidates(event: dict, cfg: dict) -> list[dict]:
     """Nearby candidates from the canonical store (incl. pending journal
     records) plus, when enabled, events read back from the target calendar.
@@ -165,15 +191,14 @@ def reconcile(event: dict, cfg: dict) -> Decision:
         return Decision("skip_duplicate", source="exact", reasoning="exact hash/title-window match")
 
     candidates = _assemble_candidates(event, cfg)
-    if not candidates:
-        return Decision("create")
 
-    matched = fuzzy_match(event, candidates, cfg["fuzzy_title_threshold"])
-    if matched is not None:
-        return _disposition(
-            event, matched, "fuzzy",
-            f"title similarity >= {cfg['fuzzy_title_threshold']} with compatible date/time",
-        )
+    if candidates:
+        matched = fuzzy_match(event, candidates, cfg["fuzzy_title_threshold"])
+        if matched is not None:
+            return _disposition(
+                event, matched, "fuzzy",
+                f"title similarity >= {cfg['fuzzy_title_threshold']} with compatible date/time",
+            )
 
     if not cfg["dedup_enabled"]:
         return Decision("create")
@@ -183,6 +208,10 @@ def reconcile(event: dict, cfg: dict) -> Decision:
         candidates,
         day_window=cfg["dedup_day_window"],
     )
+    if not llm_candidates:
+        # Nothing near the detected date — check for a same-chat record with a
+        # similar title far away (a mis-resolved bare weekday lands here).
+        llm_candidates = far_candidates(event, cfg)
     if not llm_candidates:
         return Decision("create")
 

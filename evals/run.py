@@ -16,10 +16,11 @@ Usage:
 
 import argparse
 import json
+import os
 import sys
 import tempfile
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
 from evals import loader
@@ -28,10 +29,39 @@ from scheduling_agent import dedup, detector
 LOGS_DIR = Path(__file__).parent.parent / "logs"
 REPORTS_DIR = LOGS_DIR / "evals"
 
+# The detector's own eval-clock pin. Pass-fail must not depend on which real
+# weekday the run happens on ("this Thursday" resolves differently depending
+# on today's weekday — see detect_plans's weekday-reconciliation and
+# loader._days_until_weekday), so every run pins "today" to a deterministic
+# Wednesday rather than using live wall-clock time. This MUST stay relative to
+# the real clock (never a hardcoded calendar date): main.process_event drops
+# any event dated before datetime.now(), so a fixed pin would eventually make
+# every pipeline case dated relative to it fall into the past and start
+# failing. Override with EVAL_TODAY=YYYY-MM-DD for a specific date (e.g. to
+# reproduce a bug seen on a particular real day).
+_PINNED_WEEKDAY = 2  # Wednesday (date.weekday(): Mon=0 ... Sun=6)
+
+
+def _default_eval_today() -> date:
+    override = os.environ.get("EVAL_TODAY")
+    if override:
+        return date.fromisoformat(override)
+    today = date.today()
+    return today + timedelta(days=(_PINNED_WEEKDAY - today.weekday()) % 7)
+
+
+def _eval_clock(today: date | None = None) -> tuple[date, float]:
+    """Returns (today, now) where `now` is a unix timestamp at noon on `today`
+    — used both to materialize golden-case message timestamps and as the
+    "today" the detector prompt shows the model, so both stay consistent."""
+    today = today or _default_eval_today()
+    now = datetime.combine(today, time(12, 0)).timestamp()
+    return today, now
+
 _GOT_FIELDS = (
     "title", "date", "time_start", "time_confidence", "location",
     "confidence", "status", "user_is_participant", "participation_evidence",
-    "recurrence", "end_date", "evidence",
+    "recurrence", "end_date", "evidence", "date_evidence",
 )
 
 
@@ -102,9 +132,12 @@ def _would_reach_calendar(event: dict) -> bool:
     return bool(event.get("user_is_participant")) and event.get("status") != "unanswered"
 
 
-def score_case(case: dict, model: str) -> dict:
-    thread, expected = loader.materialize_case(case)
-    events, failed = detector.detect_plans([thread], model=model)
+def score_case(case: dict, model: str, today: date | None = None) -> dict:
+    today, now = _eval_clock(today)
+    thread, expected = loader.materialize_case(case, today=today, now=now)
+    events, failed = detector.detect_plans(
+        [thread], model=model, today=datetime.combine(today, time(12, 0))
+    )
 
     failures: list[str] = []
 
@@ -270,18 +303,21 @@ class _FakeCalendar:
         return out
 
 
-def score_pipeline_case(case: dict, model: str, dedup_model: str) -> dict:
+def score_pipeline_case(
+    case: dict, model: str, dedup_model: str, today: date | None = None
+) -> dict:
     """Run a multi-poll golden case through the REAL pipeline gates: detection
     (real LLM) -> main.process_event -> reconcile (real adjudicator), against
     isolated state and a fake calendar. Scores final create/update counts and,
     optionally, the final calendar event's fields."""
     from scheduling_agent import calendar as calendar_mod, config, main, state as state_mod
 
-    threads = loader.materialize_polls(case)
-    expected = loader._resolve_offsets(dict(case["expected_pipeline"]), date.today())
+    today, now = _eval_clock(today)
+    threads = loader.materialize_polls(case, today=today, now=now)
+    expected = loader._resolve_offsets(dict(case["expected_pipeline"]), today)
     final_expected = expected.get("final")
     if final_expected:
-        final_expected = loader._resolve_offsets(dict(final_expected), date.today())
+        final_expected = loader._resolve_offsets(dict(final_expected), today)
 
     fake_calendar = _FakeCalendar()
     tmp_dir = Path(tempfile.mkdtemp(prefix=f"eval-state-{case['id']}-"))
@@ -303,7 +339,8 @@ def score_pipeline_case(case: dict, model: str, dedup_model: str) -> dict:
     try:
         for thread in threads:
             events, _failed = detector.detect_plans(
-                [thread], model=model, evidence_gate=cfg["evidence_gate_enabled"]
+                [thread], model=model, evidence_gate=cfg["evidence_gate_enabled"],
+                today=datetime.combine(today, time(12, 0)),
             )
             for event in events:
                 outcomes.append(main.process_event(event, cfg))
@@ -337,20 +374,26 @@ def score_pipeline_case(case: dict, model: str, dedup_model: str) -> dict:
     }
 
 
-def run(cases: list[dict], model: str = detector.MODEL, judge: bool = False) -> list[dict]:
+def run(
+    cases: list[dict], model: str = detector.MODEL, judge: bool = False, today: date | None = None
+) -> list[dict]:
+    today, now = _eval_clock(today)
     cases = [c for c in cases if "polls" not in c]  # pipeline cases score separately
-    results = [score_case(c, model) for c in cases]
+    results = [score_case(c, model, today=today) for c in cases]
     if judge:
         from evals import judge as judge_mod
         for result, case in zip(results, cases):
             if result["passed"] and result["expected_has_event"] and result["got"]:
-                thread, _ = loader.materialize_case(case)
+                thread, _ = loader.materialize_case(case, today=today, now=now)
                 result["title_quality"] = judge_mod.score_title(thread, result["got"]["title"])
     return results
 
 
-def run_pipeline(cases: list[dict], model: str, dedup_model: str) -> list[dict]:
-    return [score_pipeline_case(c, model, dedup_model) for c in cases if "polls" in c]
+def run_pipeline(
+    cases: list[dict], model: str, dedup_model: str, today: date | None = None
+) -> list[dict]:
+    today, _ = _eval_clock(today)
+    return [score_pipeline_case(c, model, dedup_model, today=today) for c in cases if "polls" in c]
 
 
 def summarize(
@@ -496,7 +539,14 @@ def main() -> None:
     ap.add_argument("--judge", action="store_true", help="add LLM title-quality scoring")
     ap.add_argument("-k", "--filter", default=None, help="only run cases whose id contains this")
     ap.add_argument("--golden", default=str(loader.GOLDEN_PATH))
+    ap.add_argument(
+        "--today", default=None,
+        help="pin the eval clock to this ISO date (YYYY-MM-DD) instead of the "
+             "default next-Wednesday-from-now; same effect as EVAL_TODAY"
+    )
     args = ap.parse_args()
+
+    eval_today, _ = _eval_clock(date.fromisoformat(args.today) if args.today else None)
 
     cases = loader.load_golden(Path(args.golden))
     if args.filter:
@@ -511,11 +561,15 @@ def main() -> None:
     stdout_path = run_dir / "stdout.log"
 
     with stdout_path.open("w") as log_file, _Tee(log_file):
-        results = run(cases, model=args.model, judge=args.judge)
+        print(f"  eval clock pinned to: {eval_today.isoformat()} ({eval_today.strftime('%A')})")
+        results = run(cases, model=args.model, judge=args.judge, today=eval_today)
         results_by_id = {r["id"]: r for r in results}
         dedup_results = score_dedup_pairs(cases, results_by_id, model=args.dedup_model)
-        pipeline_results = run_pipeline(cases, model=args.model, dedup_model=args.dedup_model)
+        pipeline_results = run_pipeline(
+            cases, model=args.model, dedup_model=args.dedup_model, today=eval_today
+        )
         summary = summarize(results, dedup_results, pipeline_results)
+        summary["eval_today"] = eval_today.isoformat()
         print_report(results, summary, args.model, dedup_results, pipeline_results)
         path = write_report(results, summary, args.model, run_dir, dedup_results, pipeline_results)
         print(f"\n  report: {path}")

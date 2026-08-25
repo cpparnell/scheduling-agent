@@ -270,3 +270,301 @@ def test_model_override_is_passed_through(fake_anthropic):
     detector.detect_plans([_thread()], model="claude-sonnet-4-6")
 
     assert client.messages.calls[0]["model"] == "claude-sonnet-4-6"
+
+
+def test_detect_plans_forwards_today_to_the_prompt(fake_anthropic):
+    client = fake_anthropic([_response(_event())])
+    pinned = datetime(2026, 6, 10, 12, 0, 0)
+
+    detector.detect_plans([_thread()], today=pinned)
+
+    sent = client.messages.calls[0]["messages"][0]["content"]
+    assert "[Today is Wednesday, June 10, 2026]" in sent
+
+
+def test_date_evidence_not_found_drops_event(fake_anthropic, caplog):
+    fake_anthropic([_response(_event(date_evidence="this text is nowhere in the thread"))])
+
+    with caplog.at_level("WARNING"):
+        results, failed = detector.detect_plans([_thread()])
+
+    assert results == []  # hallucinated date anchor: the event is dropped
+    assert failed == set()  # a gated drop is not a thread failure
+    assert any("Date evidence not found verbatim" in r.message for r in caplog.records)
+
+
+def test_date_evidence_not_found_kept_when_gate_disabled(fake_anthropic, caplog):
+    fake_anthropic([_response(_event(date_evidence="this text is nowhere in the thread"))])
+
+    with caplog.at_level("WARNING"):
+        results, failed = detector.detect_plans([_thread()], evidence_gate=False)
+
+    assert len(results) == 1
+    assert any("Date evidence not found verbatim" in r.message for r in caplog.records)
+
+
+def test_verbatim_date_evidence_passes_gate(fake_anthropic):
+    fake_anthropic([_response(_event(date_evidence="dinner friday?"))])
+
+    results, failed = detector.detect_plans([_thread()])
+
+    assert len(results) == 1
+
+
+def test_missing_date_evidence_field_keeps_event(fake_anthropic):
+    # Legacy payloads (or an off-spec response) without the field must pass.
+    fake_anthropic([_response(_event())])
+
+    results, failed = detector.detect_plans([_thread()])
+
+    assert len(results) == 1
+
+
+def test_schema_requires_date_evidence():
+    assert "date_evidence" in detector.EVENT_ITEM_SCHEMA["properties"]
+    assert "date_evidence" in detector.EVENT_ITEM_SCHEMA["required"]
+
+
+def test_date_evidence_with_sender_timestamp_prefix_passes_gate(fake_anthropic):
+    # The date_evidence gate calls the same _evidence_found as the evidence
+    # gate, so it must inherit the same prefix/quote tolerance.
+    thread = _thread(messages=[
+        {"sender": "+15551234567", "text": "reminder: the reunion is Sunday, August 30", "from_me": False, "unix_ts": 1700000000.0},
+    ])
+    fake_anthropic([_response(_event(
+        evidence="reminder: the reunion is Sunday, August 30",
+        date_evidence="Me (07/28 09:00AM, sent 33 days ago): reminder: the reunion is Sunday, August 30",
+    ))])
+
+    results, failed = detector.detect_plans([thread])
+
+    assert len(results) == 1
+
+
+# --- Evidence matcher robustness (real failure modes from production logs) --
+
+
+def test_evidence_sender_timestamp_prefix_passes(fake_anthropic):
+    thread = _thread(messages=[
+        {"sender": "+15551234567", "text": "9:30 or 10 start? Gonna book 2 hours", "from_me": False, "unix_ts": 1700000000.0},
+    ])
+    fake_anthropic([_response(_event(
+        evidence="Me (07/11 06:46PM, sent 3 days ago): 9:30 or 10 start? Gonna book 2 hours"
+    ))])
+
+    results, failed = detector.detect_plans([thread])
+
+    assert len(results) == 1
+
+
+def test_evidence_me_colon_prefix_with_wrapping_quotes_passes(fake_anthropic):
+    thread = _thread(messages=[
+        {"sender": "me", "text": "I'm locked in to going to the cubs game at 8", "from_me": True, "unix_ts": 1700000000.0},
+    ])
+    fake_anthropic([_response(_event(
+        evidence="Me: 'I'm locked in to going to the cubs game at 8'"
+    ))])
+
+    results, failed = detector.detect_plans([thread])
+
+    assert len(results) == 1
+
+
+def test_evidence_phone_prefix_passes(fake_anthropic):
+    thread = _thread(messages=[
+        {"sender": "+15551234567", "text": "Yes for sure", "from_me": False, "unix_ts": 1700000000.0},
+    ])
+    fake_anthropic([_response(_event(evidence="+15551234567: 'Yes for sure'"))])
+
+    results, failed = detector.detect_plans([thread])
+
+    assert len(results) == 1
+
+
+def test_evidence_curly_vs_straight_apostrophe_passes(fake_anthropic):
+    thread = _thread(messages=[
+        {"sender": "+15551234567", "text": "I'm in!", "from_me": False, "unix_ts": 1700000000.0},
+    ])
+    fake_anthropic([_response(_event(evidence="I’m in!"))])
+
+    results, failed = detector.detect_plans([thread])
+
+    assert len(results) == 1
+
+
+def test_evidence_emoji_variation_selector_and_flag_tags_pass(fake_anthropic):
+    thread = _thread(messages=[
+        {"sender": "+15551234567", "text": "Gonna watch \U0001f1f3\U0001f1f4 game on wells", "from_me": False, "unix_ts": 1700000000.0},
+    ])
+    # Model quotes the same text but with a variation selector inserted.
+    fake_anthropic([_response(_event(
+        evidence="Gonna watch \U0001f1f3\U0001f1f4️ game on wells"
+    ))])
+
+    results, failed = detector.detect_plans([thread])
+
+    assert len(results) == 1
+
+
+def test_evidence_slash_joined_multi_message_passes(fake_anthropic):
+    thread = _thread(messages=[
+        {"sender": "+15551234567", "text": "Do you wanna come?", "from_me": False, "unix_ts": 1700000000.0},
+        {"sender": "me", "text": "Yes", "from_me": True, "unix_ts": 1700000100.0},
+    ])
+    fake_anthropic([_response(_event(evidence="Do you wanna come? / Yes"))])
+
+    results, failed = detector.detect_plans([thread])
+
+    assert len(results) == 1
+
+
+def test_evidence_newline_joined_multiline_message_passes(fake_anthropic):
+    thread = _thread(messages=[
+        {"sender": "+15551234567", "text": "So I booked Ravisloe for the 22nd.", "from_me": False, "unix_ts": 1700000000.0},
+        {"sender": "+15551234567", "text": "First tee time is 10:50.", "from_me": False, "unix_ts": 1700000100.0},
+    ])
+    fake_anthropic([_response(_event(
+        evidence="So I booked Ravisloe for the 22nd.\nFirst tee time is 10:50."
+    ))])
+
+    results, failed = detector.detect_plans([thread])
+
+    assert len(results) == 1
+
+
+def test_evidence_minor_paraphrase_within_overlap_passes(fake_anthropic):
+    thread = _thread(messages=[
+        {"sender": "+15551234567", "text": "want to grab dinner at the new taco place friday around 7", "from_me": False, "unix_ts": 1700000000.0},
+    ])
+    fake_anthropic([_response(_event(
+        evidence="want to grab dinner at the taco place this friday around 7"
+    ))])
+
+    results, failed = detector.detect_plans([thread])
+
+    assert len(results) == 1
+
+
+def test_evidence_fabricated_details_still_dropped(fake_anthropic, caplog):
+    thread = _thread(messages=[
+        {"sender": "+15551234567", "text": "dinner friday?", "from_me": False, "unix_ts": 1700000000.0},
+    ])
+    fake_anthropic([_response(_event(
+        evidence="dinner at 9pm on friday at the fancy new steakhouse downtown"
+    ))])
+
+    with caplog.at_level("WARNING"):
+        results, failed = detector.detect_plans([thread])
+
+    assert results == []
+
+
+def test_evidence_prefix_strip_does_not_eat_real_colon_content(fake_anthropic):
+    thread = _thread(messages=[
+        {"sender": "+15551234567", "text": "dinner at 7: does that work for you?", "from_me": False, "unix_ts": 1700000000.0},
+    ])
+    fake_anthropic([_response(_event(evidence="dinner at 7: does that work for you?"))])
+
+    results, failed = detector.detect_plans([thread])
+
+    assert len(results) == 1
+
+
+# --- Weekday math hardening (_reconcile_weekday) ----------------------------
+
+
+def test_reconcile_weekday_shifts_back_one_day():
+    # 2026-07-21 is a Tuesday; "this Monday" should be 2026-07-20.
+    event = _event(date="2026-07-21", evidence="can we set up standup this Monday?")
+    detector._reconcile_weekday(event, chat_id=1)
+    assert event["date"] == "2026-07-20"
+
+
+def test_reconcile_weekday_shifts_forward_when_nearer():
+    # 2026-07-14 is a Tuesday; nearest Wednesday is forward by 1 day.
+    event = _event(date="2026-07-14", evidence="dinner this Wednesday?")
+    detector._reconcile_weekday(event, chat_id=1)
+    assert event["date"] == "2026-07-15"
+
+
+def test_reconcile_weekday_leaves_matching_date_untouched():
+    # 2026-07-16 is already a Thursday.
+    event = _event(date="2026-07-16", evidence="running club this Thursday?")
+    detector._reconcile_weekday(event, chat_id=1)
+    assert event["date"] == "2026-07-16"
+
+
+def test_reconcile_weekday_leaves_ambiguous_multi_weekday_untouched():
+    event = _event(date="2026-07-21", evidence="Monday or Tuesday works for the standup")
+    detector._reconcile_weekday(event, chat_id=1)
+    assert event["date"] == "2026-07-21"
+
+
+def test_reconcile_weekday_ignores_last_weekday_mention():
+    event = _event(date="2026-07-21", evidence="like we talked about last Friday, let's meet up")
+    detector._reconcile_weekday(event, chat_id=1)
+    assert event["date"] == "2026-07-21"
+
+
+def test_reconcile_weekday_coshifts_end_date():
+    event = _event(
+        date="2026-07-21", end_date="2026-07-23", evidence="trip starts this Monday"
+    )
+    detector._reconcile_weekday(event, chat_id=1)
+    assert event["date"] == "2026-07-20"
+    assert event["end_date"] == "2026-07-22"
+
+
+def test_reconcile_weekday_far_anchor_only_nudged_within_week():
+    # A far-future date whose weekday is one day off should shift by 1 day,
+    # never snap back to "next occurrence of that weekday from today".
+    event = _event(date="2026-08-31", evidence="on Sunday we should all get dinner")
+    detector._reconcile_weekday(event, chat_id=1)
+    assert event["date"] == "2026-08-30"
+
+
+def test_reconcile_weekday_checks_date_evidence_field_too():
+    event = _event(date="2026-07-21", evidence="yes!", date_evidence="dinner this Monday?")
+    detector._reconcile_weekday(event, chat_id=1)
+    assert event["date"] == "2026-07-20"
+
+
+# --- Group-silence participation demotion (_demote_if_user_silent) ---------
+
+
+def test_demote_group_thread_with_zero_from_me_messages():
+    thread = _thread(participants=("+15551111111", "+15552222222"), messages=[
+        {"sender": "+15551111111", "text": "gym at 6?", "from_me": False, "unix_ts": 1700000000.0},
+        {"sender": "+15552222222", "text": "yes! see you there", "from_me": False, "unix_ts": 1700000100.0},
+    ])
+    event = _event(status="confirmed")
+    detector._demote_if_user_silent(event, thread)
+    assert event["status"] == "unanswered"
+
+
+def test_no_demote_when_user_sent_a_message():
+    thread = _thread(participants=("+15551111111", "+15552222222"), messages=[
+        {"sender": "+15551111111", "text": "gym at 6?", "from_me": False, "unix_ts": 1700000000.0},
+        {"sender": "me", "text": "yes!", "from_me": True, "unix_ts": 1700000100.0},
+    ])
+    event = _event(status="confirmed")
+    detector._demote_if_user_silent(event, thread)
+    assert event["status"] == "confirmed"
+
+
+def test_no_demote_in_one_on_one_thread():
+    thread = _thread(participants=("+15551234567",), messages=[
+        {"sender": "+15551234567", "text": "dinner friday?", "from_me": False, "unix_ts": 1700000000.0},
+    ])
+    event = _event(status="confirmed")
+    detector._demote_if_user_silent(event, thread)
+    assert event["status"] == "confirmed"
+
+
+def test_demote_leaves_already_unanswered_status_untouched():
+    thread = _thread(participants=("+15551111111", "+15552222222"), messages=[
+        {"sender": "+15551111111", "text": "gym at 6?", "from_me": False, "unix_ts": 1700000000.0},
+    ])
+    event = _event(status="unanswered")
+    detector._demote_if_user_silent(event, thread)
+    assert event["status"] == "unanswered"
