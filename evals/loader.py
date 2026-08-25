@@ -4,12 +4,19 @@ the real ``today`` at runtime, so fixtures never go stale.
 Placeholders in message text:
   {day+N}     -> "Weekday, Month D" of today+N  (e.g. "Tuesday, June 17")
   {date+N}    -> "Month D" of today+N           (e.g. "June 13")
-  {saturday}  -> "Saturday" (next Saturday from today)
-  {monday}, {tuesday}, ... -> next occurrence of that weekday's name, never today
-                               (use this instead of {day+N} whenever the message text
-                               also names a literal weekday, e.g. "every Monday" — a
-                               fixed N-day offset will only coincidentally land on the
-                               right weekday, silently making the case flaky)
+  {saturday}  -> "Saturday" (the next occurrence of Saturday from today, i.e. today
+                 itself when today is a Saturday)
+  {monday}, {tuesday}, ... -> the next occurrence of that weekday's name, INCLUDING
+                               today when today is that weekday ("this Thursday" said
+                               on a Thursday means today — use this instead of
+                               {day+N} whenever the message text also names a literal
+                               weekday, e.g. "every Monday" — a fixed N-day offset will
+                               only coincidentally land on the right weekday, silently
+                               making the case flaky)
+  {weekday_of_day+N} -> the weekday NAME of today+N (e.g. "Friday" when today+45
+                        is a Friday). Use this to write a bare-weekday mention that
+                        must stay consistent with a {day+N} anchor elsewhere in the
+                        case, so both always land on the same real date.
   {tomorrow}  -> "tomorrow"
   {tonight}   -> "tonight"
 
@@ -33,10 +40,11 @@ _WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday",
 
 
 def _days_until_weekday(today: date, weekday_name: str) -> int:
-    """Days from today until the next occurrence of weekday_name (never 0 —
-    always at least 1, i.e. "next Monday" said today never means today)."""
+    """Days from today until the next occurrence of weekday_name, INCLUDING
+    today (0) when today already is that weekday — "this Thursday" said on a
+    Thursday means today, matching how people actually text."""
     target = _WEEKDAYS.index(weekday_name.lower())
-    return (target - today.weekday()) % 7 or 7
+    return (target - today.weekday()) % 7
 
 
 def _days_until_saturday(today: date) -> int:
@@ -50,6 +58,9 @@ def _substitute(text: str, today: date) -> str:
             return token
         if token.lower() in _WEEKDAYS:
             return (today + timedelta(days=_days_until_weekday(today, token))).strftime("%A")
+        wk = re.fullmatch(r"weekday_of_day\+(\d+)", token)
+        if wk:
+            return (today + timedelta(days=int(wk.group(1)))).strftime("%A")
         rel = re.fullmatch(r"(day|date)\+(\d+)", token)
         if rel:
             kind, n = rel.group(1), int(rel.group(2))

@@ -7,9 +7,10 @@ An iMessage-to-Calendar scheduling agent for macOS. It watches your iMessage dat
 ```
 chat.db changes
   → watcher.py   (watchdog, 5-second debounce)
-  → reader.py    (read-only SQLite read of new messages)
+  → reader.py    (read-only SQLite read of new messages; prepends recent context plus
+                  older date-bearing anchor messages, e.g. "the trip is Oct 10!")
   → detector.py  (Claude Haiku extracts zero or more plans per thread as structured JSON,
-                  with a verbatim-evidence gate against hallucinated plans)
+                  with verbatim-evidence gates against hallucinated plans and dates)
   → main.py      (gates: past-event, participation, unanswered-invite, confidence,
                   time-confidence demotion to all-day)
   → reconcile.py (matches the detection against the canonical event store — and optionally
@@ -38,6 +39,35 @@ duplicate spams the calendar. With `calendar_query_enabled`, events already on t
 calendar (created manually, or before a state reset) join the candidate set. A match with
 material new information — a reschedule, a newly stated location, tentative → confirmed —
 **updates** the existing calendar event; anything else is skipped as a duplicate.
+
+**Bare-weekday anchoring.** "On Friday we will…" usually means the next Friday — but not
+when the chat established weeks earlier that the plan is months out. Four defenses: the
+reader prepends older date-bearing messages (beyond the normal 30-message context window)
+so the anchor stays visible; the detector must resolve a bare weekday against any anchor
+in the thread and cite the anchoring message verbatim in `date_evidence` (dropped if the
+quote isn't found — same hallucination guard as `evidence`); a deterministic post-check
+(`_reconcile_weekday`) re-derives the weekday named in the model's own evidence and shifts
+the emitted date by the minimal signed delta (at most 3 days) if the two disagree — Claude's
+own weekday arithmetic is unreliable even when told the current date explicitly, so this
+catches it rather than trusting the model's math; and reconciliation has a far-date layer
+that catches a same-chat detection whose title matches an event already recorded far away,
+sending it to the LLM adjudicator as a probable mis-dated re-mention instead of creating a
+near-term duplicate. Relatedly, a weekday named on the same day it's said ("this Thursday"
+sent on a Thursday) resolves to that day, not next week.
+
+**Verbatim evidence matching.** The hallucination guard requires `evidence`/`date_evidence`
+to appear in the thread, but the model doesn't always quote it byte-for-byte: it prepends a
+sender/timestamp label ("Me (07/11 6:46PM, sent 3 days ago): …"), wraps it in quotes, joins
+several messages with `/` or a newline, or re-encodes an emoji's invisible variation-selector
+codepoint. The matcher normalizes (NFKC, curly→straight quotes, strips invisible codepoints),
+strips a recognized sender/timestamp prefix, matches per-fragment across message joins, and
+falls back to a bounded token-overlap check (≥3 tokens, ≥80% coverage against a single
+message) — while still dropping genuine fabrications where no message covers the quote.
+
+**Group-silence demotion.** In a multi-person thread, another participant accepting a plan
+never confirms it *for the user* — if "Me" never sent a message about the plan, its status
+is force-demoted to `unanswered` regardless of what the model classified it as, so the
+unanswered-invite gate holds it back until the user actually responds.
 
 **Crash safety.** Calendar writes are journaled: the intent is persisted before the
 AppleScript call and committed after state is updated, and pending journal entries count
@@ -91,6 +121,8 @@ The config file lives at `~/.scheduling-agent/config.json` and is created with d
 | `blocked_contacts` | `[]` | Phone numbers / emails to ignore |
 | `target_calendar` | `"Calendar"` | Apple Calendar name to create events in |
 | `lookback_days` | `7` | How far back to scan on first run |
+| `date_context_lookback_days` | `90` | How far before the watermark to scan for older date-bearing anchor messages to prepend as context |
+| `date_context_max_messages` | `10` | Max older date-bearing messages prepended per chat, beyond the fixed 30-message context window |
 | `confidence_threshold` | `0.85` | Minimum Claude confidence to auto-create an event (confirmed and tentative alike — tentative is a status, not a lower bar) |
 | `time_confidence_threshold` | `0.9` | Minimum confidence in the extracted clock time to keep it; below this the event is created all-day instead |
 | `dedup_enabled` | `true` | Whether the LLM adjudicator runs as reconciliation's last layer |
@@ -99,7 +131,8 @@ The config file lives at `~/.scheduling-agent/config.json` and is created with d
 | `dedup_fail_open` | `true` | If the adjudicator call itself fails, create the event rather than risk dropping a real plan |
 | `calendar_query_enabled` | `true` | Read events back from the target calendar as reconciliation candidates (catches manually created events and lost state) |
 | `fuzzy_title_threshold` | `0.6` | Minimum normalized-title token overlap for the deterministic fuzzy layer to match without the LLM |
-| `evidence_gate_enabled` | `true` | Drop detected plans whose quoted evidence isn't found verbatim in the thread (hallucination guard) |
+| `far_title_similarity` | `0.4` | Screening bar for the far-date layer: same-chat records with at least this much title overlap but a distant date go to the LLM adjudicator (catches a bare weekday mis-resolved to a near-term date) |
+| `evidence_gate_enabled` | `true` | Drop detected plans whose quoted evidence (or date evidence) isn't found verbatim in the thread (hallucination guard) |
 | `reconcile_update_enabled` | `true` | Let reconciliation matches update the existing calendar event (reschedules, added locations); off treats them as skips |
 | `max_watermark_retries` | `3` | How many consecutive polls to retry a thread whose detection failed before giving up and advancing past it |
 
@@ -144,7 +177,8 @@ summary line) is also mirrored to a timestamped file in `logs/tests/`.
 against a golden dataset of synthetic threads: confirmed/tentative/unanswered
 plans, hard negatives like vague/cancelled/past-recap threads, bystander cases
 (third-party plans that must never reach the calendar, plus participant-positive
-controls), multi-event threads, stale relative-date resolution, all-day vs.
+controls), multi-event threads, stale relative-date resolution (including bare
+weekdays anchored to a far-out event earlier in the thread), all-day vs.
 timed extraction, and dedup pairs (the same plan reworded, or two different
 plans sharing a date/time — including "different" controls that guard against
 over-merging). A separate **pipeline phase** replays multi-poll scenarios
@@ -158,10 +192,20 @@ duplicate, and cancellations. This calls the real model, so it needs
 zero bystander leaks, all known-duplicate pairs caught with no controls merged,
 and exact create/update counts on every pipeline scenario.
 
+**Eval clock pinning.** What the detector prompt shows as "today" affects
+weekday-dependent cases ("this Thursday" resolves differently depending on the
+real day of the week), so a run's pass/fail must not depend on which day it
+happens to execute. `evals/run.py` pins the clock to the next Wednesday
+on/after the real date (never a fixed calendar date — `main.process_event`
+drops past-dated events against the live clock, so a fixed pin would eventually
+rot every pipeline case). Override with `--today YYYY-MM-DD` or `EVAL_TODAY`
+to reproduce a specific day.
+
 ```bash
 python -m evals.run                     # baseline on the default model
 python -m evals.run --model claude-sonnet-4-6   # compare another model
 python -m evals.run --judge             # add an LLM title-quality score
+python -m evals.run --today 2026-07-16  # reproduce a specific day's eval clock
 pytest -m eval                          # run it as a pass/fail gate
 ```
 

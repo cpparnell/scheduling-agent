@@ -7,20 +7,10 @@ from scheduling_agent import calendar, config, main, reader, state
 
 def _cfg(**overrides):
     cfg = {
-        "lookback_days": 7,
-        "blocked_contacts": [],
-        "confidence_threshold": 0.85,
+        **config.DEFAULTS,
         "target_calendar": "Work",
-        "time_confidence_threshold": config.DEFAULTS["time_confidence_threshold"],
         "dedup_enabled": False,
-        "dedup_model": config.DEFAULTS["dedup_model"],
-        "dedup_day_window": config.DEFAULTS["dedup_day_window"],
-        "dedup_fail_open": config.DEFAULTS["dedup_fail_open"],
         "calendar_query_enabled": False,
-        "fuzzy_title_threshold": config.DEFAULTS["fuzzy_title_threshold"],
-        "evidence_gate_enabled": True,
-        "reconcile_update_enabled": True,
-        "max_watermark_retries": config.DEFAULTS["max_watermark_retries"],
     }
     cfg.update(overrides)
     return cfg
@@ -483,8 +473,9 @@ def test_dedup_disabled_bypasses_adjudicator_entirely(
 def test_dedup_no_nearby_candidates_never_calls_adjudicator(
     one_chat_db, fake_anthropic, fake_dedup_anthropic, spy_create_event
 ):
-    # Existing event is far outside the dedup window.
-    state.record_event(1, "2099-02-14", "19:00", "Unrelated Dinner", status="confirmed")
+    # Existing event is far outside the dedup window AND dissimilar in title,
+    # so neither the near layer nor the far-date layer produces candidates.
+    state.record_event(1, "2099-02-14", "19:00", "Dentist Checkup", status="confirmed")
     fake_anthropic([_response(_event())])
     client = fake_dedup_anthropic([{"is_duplicate": True, "duplicate_of": 0, "reasoning": "n/a"}])
 

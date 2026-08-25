@@ -5,13 +5,9 @@ from scheduling_agent import calendar, config, reconcile, state
 
 def _cfg(**overrides):
     cfg = {
+        **config.DEFAULTS,
         "dedup_enabled": True,
-        "dedup_model": config.DEFAULTS["dedup_model"],
-        "dedup_day_window": 1,
-        "dedup_fail_open": True,
         "calendar_query_enabled": False,
-        "fuzzy_title_threshold": 0.6,
-        "target_calendar": "Calendar",
     }
     cfg.update(overrides)
     return cfg
@@ -334,3 +330,79 @@ def test_calendar_only_candidate_reaches_llm(monkeypatch, fake_dedup_anthropic):
 
     assert decision.action == "skip_duplicate"
     assert decision.matched["calendar_uid"] == "UID-7"
+
+
+# --- far-date candidate layer ---------------------------------------------------
+
+
+def test_far_candidates_same_chat_similar_title_far_date():
+    state.record_event(1, "2099-03-20", None, "Sam dinner celebration", confidence=0.9)
+
+    cands = reconcile.far_candidates(_event(chat_id=1), _cfg())
+
+    assert [c["title"] for c in cands] == ["Sam dinner celebration"]
+
+
+def test_far_candidates_other_chat_excluded():
+    state.record_event(2, "2099-03-20", None, "Sam dinner celebration", confidence=0.9)
+
+    assert reconcile.far_candidates(_event(chat_id=1), _cfg()) == []
+
+
+def test_far_candidates_near_date_excluded():
+    # Near dates are the near layer's job; the far layer must not double-handle.
+    state.record_event(1, "2099-01-16", None, "Sam dinner celebration", confidence=0.9)
+
+    assert reconcile.far_candidates(_event(chat_id=1), _cfg()) == []
+
+
+def test_far_candidates_dissimilar_title_excluded():
+    state.record_event(1, "2099-03-20", None, "Dentist checkup", confidence=0.9)
+
+    assert reconcile.far_candidates(_event(chat_id=1), _cfg()) == []
+
+
+def test_far_match_duplicate_verdict_skips(fake_dedup_anthropic):
+    # The real event was recorded months out; the new detection is the same
+    # plan with a bare weekday mis-resolved to a near-term date.
+    fake_dedup_anthropic([{"is_duplicate": True, "duplicate_of": 0, "reasoning": "mis-dated mention"}])
+    state.record_event(1, "2099-03-20", None, "Dinner with Sam", confidence=0.9)
+
+    decision = reconcile.reconcile(_event(chat_id=1), _cfg())
+
+    assert decision.action == "skip_duplicate"
+    assert decision.source == "llm"
+    assert decision.reasoning == "mis-dated mention"
+
+
+def test_far_match_different_verdict_creates(fake_dedup_anthropic):
+    # Same title far out can be a genuinely new occurrence (recurring plan).
+    fake_dedup_anthropic([{"is_duplicate": False, "duplicate_of": None, "reasoning": "new occurrence"}])
+    state.record_event(1, "2099-03-20", None, "Dinner with Sam", confidence=0.9)
+
+    decision = reconcile.reconcile(_event(chat_id=1), _cfg())
+
+    assert decision.action == "create"
+
+
+def test_far_layer_no_similar_title_never_calls_llm(fake_dedup_anthropic):
+    client = fake_dedup_anthropic([{"is_duplicate": True, "duplicate_of": 0, "reasoning": "n/a"}])
+    state.record_event(1, "2099-03-20", None, "Dentist checkup", confidence=0.9)
+
+    decision = reconcile.reconcile(_event(chat_id=1), _cfg())
+
+    assert decision.action == "create"
+    assert client.messages.calls == []
+
+
+def test_far_layer_skipped_when_near_candidates_exist(fake_dedup_anthropic):
+    client = fake_dedup_anthropic([{"is_duplicate": True, "duplicate_of": 0, "reasoning": "n/a"}])
+    # A near candidate (different chat, same date) AND a far same-chat record.
+    state.record_event(2, "2099-01-15", "12:00", "Sam bday dinner", confidence=0.95)
+    state.record_event(1, "2099-03-20", None, "Dinner with Sam", confidence=0.9)
+
+    reconcile.reconcile(_event(chat_id=1), _cfg())
+
+    prompt = client.messages.calls[0]["messages"][0]["content"]
+    assert "Sam bday dinner" in prompt
+    assert "2099-03-20" not in prompt

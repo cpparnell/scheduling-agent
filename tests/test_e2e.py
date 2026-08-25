@@ -30,20 +30,10 @@ def spy_osascript(monkeypatch):
 
 def _cfg(**overrides):
     cfg = {
-        "lookback_days": 7,
-        "blocked_contacts": [],
-        "confidence_threshold": 0.85,
+        **config.DEFAULTS,
         "target_calendar": "Work",
-        "time_confidence_threshold": config.DEFAULTS["time_confidence_threshold"],
         "dedup_enabled": False,
-        "dedup_model": config.DEFAULTS["dedup_model"],
-        "dedup_day_window": config.DEFAULTS["dedup_day_window"],
-        "dedup_fail_open": config.DEFAULTS["dedup_fail_open"],
         "calendar_query_enabled": False,
-        "fuzzy_title_threshold": config.DEFAULTS["fuzzy_title_threshold"],
-        "evidence_gate_enabled": True,
-        "reconcile_update_enabled": True,
-        "max_watermark_retries": config.DEFAULTS["max_watermark_retries"],
     }
     cfg.update(overrides)
     return cfg

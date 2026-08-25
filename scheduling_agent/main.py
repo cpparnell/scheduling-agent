@@ -250,6 +250,8 @@ def process_new_messages(cfg: dict) -> None:
             last_apple_ts=last_ts,
             lookback_days=cfg["lookback_days"],
             blocked=cfg["blocked_contacts"],
+            date_context_lookback_days=cfg["date_context_lookback_days"],
+            date_context_max=cfg["date_context_max_messages"],
         )
     except RuntimeError as e:
         logger.error("%s", e)

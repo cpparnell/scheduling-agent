@@ -421,6 +421,18 @@ def get_events_near(date_str: str, window_days: int = 1) -> list[dict]:
     return matches
 
 
+def get_active_events() -> list[dict]:
+    """All non-suppressed canonical records across all chats and dates,
+    including records from pending create-journal entries. Used by the
+    far-date reconciliation layer, which matches on title rather than date."""
+    data = _load()
+    return [
+        record
+        for record in data.get("events", []) + _pending_create_records(data)
+        if not record.get("suppressed")
+    ]
+
+
 def get_watermark_hold() -> dict:
     return _load().get("watermark_hold", {"ts": None, "count": 0})
 

@@ -4,7 +4,7 @@ the pipeline scorer) with the LLM faked — no API key needed."""
 from datetime import date
 
 from evals import loader
-from evals.run import _FakeCalendar, score_pipeline_case
+from evals.run import _FakeCalendar, _default_eval_today, score_case, score_pipeline_case
 
 
 def _poll_case(**overrides):
@@ -100,3 +100,50 @@ def test_score_pipeline_case_flags_duplicate_creation(fake_anthropic):
 
     assert result["creates"] == 2
     assert result["passed"] is False
+
+
+def test_weekday_of_day_placeholder_matches_day_offset():
+    today = date(2026, 7, 16)
+    text = loader._substitute("reunion is {day+45}, dinner on {weekday_of_day+45}", today)
+    # 2026-08-30 is a Sunday; both placeholders must land on the same real date.
+    assert text == "reunion is Sunday, August 30, dinner on Sunday"
+
+
+def test_weekday_of_day_placeholder_unknown_token_left_alone():
+    assert loader._substitute("{weekday_of_day+x}", date(2026, 7, 16)) == "{weekday_of_day+x}"
+
+
+def test_days_until_weekday_same_day_is_zero():
+    # 2026-07-16 is a Thursday: "this Thursday" said on a Thursday means today.
+    today = date(2026, 7, 16)
+    assert loader._days_until_weekday(today, "thursday") == 0
+    assert loader._substitute("{thursday}", today) == "Thursday"
+
+
+# --- Eval clock pinning ------------------------------------------------------
+
+
+def test_default_eval_today_is_a_wednesday():
+    # Regardless of which real weekday the test suite runs on, the pinned eval
+    # clock always lands on a Wednesday so "this <weekday>" cases never flake.
+    assert _default_eval_today().weekday() == 2
+
+
+def test_default_eval_today_respects_env_override(monkeypatch):
+    monkeypatch.setenv("EVAL_TODAY", "2026-01-05")  # a Monday
+    assert _default_eval_today() == date(2026, 1, 5)
+
+
+def test_score_case_sends_pinned_wednesday_header_to_the_model(fake_anthropic):
+    client = fake_anthropic([{"events": []}])
+    case = {
+        "id": "pin_test", "category": "positive",
+        "participants": ["+15551234567"],
+        "messages": [{"from_me": False, "text": "dinner friday?", "hours_ago": 2}],
+        "expected": {"has_event": False},
+    }
+
+    score_case(case, model="fake")
+
+    sent = client.messages.calls[0]["messages"][0]["content"]
+    assert "[Today is Wednesday" in sent
