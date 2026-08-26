@@ -1,6 +1,10 @@
+import argparse
 import logging
+import logging.handlers
+import shutil
 import signal
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -27,7 +31,12 @@ def setup_logging() -> None:
     console.setFormatter(formatter)
     root.addHandler(console)
 
-    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    # Rotating rather than a plain FileHandler: under launchd this process runs
+    # indefinitely instead of once per terminal session, so an unbounded
+    # single file is no longer safe to assume.
+    file_handler = logging.handlers.RotatingFileHandler(
+        log_file, maxBytes=10_000_000, backupCount=5, encoding="utf-8"
+    )
     file_handler.setFormatter(formatter)
     root.addHandler(file_handler)
 
@@ -307,7 +316,68 @@ def process_new_messages(cfg: dict) -> None:
                 state.set_watermark_hold(last_ts, count)
 
 
+def purge() -> None:
+    """Delete all local state (canonical event store, journal, watermark) and
+    logs. Does not touch anything on the Calendar or in Messages."""
+    removed = []
+    if state.STATE_FILE.exists():
+        state.STATE_FILE.unlink()
+        removed.append(str(state.STATE_FILE))
+    if LOGS_DIR.parent.exists():
+        shutil.rmtree(LOGS_DIR.parent)
+        removed.append(str(LOGS_DIR.parent))
+
+    if removed:
+        print("Removed:")
+        for path in removed:
+            print(f"  {path}")
+    else:
+        print("Nothing to remove.")
+
+
+class _PollTimer:
+    """Repeating backstop timer that re-runs `callback` every
+    `interval_minutes`, independent of the filesystem watcher, in case a
+    chat.db change event is ever missed."""
+
+    def __init__(self, callback, interval_minutes: float):
+        self._callback = callback
+        self._interval = interval_minutes * 60
+        self._timer: threading.Timer | None = None
+
+    def start(self) -> None:
+        self._schedule()
+
+    def stop(self) -> None:
+        if self._timer is not None:
+            self._timer.cancel()
+
+    def _schedule(self) -> None:
+        self._timer = threading.Timer(self._interval, self._fire)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def _fire(self) -> None:
+        try:
+            self._callback()
+        except Exception:
+            logger.exception("Error in poll-fallback callback")
+        finally:
+            self._schedule()
+
+
 def main() -> None:
+    parser = argparse.ArgumentParser(prog="scheduling-agent")
+    parser.add_argument(
+        "--purge", action="store_true",
+        help="Delete local state and logs (~/.scheduling-agent/state.json and ./logs), then exit.",
+    )
+    args = parser.parse_args()
+
+    if args.purge:
+        purge()
+        return
+
     setup_logging()
     cfg = config.load()
     logger.info("Scheduling agent starting (calendar=%s)", cfg["target_calendar"])
@@ -323,9 +393,18 @@ def main() -> None:
 
     observer = watcher.watch(on_change, debounce_seconds=5.0)
 
+    poll_timer = None
+    poll_interval = cfg.get("poll_interval_minutes") or 0
+    if poll_interval > 0:
+        poll_timer = _PollTimer(on_change, poll_interval)
+        poll_timer.start()
+        logger.info("Poll fallback active every %s minute(s)", poll_interval)
+
     def shutdown(sig, frame):
         logger.info("Shutting down...")
         observer.stop()
+        if poll_timer is not None:
+            poll_timer.stop()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, shutdown)

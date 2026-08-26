@@ -85,14 +85,26 @@ up to a bounded number of retries, so a transient failure doesn't silently drop 
 
 ## Setup
 
+**Quick install:**
+
+```bash
+./scripts/setup.sh
+```
+
+Creates the venv, installs the package, walks you through the API key, checks
+whether Full Disk Access looks granted, and optionally installs a launchd
+agent (see "Running in the background" below) so you don't have to leave a
+terminal open. It's a thin wrapper around the manual steps below — read on if
+you'd rather do it by hand or understand what it does.
+
 1. **Grant Full Disk Access** so the agent can read the iMessage database: System Settings → Privacy & Security → Full Disk Access → add Terminal (or your Python binary).
 
-2. **Create a virtual environment and install dependencies:**
+2. **Create a virtual environment and install:**
 
    ```bash
    python3 -m venv venv
    source venv/bin/activate
-   pip install -r requirements.txt
+   pip install -e .
    ```
 
 3. **Set your API key:** copy the example env file and fill in your key.
@@ -107,10 +119,37 @@ up to a bounded number of retries, so a transient failure doesn't silently drop 
 
 ```bash
 source venv/bin/activate
-python main.py
+scheduling-agent
 ```
 
-On startup the agent scans the last 7 days of messages, then keeps running and processes new messages as they arrive. Press Ctrl+C to stop.
+(equivalently `python -m scheduling_agent`, or the older `python main.py`.)
+
+On startup the agent scans the last 7 days of messages, then keeps running and processes new messages as they arrive: normally triggered by a `chat.db` filesystem event, with a `poll_interval_minutes`-based timer as a backstop in case an event is ever missed. Press Ctrl+C to stop.
+
+### Running in the background
+
+A foreground terminal isn't a great way to run something meant to stay up.
+`scripts/install-launchagent.sh` installs a `launchd` agent that starts on
+login and restarts automatically if the process crashes:
+
+```bash
+./scripts/install-launchagent.sh
+```
+
+Supervisor-level output goes to `~/Library/Logs/scheduling-agent/launchd.log`;
+the agent's own detailed log still goes to `logs/stdout/` as described below.
+`launchctl unload ~/Library/LaunchAgents/com.scheduling-agent.plist` stops and
+disables it.
+
+### Removing your data
+
+```bash
+scheduling-agent --purge
+```
+
+Deletes `~/.scheduling-agent/state.json` (the canonical event store, including
+quoted message evidence) and everything under `logs/`, then exits. It does not
+touch Calendar or Messages — events already created stay on your calendar.
 
 ## Configuration
 
@@ -135,6 +174,7 @@ The config file lives at `~/.scheduling-agent/config.json` and is created with d
 | `evidence_gate_enabled` | `true` | Drop detected plans whose quoted evidence (or date evidence) isn't found verbatim in the thread (hallucination guard) |
 | `reconcile_update_enabled` | `true` | Let reconciliation matches update the existing calendar event (reschedules, added locations); off treats them as skips |
 | `max_watermark_retries` | `3` | How many consecutive polls to retry a thread whose detection failed before giving up and advancing past it |
+| `poll_interval_minutes` | `15` | Backstop poll interval, independent of the filesystem watcher, in case a `chat.db` change event is ever missed. `0` disables it |
 
 Upgrading from v0.4: `tentative_confidence_threshold` was removed (a stale key in an existing
 config.json is ignored). The state file migrates automatically to schema v4; previously created
@@ -142,7 +182,11 @@ config.json is ignored). The state file migrates automatically to schema v4; pre
 
 State (the last-processed message timestamp, dedup hashes, and descriptive records of created
 events — including the calendar event UID — used for dedup adjudication) is stored in
-`~/.scheduling-agent/state.json`.
+`~/.scheduling-agent/state.json`. Quoted message `evidence` is truncated to
+`state.EVIDENCE_MAX_CHARS` (240 characters) before being written, and log lines that would
+otherwise include a verbatim quote are truncated the same way — enough context for the dedup
+adjudicator to keep working, without keeping a full plaintext transcript on disk indefinitely.
+Run `scheduling-agent --purge` to delete it (see "Removing your data" above).
 
 ## Testing
 
@@ -220,15 +264,20 @@ placeholders that are resolved relative to the current day at runtime, so they
 never go stale.
 
 **Log directories** — three separate locations, one per entry point: `logs/stdout/`
-(the live agent, `python main.py`), `logs/evals/` (`python -m evals.run`), and
-`logs/tests/` (`pytest`).
+(the live agent, `scheduling-agent`), `logs/evals/` (`python -m evals.run`), and
+`logs/tests/` (`pytest`). The live agent's log file rotates at 10MB (5 backups
+kept) so a long-running background process (see "Running in the background")
+doesn't grow it unbounded.
 
 ## Project structure
 
 ```
-main.py                # Thin entry point
+main.py                # Thin entry point (python main.py); scheduling-agent console
+                        # command and python -m scheduling_agent do the same thing
 scheduling_agent/
-├── main.py            # process_new_messages(), per-event gates (process_event), journal recovery
+├── __main__.py        # Enables `python -m scheduling_agent`
+├── main.py            # process_new_messages(), per-event gates (process_event), journal
+                        # recovery, poll-fallback timer, --purge flag
 ├── config.py          # Loads ~/.scheduling-agent/config.json
 ├── state.py           # Canonical event store, write-ahead journal, checkpoint, dedup hashes
 ├── reader.py          # Reads iMessage threads from chat.db
@@ -237,6 +286,10 @@ scheduling_agent/
 ├── dedup.py           # LLM adjudicator: is a new detection the same plan as an existing event?
 ├── calendar.py        # Apple Calendar create/update/query via osascript (timed + all-day)
 └── watcher.py         # Filesystem watcher with debounce
+scripts/
+├── setup.sh                    # venv + install + API key + launchd prompt
+├── install-launchagent.sh      # Installs/reloads the launchd agent
+└── com.scheduling-agent.plist  # launchd agent template (RunAtLoad, KeepAlive)
 tests/                 # Offline unit/integration tests (pytest)
 └── fixtures/chatdb.py # Builds a temp chat.db + encodes attributedBody blobs
 evals/                 # Paid detection eval (golden dataset + runner)
@@ -248,4 +301,9 @@ evals/                 # Paid detection eval (golden dataset + runner)
 ## Privacy notes
 
 - The iMessage database is opened **read-only**; the agent never modifies your messages.
-- Message text from new threads is sent to the Anthropic API for plan detection. Use `blocked_contacts` to exclude conversations you don't want processed.
+- Message text from new threads is sent to the Anthropic API for plan detection, including
+  the phone numbers/emails of everyone in the thread as participant context — not just the
+  device owner's. Use `blocked_contacts` to exclude conversations you don't want processed.
+- Quoted message evidence stored in `~/.scheduling-agent/state.json` (and written to logs) is
+  truncated, not stored/logged in full — see "Configuration" above. Run `scheduling-agent
+  --purge` at any time to delete all local state and logs.
