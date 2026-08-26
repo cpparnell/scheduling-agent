@@ -138,6 +138,9 @@ login and restarts automatically if the process crashes:
 
 Supervisor-level output goes to `~/Library/Logs/scheduling-agent/launchd.log`;
 the agent's own detailed log still goes to `logs/stdout/` as described below.
+Note that `launchd.log` is a raw, unrotated redirect of the same stdout stream
+`logs/stdout/` captures (rotated) — it carries the same truncated-but-still
+evidence-bearing lines and will grow unbounded if you never run `--purge`.
 `launchctl unload ~/Library/LaunchAgents/com.scheduling-agent.plist` stops and
 disables it.
 
@@ -148,8 +151,10 @@ scheduling-agent --purge
 ```
 
 Deletes `~/.scheduling-agent/state.json` (the canonical event store, including
-quoted message evidence) and everything under `logs/`, then exits. It does not
-touch Calendar or Messages — events already created stay on your calendar.
+quoted message evidence), everything under `logs/`, and, if present,
+`~/Library/Logs/scheduling-agent/` (the launchd supervisor log — see "Running
+in the background" above), then exits. It does not touch Calendar or Messages
+— events already created stay on your calendar.
 
 ## Configuration
 

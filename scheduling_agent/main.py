@@ -316,6 +316,9 @@ def process_new_messages(cfg: dict) -> None:
                 state.set_watermark_hold(last_ts, count)
 
 
+LAUNCHD_LOG_DIR = Path.home() / "Library" / "Logs" / "scheduling-agent"
+
+
 def purge() -> None:
     """Delete all local state (canonical event store, journal, watermark) and
     logs. Does not touch anything on the Calendar or in Messages."""
@@ -326,6 +329,12 @@ def purge() -> None:
     if LOGS_DIR.parent.exists():
         shutil.rmtree(LOGS_DIR.parent)
         removed.append(str(LOGS_DIR.parent))
+    # launchd redirects raw stdout/stderr here (see install-launchagent.sh);
+    # it's a separate, unrotated log containing the same truncated-but-still
+    # evidence-bearing lines as logs/stdout/, so it must be purged too.
+    if LAUNCHD_LOG_DIR.exists():
+        shutil.rmtree(LAUNCHD_LOG_DIR)
+        removed.append(str(LAUNCHD_LOG_DIR))
 
     if removed:
         print("Removed:")
@@ -333,6 +342,36 @@ def purge() -> None:
             print(f"  {path}")
     else:
         print("Nothing to remove.")
+
+
+class _RunGate:
+    """Serializes runs of `run_fn` triggered by the filesystem watcher and the
+    poll-fallback timer, since state._save() is a non-atomic write with no
+    locking of its own — concurrent runs could corrupt state.json or double
+    up a calendar event.
+
+    `blocking()` waits for the lock (used by the watcher, which should never
+    silently drop a detected change). `skip_if_busy()` does not block: if a
+    run is already in progress, the tick is skipped entirely rather than
+    queued, since the next scheduled tick will pick up any new messages.
+    """
+
+    def __init__(self, run_fn):
+        self._run_fn = run_fn
+        self._lock = threading.Lock()
+
+    def blocking(self) -> None:
+        with self._lock:
+            self._run_fn()
+
+    def skip_if_busy(self) -> None:
+        if not self._lock.acquire(blocking=False):
+            logger.info("Poll fallback skipping tick; a run is already in progress")
+            return
+        try:
+            self._run_fn()
+        finally:
+            self._lock.release()
 
 
 class _PollTimer:
@@ -386,17 +425,17 @@ def main() -> None:
     recover_journal(cfg)
     process_new_messages(cfg)
 
-    # Then watch for future changes
-    def on_change():
+    def run() -> None:
         cfg_fresh = config.load()
         process_new_messages(cfg_fresh)
 
-    observer = watcher.watch(on_change, debounce_seconds=5.0)
+    gate = _RunGate(run)
+    observer = watcher.watch(gate.blocking, debounce_seconds=5.0)
 
     poll_timer = None
     poll_interval = cfg.get("poll_interval_minutes") or 0
     if poll_interval > 0:
-        poll_timer = _PollTimer(on_change, poll_interval)
+        poll_timer = _PollTimer(gate.skip_if_busy, poll_interval)
         poll_timer.start()
         logger.info("Poll fallback active every %s minute(s)", poll_interval)
 
