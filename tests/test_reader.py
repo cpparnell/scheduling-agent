@@ -405,3 +405,52 @@ def test_date_context_lookback_measured_from_now_not_cutoff(fake_chat_db):
     )
     msgs_wide = [m["text"] for m in threads_wide[0]["messages"]]
     assert "the trip is October 10!" in msgs_wide
+
+
+# --- F1: is_context tagging -------------------------------------------------
+
+
+def test_new_messages_are_tagged_is_context_false(fake_chat_db):
+    fake_chat_db([{
+        "participants": ["+15551234567"],
+        "messages": [
+            {"text": "dinner friday?", "from_me": False, "unix_ts": _recent(1)},
+        ],
+    }])
+
+    threads = reader.get_threads_since(None, lookback_days=7, blocked=[])
+
+    assert threads[0]["messages"][0]["is_context"] is False
+
+
+def test_prepended_context_window_messages_are_tagged_is_context_true(fake_chat_db):
+    fake_chat_db([_windowed_chat("the trip is October 10!", anchor_hours_ago=24 * 20)])
+
+    cutoff = reader.unix_to_apple(_recent(24))
+    threads = reader.get_threads_since(cutoff, lookback_days=7, blocked=[])
+
+    msgs = threads[0]["messages"]
+    by_text = {m["text"]: m["is_context"] for m in msgs}
+    # The date anchor and the filler context messages are all replayed
+    # context; only the post-cutoff message is genuinely new this poll.
+    assert by_text["the trip is October 10!"] is True
+    assert by_text["filler 30"] is True  # newest filler, guaranteed inside the 30-window
+    assert by_text["on friday we leave"] is False
+
+
+def test_cold_start_anchor_is_tagged_is_context_true(fake_chat_db):
+    # Cold-start anchors (F6d) are still context, not new — even though
+    # there's no replay window, they aren't this-poll's own content either.
+    fake_chat_db([{
+        "participants": ["+15551234567"],
+        "messages": [
+            {"text": "the trip is October 10!", "from_me": False, "unix_ts": _recent(24 * 20)},
+            {"text": "on friday we leave", "from_me": False, "unix_ts": _recent(1)},
+        ],
+    }])
+
+    threads = reader.get_threads_since(None, lookback_days=7, blocked=[])
+
+    by_text = {m["text"]: m["is_context"] for m in threads[0]["messages"]}
+    assert by_text["the trip is October 10!"] is True
+    assert by_text["on friday we leave"] is False

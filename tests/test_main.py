@@ -228,6 +228,105 @@ def test_non_participant_gate_beats_confirmed_status(
     assert spy_create_event["calls"] == []
 
 
+# --- F7: observations + anti-flap guard -------------------------------------
+
+
+def test_unanswered_skip_records_an_observation():
+    result = main.process_event(_event(chat_id=1, status="unanswered"), _cfg())
+
+    assert result == "skipped:unanswered"
+    obs = state.get_observation(1, FUTURE_DATE, "19:00", "Dinner")
+    assert obs is not None
+    assert obs["last_status"] == "unanswered"
+    assert obs["count"] == 1
+
+
+def test_not_participant_skip_records_an_observation():
+    event = _event(
+        chat_id=1, user_is_participant=False, participation_evidence="not the user's plan"
+    )
+    result = main.process_event(event, _cfg())
+
+    assert result == "skipped:not-participant"
+    obs = state.get_observation(1, FUTURE_DATE, "19:00", "Dinner")
+    assert obs is not None
+    assert obs["last_status"] == "not-participant"
+
+
+def test_low_confidence_skip_records_an_observation():
+    event = _event(chat_id=1, confidence=0.5)
+    result = main.process_event(event, _cfg(confidence_threshold=0.85))
+
+    assert result == "skipped:low-confidence"
+    obs = state.get_observation(1, FUTURE_DATE, "19:00", "Dinner")
+    assert obs is not None
+    assert obs["last_status"] == "low-confidence"
+
+
+def test_observation_count_increments_across_repeated_skips():
+    main.process_event(_event(chat_id=1, status="unanswered"), _cfg())
+    main.process_event(_event(chat_id=1, status="unanswered"), _cfg())
+    main.process_event(_event(chat_id=1, status="unanswered"), _cfg())
+
+    obs = state.get_observation(1, FUTURE_DATE, "19:00", "Dinner")
+    assert obs["count"] == 3
+
+
+def test_anti_flap_reverts_confirmed_to_unanswered_with_no_new_user_message(
+    spy_create_event,
+):
+    # First poll: unanswered, correctly skipped and observed.
+    main.process_event(_event(chat_id=1, status="unanswered"), _cfg())
+
+    # A later poll flips to confirmed but the event carries no new message
+    # from the user (stale context re-analysis, not a real acceptance).
+    flipped = _event(chat_id=1, status="confirmed", **{"_new_msg_from_user": False})
+    result = main.process_event(flipped, _cfg())
+
+    assert result == "skipped:unanswered"
+    assert spy_create_event["calls"] == []
+
+
+def test_anti_flap_does_not_block_a_genuine_new_acceptance(spy_create_event):
+    main.process_event(_event(chat_id=1, status="unanswered"), _cfg())
+
+    # This time the flip DOES carry a new message from the user — a real
+    # acceptance — and must be allowed through normally.
+    accepted = _event(chat_id=1, status="confirmed", **{"_new_msg_from_user": True})
+    result = main.process_event(accepted, _cfg())
+
+    assert result == "created"
+    assert len(spy_create_event["calls"]) == 1
+
+
+def test_anti_flap_does_not_trigger_without_prior_unanswered_observation(
+    spy_create_event,
+):
+    # No observation history at all (e.g. state was purged, or this is the
+    # first time this hash has ever been seen) — confirmed with no new user
+    # message still creates normally; the guard only fires against a known
+    # prior "unanswered" observation, it isn't a general-purpose block.
+    event = _event(chat_id=1, status="confirmed", **{"_new_msg_from_user": False})
+    result = main.process_event(event, _cfg())
+
+    assert result == "created"
+    assert len(spy_create_event["calls"]) == 1
+
+
+def test_new_msg_from_user_missing_defaults_to_true_preserving_old_behavior(
+    spy_create_event,
+):
+    # An event dict with no "_new_msg_from_user" key at all (e.g. constructed
+    # by code that predates F7) must not be treated as guard-triggering.
+    main.process_event(_event(chat_id=1, status="unanswered"), _cfg())
+    event = _event(chat_id=1, status="confirmed")
+    assert "_new_msg_from_user" not in event
+
+    result = main.process_event(event, _cfg())
+
+    assert result == "created"
+
+
 def test_past_event_is_skipped(one_chat_db, fake_anthropic, spy_create_event):
     fake_anthropic([_response(_event(date="2020-01-01"))])
 

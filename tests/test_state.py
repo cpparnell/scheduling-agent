@@ -331,6 +331,83 @@ def test_prune_state_keeps_recent_event_hash_and_title_key_in_sync():
     assert key in data["title_events"]
 
 
+# --- v6: observations map (F7 anti-flap guard) -------------------------------
+
+
+def test_v5_to_v6_migration_adds_empty_observations():
+    legacy = {
+        "schema_version": 5,
+        "created_events": {},
+        "title_events": {},
+        "events": [],
+        "journal": [],
+        "watermark_hold": {"ts": None, "count": 0},
+    }
+    migrated = state._migrate(dict(legacy))
+    assert migrated["schema_version"] == state.CURRENT_SCHEMA_VERSION
+    assert migrated["observations"] == {}
+
+
+def test_v0_to_v6_migration_chain_adds_observations():
+    legacy = {"last_processed_timestamp": 42, "created_events": ["x"]}
+    migrated = state._migrate(dict(legacy))
+    assert migrated["schema_version"] == state.CURRENT_SCHEMA_VERSION
+    assert migrated["observations"] == {}
+
+
+def test_record_observation_round_trips():
+    state.record_observation(1, "2026-06-13", "19:00", "Dinner", "unanswered")
+
+    obs = state.get_observation(1, "2026-06-13", "19:00", "Dinner")
+    assert obs is not None
+    assert obs["last_status"] == "unanswered"
+    assert obs["date"] == "2026-06-13"
+    assert obs["count"] == 1
+
+
+def test_get_observation_returns_none_when_never_recorded():
+    assert state.get_observation(1, "2026-06-13", "19:00", "Dinner") is None
+
+
+def test_record_observation_increments_count_and_updates_status():
+    state.record_observation(1, "2026-06-13", "19:00", "Dinner", "unanswered")
+    state.record_observation(1, "2026-06-13", "19:00", "Dinner", "low-confidence")
+
+    obs = state.get_observation(1, "2026-06-13", "19:00", "Dinner")
+    assert obs["count"] == 2
+    assert obs["last_status"] == "low-confidence"
+
+
+def test_prune_state_drops_stale_observations():
+    old_date = (date_type.today() - timedelta(days=state.EVENT_RECORD_RETENTION_DAYS + 5)).isoformat()
+    recent_date = date_type.today().isoformat()
+    data = {
+        "events": [],
+        "created_events": {},
+        "title_events": {},
+        "observations": {
+            "stale-hash": {"last_status": "unanswered", "date": old_date, "count": 1},
+            "fresh-hash": {"last_status": "unanswered", "date": recent_date, "count": 1},
+        },
+    }
+    state._prune_state(data)
+    assert "stale-hash" not in data["observations"]
+    assert "fresh-hash" in data["observations"]
+
+
+def test_prune_state_keeps_malformed_observation_date_rather_than_dropping():
+    data = {
+        "events": [],
+        "created_events": {},
+        "title_events": {},
+        "observations": {
+            "weird-hash": {"last_status": "unanswered", "date": None, "count": 1},
+        },
+    }
+    state._prune_state(data)
+    assert "weird-hash" in data["observations"]
+
+
 def test_pending_journal_entry_trips_is_duplicate():
     record = state.make_record(1, "2026-06-13", "19:00", "Dinner")
     state.journal_intent(record)

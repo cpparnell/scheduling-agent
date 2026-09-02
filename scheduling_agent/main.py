@@ -49,6 +49,7 @@ def process_event(event: dict, cfg: dict) -> str:
     confidence = event["confidence"]
     status = event.get("status", "confirmed")
     evidence = event.get("evidence")
+    new_msg_from_user = event.get("_new_msg_from_user", True)
 
     try:
         event_date = datetime.strptime(date, "%Y-%m-%d").date()
@@ -67,12 +68,29 @@ def process_event(event: dict, cfg: dict) -> str:
             "Skipping non-participant plan: %s on %s — %s",
             title, date, event.get("participation_evidence"),
         )
+        state.record_observation(chat_id, date, time_start, title, "not-participant")
         return "skipped:not-participant"
 
-    # An invitation nobody has answered is not calendar-worthy yet. It is not
-    # recorded either, so a later acceptance re-detects and creates it.
+    # Anti-flap guard (F7): a hash last observed unanswered flipping to
+    # confirmed/tentative with no new message from "Me" is more likely stale
+    # context re-analysis than a genuine acceptance — demote it back rather
+    # than trust a single poll. A real acceptance always shows up as a new
+    # message from the user, so this never blocks one.
+    if status in ("confirmed", "tentative") and not new_msg_from_user:
+        obs = state.get_observation(chat_id, date, time_start, title)
+        if obs and obs.get("last_status") == "unanswered":
+            logger.info(
+                "Anti-flap: reverting %s->unanswered with no new user message: %s on %s",
+                status, title, date,
+            )
+            status = "unanswered"
+
+    # An invitation nobody has answered is not calendar-worthy yet. Its
+    # observation IS recorded (unlike before F7), so a later flip to
+    # confirmed/tentative with still no new user message can be caught above.
     if status == "unanswered":
         logger.info("Skipping unanswered invitation: %s on %s", title, date)
+        state.record_observation(chat_id, date, time_start, title, "unanswered")
         return "skipped:unanswered"
 
     # Single confidence bar: tentative is a classification (the user explicitly
@@ -82,6 +100,7 @@ def process_event(event: dict, cfg: dict) -> str:
             "Skipping low-confidence %s event (%.2f < %.2f): %s",
             status, confidence, cfg["confidence_threshold"], title,
         )
+        state.record_observation(chat_id, date, time_start, title, "low-confidence")
         return "skipped:low-confidence"
 
     if time_start is not None and time_confidence < cfg["time_confidence_threshold"]:
@@ -264,7 +283,9 @@ def process_new_messages(cfg: dict) -> None:
     logger.info("Found %d thread(s) with new messages", len(threads))
 
     events, failed_chats = detector.detect_plans(
-        threads, evidence_gate=cfg["evidence_gate_enabled"]
+        threads,
+        evidence_gate=cfg["evidence_gate_enabled"],
+        context_marking_enabled=cfg["context_marking_enabled"],
     )
 
     counts = {"created": 0, "updated": 0, "skipped": 0}

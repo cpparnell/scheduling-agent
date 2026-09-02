@@ -12,7 +12,7 @@ STATE_FILE = STATE_DIR / "state.json"
 
 # Bump this whenever the on-disk state shape changes, and add a corresponding
 # step in _migrate(). Files written before versioning are treated as version 0.
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 6
 
 # Events with the same chat + normalized title within this many days are treated
 # as the same occurrence and deduplicated.
@@ -46,6 +46,13 @@ def _new_state() -> dict:
         # Tracks how many consecutive polls have failed to advance the
         # watermark past a bad thread, so main.py can cap retries.
         "watermark_hold": {"ts": None, "count": 0},
+        # Maps dedup hash -> {last_status, last_seen, date, count} for
+        # detections main.process_event skipped (unanswered, not-participant,
+        # low-confidence) — these previously left no record at all, so a
+        # single flaky poll's confirmation of a hash last seen "unanswered"
+        # had no history to check against. See record_observation/
+        # get_observation and main.py's anti-flap guard.
+        "observations": {},
     }
 
 
@@ -100,6 +107,11 @@ def _migrate(data: dict) -> dict:
                 h: events_by_hash.get(h, today_str) for h in old_created
             }
         version = 5
+    if version < 6:
+        # v6: observations map for skipped (not created) detections, so an
+        # anti-flap check has history to consult instead of none at all.
+        data.setdefault("observations", {})
+        version = 6
     data["schema_version"] = CURRENT_SCHEMA_VERSION
     return data
 
@@ -422,12 +434,15 @@ def update_record(
 
 
 def _prune_state(data: dict) -> None:
-    """Prune `events`, `created_events`, and `title_events` together against
-    the same retention cutoff, in place. Keeping these three in lockstep is
-    what lets is_duplicate() and find_record() agree: a hash or title key
-    that outlives the record it came from is what previously caused
-    is_duplicate()=True / find_record()=None (a duplicate detection silently
-    dropped with no record to reconcile against)."""
+    """Prune `events`, `created_events`, `title_events`, and `observations`
+    together against the same retention cutoff, in place. Keeping the first
+    three in lockstep is what lets is_duplicate() and find_record() agree: a
+    hash or title key that outlives the record it came from is what
+    previously caused is_duplicate()=True / find_record()=None (a duplicate
+    detection silently dropped with no record to reconcile against).
+    `observations` never had this failure mode (it's read defensively via
+    get_observation, not asserted against) but is pruned the same way so it
+    doesn't grow unbounded either."""
     cutoff = date_type.today() - timedelta(days=EVENT_RECORD_RETENTION_DAYS)
 
     kept = []
@@ -458,6 +473,50 @@ def _prune_state(data: dict) -> None:
         except (ValueError, TypeError):
             pruned_title[k] = d
     data["title_events"] = pruned_title
+
+    observations = data.get("observations", {})
+    pruned_observations = {}
+    for h, obs in observations.items():
+        d = obs.get("date")
+        try:
+            if d is not None and date_type.fromisoformat(d) >= cutoff:
+                pruned_observations[h] = obs
+            elif d is None:
+                pruned_observations[h] = obs  # malformed: keep rather than silently drop
+        except (ValueError, TypeError):
+            pruned_observations[h] = obs
+    data["observations"] = pruned_observations
+
+
+# --- Observations (F7 anti-flap guard) --------------------------------------
+
+
+def record_observation(
+    chat_id: int, date: str, time_start: str | None, title: str, status: str
+) -> None:
+    """Record that a detection was skipped (not created) with this status —
+    unanswered, not-participant, or low-confidence. Written even though no
+    calendar event resulted, so a later poll can tell a genuine acceptance
+    apart from a single flaky re-classification of stale replayed context
+    (see main.py's anti-flap guard, which consults get_observation)."""
+    data = _load()
+    h = event_hash(chat_id, date, time_start, title)
+    observations = data.setdefault("observations", {})
+    prev = observations.get(h)
+    observations[h] = {
+        "last_status": status,
+        "last_seen": datetime.now().isoformat(),
+        "date": date,
+        "count": (prev.get("count", 0) + 1) if prev else 1,
+    }
+    _prune_state(data)
+    _save(data)
+
+
+def get_observation(chat_id: int, date: str, time_start: str | None, title: str) -> dict | None:
+    data = _load()
+    h = event_hash(chat_id, date, time_start, title)
+    return data.get("observations", {}).get(h)
 
 
 def get_events_near(date_str: str, window_days: int = 1) -> list[dict]:

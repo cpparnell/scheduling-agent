@@ -48,6 +48,12 @@ DEFAULTS = {
     # How many consecutive polls to hold the watermark back for a thread that
     # keeps failing detection, before giving up and advancing past it anyway.
     "max_watermark_retries": 3,
+    # Mark replayed context vs. newly-arrived messages in the prompt, and
+    # instruct the model not to re-emit a plan whose only trace is old
+    # context — attacks duplicate re-detection at the source (every poll
+    # replays the same context window). Disable to fall back to the
+    # unmarked prompt.
+    "context_marking_enabled": True,
 }
 
 

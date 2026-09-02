@@ -374,6 +374,7 @@ def score_pipeline_case(
             events, _failed = detector.detect_plans(
                 [thread], model=model, evidence_gate=cfg["evidence_gate_enabled"],
                 today=datetime.combine(today, time(12, 0)),
+                context_marking_enabled=cfg["context_marking_enabled"],
             )
             for event in events:
                 outcomes.append(main.process_event(event, cfg))

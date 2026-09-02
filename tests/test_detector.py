@@ -262,6 +262,79 @@ def test_format_thread_omits_age_for_recent_messages():
     assert "sent" not in out
 
 
+def test_format_thread_omits_separators_when_no_message_is_context():
+    thread = _thread(messages=[
+        {"sender": "+15551234567", "text": "dinner friday?", "from_me": False,
+         "unix_ts": 1700000000.0, "is_context": False},
+        {"sender": "me", "text": "yes 7pm", "from_me": True, "unix_ts": 1700000100.0,
+         "is_context": False},
+    ])
+
+    out = detector._format_thread(thread)
+
+    assert detector._CONTEXT_HEADER not in out
+    assert detector._NEW_HEADER not in out
+
+
+def test_format_thread_omits_separators_when_is_context_key_absent():
+    # Legacy/production shape where messages simply don't carry the key at
+    # all (rather than explicit False) must behave identically.
+    thread = _thread()  # default messages have no is_context key
+
+    out = detector._format_thread(thread)
+
+    assert detector._CONTEXT_HEADER not in out
+    assert detector._NEW_HEADER not in out
+
+
+def test_format_thread_inserts_separators_for_mixed_context():
+    thread = _thread(messages=[
+        {"sender": "+15551234567", "text": "dinner friday?", "from_me": False,
+         "unix_ts": 1700000000.0, "is_context": True},
+        {"sender": "me", "text": "yes 7pm", "from_me": True, "unix_ts": 1700000100.0,
+         "is_context": True},
+        {"sender": "+15551234567", "text": "can't wait!!", "from_me": False,
+         "unix_ts": 1700000200.0, "is_context": False},
+    ])
+
+    out = detector._format_thread(thread)
+
+    assert detector._CONTEXT_HEADER in out
+    assert detector._NEW_HEADER in out
+    # Context header precedes the new-message header, which precedes the
+    # actual new message content.
+    ctx_idx = out.index(detector._CONTEXT_HEADER)
+    new_idx = out.index(detector._NEW_HEADER)
+    msg_idx = out.index("can't wait")
+    assert ctx_idx < new_idx < msg_idx
+
+
+def test_format_thread_context_marking_disabled_omits_separators():
+    thread = _thread(messages=[
+        {"sender": "+15551234567", "text": "dinner friday?", "from_me": False,
+         "unix_ts": 1700000000.0, "is_context": True},
+        {"sender": "me", "text": "yes 7pm", "from_me": True, "unix_ts": 1700000100.0,
+         "is_context": False},
+    ])
+
+    out = detector._format_thread(thread, context_marking_enabled=False)
+
+    assert detector._CONTEXT_HEADER not in out
+    assert detector._NEW_HEADER not in out
+
+
+def test_format_thread_all_context_shows_only_context_header():
+    thread = _thread(messages=[
+        {"sender": "+15551234567", "text": "dinner friday?", "from_me": False,
+         "unix_ts": 1700000000.0, "is_context": True},
+    ])
+
+    out = detector._format_thread(thread)
+
+    assert detector._CONTEXT_HEADER in out
+    assert detector._NEW_HEADER not in out
+
+
 def test_create_call_uses_expected_model_system_and_schema(fake_anthropic):
     client = fake_anthropic([_response(_event())])
 
@@ -269,8 +342,18 @@ def test_create_call_uses_expected_model_system_and_schema(fake_anthropic):
 
     call = client.messages.calls[0]
     assert call["model"] == detector.MODEL
-    assert call["system"] == detector.SYSTEM_PROMPT
+    # context_marking_enabled defaults True, so the addendum is appended.
+    assert call["system"] == detector.SYSTEM_PROMPT + detector._CONTEXT_MARKING_ADDENDUM
     assert call["output_config"]["format"]["schema"] is detector.RESPONSE_SCHEMA
+
+
+def test_context_marking_disabled_uses_bare_system_prompt(fake_anthropic):
+    client = fake_anthropic([_response(_event())])
+
+    detector.detect_plans([_thread()], context_marking_enabled=False)
+
+    call = client.messages.calls[0]
+    assert call["system"] == detector.SYSTEM_PROMPT
 
 
 def test_model_override_is_passed_through(fake_anthropic):
@@ -682,3 +765,45 @@ def test_demote_leaves_already_unanswered_status_untouched():
     event = _event(status="unanswered")
     detector._demote_if_user_silent(event, thread)
     assert event["status"] == "unanswered"
+
+
+def test_demote_uses_distinct_senders_when_participants_list_undercounts():
+    # C9: chat_handle_join can miss a handle row, leaving `participants` with
+    # only one entry even though two distinct non-"Me" senders are actually
+    # in the thread. Distinct-sender counting must still catch the group.
+    thread = _thread(participants=("+15551111111",), messages=[
+        {"sender": "+15551111111", "text": "gym at 6?", "from_me": False, "unix_ts": 1700000000.0},
+        {"sender": "+15552222222", "text": "yes! see you there", "from_me": False, "unix_ts": 1700000100.0},
+    ])
+    event = _event(status="confirmed")
+    detector._demote_if_user_silent(event, thread)
+    assert event["status"] == "unanswered"
+
+
+def test_demote_ignores_old_context_when_new_messages_are_silent():
+    # An old "Me" acceptance sitting in already-processed context must not
+    # excuse a status this poll re-establishes from new messages that don't
+    # include the user.
+    thread = _thread(participants=("+15551111111", "+15552222222"), messages=[
+        {"sender": "+15551111111", "text": "gym at 6?", "from_me": False,
+         "unix_ts": 1700000000.0, "is_context": True},
+        {"sender": "me", "text": "yes!", "from_me": True,
+         "unix_ts": 1700000100.0, "is_context": True},
+        {"sender": "+15552222222", "text": "actually let's do 7 instead", "from_me": False,
+         "unix_ts": 1700000200.0, "is_context": False},
+    ])
+    event = _event(status="confirmed")
+    detector._demote_if_user_silent(event, thread)
+    assert event["status"] == "unanswered"
+
+
+def test_demote_still_skips_when_new_message_is_from_user():
+    thread = _thread(participants=("+15551111111", "+15552222222"), messages=[
+        {"sender": "+15551111111", "text": "gym at 6?", "from_me": False,
+         "unix_ts": 1700000000.0, "is_context": True},
+        {"sender": "me", "text": "still on for 7 instead", "from_me": True,
+         "unix_ts": 1700000200.0, "is_context": False},
+    ])
+    event = _event(status="confirmed")
+    detector._demote_if_user_silent(event, thread)
+    assert event["status"] == "confirmed"

@@ -160,6 +160,7 @@ def get_threads_since(
             "text": text,
             "from_me": bool(from_me),
             "unix_ts": apple_to_unix(apple_ts),
+            "is_context": False,
         })
         if apple_ts > threads[chat_id]["latest_apple_ts"]:
             threads[chat_id]["latest_apple_ts"] = apple_ts
@@ -196,7 +197,12 @@ def _prepend_context(
     date_context_lookback_days of NOW, not of the cutoff — a machine that's
     been idle a while shouldn't see its anchor reach shrink) so far-back
     anchoring messages stay visible to the detector. Pass context_window=0
-    (used on a cold start) to harvest date anchors with no replay window."""
+    (used on a cold start) to harvest date anchors with no replay window.
+    Every prepended message (context window and date anchors alike) is
+    tagged is_context=True, distinguishing it from the is_context=False
+    "new" messages already in threads[chat_id]["messages"] — the detector
+    uses this to avoid re-emitting a plan whose only trace is old context
+    (see detector._format_thread)."""
     try:
         conn = sqlite3.connect(f"file:{CHAT_DB}?mode=ro", uri=True, timeout=5)
     except sqlite3.OperationalError:
@@ -259,6 +265,7 @@ def _prepend_context(
             "text": text,
             "from_me": bool(from_me),
             "unix_ts": apple_to_unix(apple_ts),
+            "is_context": True,
         }
         if in_window:
             context_by_chat.setdefault(chat_id, []).append(msg)

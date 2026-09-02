@@ -148,6 +148,30 @@ message as `evidence`.
 Respond with a JSON object only. No prose.
 """
 
+# Appended to SYSTEM_PROMPT (when context_marking_enabled) for threads that
+# mix already-processed context with newly-arrived messages. Every poll
+# re-sends the same context window, so without this rule the model would
+# re-emit the same plan every time any new message arrives in the chat.
+_CONTEXT_MARKING_ADDENDUM = """
+
+**Already-processed context**: This thread mixes context — messages from a
+previous analysis, marked "[--- earlier messages, already processed —
+context only ---]" — with messages that just arrived, marked "[--- new
+messages ---]". Only emit a plan if at least one NEW message carries
+scheduling-relevant information about it: the proposal itself, an
+acceptance or decline, a change to the date/time/location, or a
+cancellation. If everything that establishes a plan sits in the earlier
+context and the new message(s) don't add anything relevant, emit nothing —
+it was already handled. A new message that merely reacts to an
+already-established plan ("so excited!!", "lol", an emoji) is NOT
+scheduling-relevant and must not cause you to re-emit it. This rule is
+about withholding re-emission, not about ignoring context: still use the
+context to fill in a plan's details (date, time, location) when a new
+message's scheduling-relevant content refers back to it — e.g. a late
+acceptance of an invitation that was proposed in the context, or a
+reschedule/cancellation of a plan established there.
+"""
+
 EVENT_ITEM_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -232,7 +256,13 @@ RESPONSE_SCHEMA = {
 EVENT_SCHEMA = RESPONSE_SCHEMA
 
 
-def _format_thread(thread: dict, today: datetime | None = None) -> str:
+_CONTEXT_HEADER = "[--- earlier messages, already processed — context only ---]"
+_NEW_HEADER = "[--- new messages ---]"
+
+
+def _format_thread(
+    thread: dict, today: datetime | None = None, context_marking_enabled: bool = True
+) -> str:
     now = today or datetime.now()
     # A naive `now` (production's live wall clock, or the eval harness's
     # pinned date) is presumed to already be local time; attach the local
@@ -255,7 +285,23 @@ def _format_thread(thread: dict, today: datetime | None = None) -> str:
         f"[Participants: {participants}]",
         "",
     ]
-    for msg in thread.get("messages", []):
+    messages = thread.get("messages", [])
+    # Only insert the context/new-message separators when the thread actually
+    # mixes both (some message tagged is_context=True by reader._prepend_context
+    # or evals/loader.materialize_polls) — a single-poll thread where every
+    # message is "new" renders exactly as it did before this feature existed.
+    mark_context = context_marking_enabled and any(m.get("is_context") for m in messages)
+    context_header_shown = False
+    new_header_shown = False
+    for msg in messages:
+        if mark_context:
+            is_ctx = bool(msg.get("is_context"))
+            if is_ctx and not context_header_shown:
+                lines.append(_CONTEXT_HEADER)
+                context_header_shown = True
+            if not is_ctx and not new_header_shown:
+                lines.append(_NEW_HEADER)
+                new_header_shown = True
         sender = "Me" if msg.get("from_me") else msg.get("sender", "Them")
         sent_at = datetime.fromtimestamp(msg.get("unix_ts", 0), tz=local_tz)
         ts = sent_at.strftime("%a %m/%d/%Y %I:%M%p")
@@ -482,17 +528,50 @@ def _reconcile_weekday(event: dict, chat_id) -> None:
             pass
 
 
+def _new_messages(thread: dict) -> list[dict]:
+    """The thread's messages that aren't already-processed context — i.e. the
+    ones from THIS poll. When the thread carries no context-marking info at
+    all (single-poll cases, or context marking disabled), every message
+    counts as new, matching pre-F1 behavior."""
+    messages = thread.get("messages", [])
+    if not any(m.get("is_context") for m in messages):
+        return messages
+    return [m for m in messages if not m.get("is_context")]
+
+
+def _new_message_from_user(thread: dict) -> bool:
+    """Whether any NEW (this-poll) message is from "Me". Used both by
+    _demote_if_user_silent (within-poll group-silence check) and tagged onto
+    each event as event["_new_msg_from_user"] for main.py's cross-poll
+    anti-flap guard (F7), which has no access to the thread itself."""
+    return any(m.get("from_me") for m in _new_messages(thread))
+
+
 def _demote_if_user_silent(event: dict, thread: dict) -> None:
     """In a multi-participant thread where the user ("Me") never sent a
     message, another person's acceptance can't confirm or tentatively commit
     the plan FOR the user — demote to "unanswered" so the calendar's
     ownership/status gates hold it back until the user actually responds. A
-    later real acceptance re-detects and creates the event normally."""
-    if len(thread.get("participants", [])) <= 1:
+    later real acceptance re-detects and creates the event normally.
+
+    "Group" is judged by distinct senders seen in the thread, not just the
+    queried `participants` list — chat_handle_join excludes the user, so a
+    2-person group chat can show participants=[one other handle] if a handle
+    row is ever missing, indistinguishable from a genuine 1:1 by list length
+    alone. Distinct non-"Me" senders is a more reliable group signal.
+
+    Only NEW (this-poll) messages are checked for user silence — an old
+    acceptance from a prior poll doesn't retroactively justify a status this
+    poll is otherwise not re-establishing from new content."""
+    other_senders = {
+        m.get("sender") for m in thread.get("messages", []) if not m.get("from_me")
+    }
+    is_group = len(thread.get("participants", [])) > 1 or len(other_senders) > 1
+    if not is_group:
         return
     if event.get("status") not in ("confirmed", "tentative"):
         return
-    if any(m.get("from_me") for m in thread.get("messages", [])):
+    if _new_message_from_user(thread):
         return
     logger.info(
         "  -> Demoting to unanswered: user never responded in group thread %s",
@@ -506,6 +585,7 @@ def detect_plans(
     model: str = MODEL,
     evidence_gate: bool = True,
     today: datetime | None = None,
+    context_marking_enabled: bool = True,
 ) -> tuple[list[dict], set]:
     """
     Analyze a list of conversation threads for plans.
@@ -522,9 +602,17 @@ def detect_plans(
     `today` is forwarded to `_format_thread` so callers (the eval harness) can
     pin what the model sees as "today"; production callers leave it None and
     get the live wall clock.
+
+    `context_marking_enabled` (mirrors config.DEFAULTS) inserts the
+    already-processed-context / new-messages separators (see
+    _CONTEXT_MARKING_ADDENDUM) so the model doesn't re-emit a plan whose only
+    trace is old context replayed by reader._prepend_context every poll. A
+    thread with no is_context-tagged messages (any single-poll case) is
+    unaffected either way.
     """
     results = []
     failed_chat_ids = set()
+    system_prompt = SYSTEM_PROMPT + (_CONTEXT_MARKING_ADDENDUM if context_marking_enabled else "")
 
     for thread in threads:
         participants = ", ".join(thread.get("participants", ["unknown"]))
@@ -538,11 +626,13 @@ def detect_plans(
         )
 
         try:
-            formatted = _format_thread(thread, today=today)
+            formatted = _format_thread(
+                thread, today=today, context_marking_enabled=context_marking_enabled
+            )
             response = _get_client().messages.create(
                 model=model,
                 max_tokens=2048,
-                system=SYSTEM_PROMPT,
+                system=system_prompt,
                 messages=[{
                     "role": "user",
                     "content": f"Analyze this iMessage thread for plans:\n\n{formatted}"
@@ -611,6 +701,9 @@ def detect_plans(
                     event.get("confidence", 0),
                 )
                 event["chat_id"] = thread["chat_id"]
+                # Consumed by main.py's anti-flap guard (F7), which has no
+                # access to the thread itself — see _new_message_from_user.
+                event["_new_msg_from_user"] = _new_message_from_user(thread)
                 results.append(event)
 
         except Exception as e:
