@@ -126,10 +126,22 @@ def _score_multi_event(expected_events: list[dict], got_events: list[dict]) -> l
     return failures
 
 
+# Statuses that never reach the calendar as a create, mirroring
+# main.process_event's gates. "cancelled" isn't a detector output yet (added
+# by a later fix in this plan) — included here pre-emptively so scoring
+# doesn't need to change again once it is, and so an unrecognized status
+# never crashes this check.
+_NON_CREATING_STATUSES = ("unanswered", "cancelled")
+
+
 def _would_reach_calendar(event: dict) -> bool:
     """Mirror the production ownership/status gates: an event only reaches the
-    calendar when the user participates and the invitation isn't unanswered."""
-    return bool(event.get("user_is_participant")) and event.get("status") != "unanswered"
+    calendar when the user participates and the invitation isn't unanswered
+    (or, once implemented, cancelled)."""
+    return (
+        bool(event.get("user_is_participant"))
+        and event.get("status") not in _NON_CREATING_STATUSES
+    )
 
 
 def score_case(case: dict, model: str, today: date | None = None) -> dict:
@@ -202,11 +214,18 @@ def score_case(case: dict, model: str, today: date | None = None) -> dict:
     }
 
 
-def score_dedup_pairs(cases: list[dict], results_by_id: dict, model: str) -> list[dict]:
+def score_dedup_pairs(
+    cases: list[dict], results_by_id: dict, model: str, day_window: int = 1
+) -> list[dict]:
     """For golden cases annotated with dedup_with/dedup_verdict, treat the
     referenced case's detected event as an "existing calendar event" and run
     the real dedup.find_candidates + dedup.adjudicate against this case's
-    detected event(s), scoring the resulting same/different verdict."""
+    detected event(s), scoring the resulting same/different verdict.
+
+    ``day_window`` is threaded through to ``dedup.find_candidates`` so a wider
+    (or narrower) candidate window than production's default can be exercised
+    without duplicating this function — used by dedup pairs whose two halves
+    are deliberately more than a day apart (e.g. a reschedule mention)."""
     dedup_results = []
 
     for case in cases:
@@ -233,7 +252,7 @@ def score_dedup_pairs(cases: list[dict], results_by_id: dict, model: str) -> lis
         any_duplicate = False
         reasoning = None
         for b in b_events:
-            candidates = dedup.find_candidates(b, existing_records)
+            candidates = dedup.find_candidates(b, existing_records, day_window=day_window)
             if not candidates:
                 continue
             called_llm = True
@@ -266,6 +285,7 @@ class _FakeCalendar:
         self.events: dict[str, dict] = {}
         self.creates = 0
         self.updates = 0
+        self.deletes = 0
 
     def create_event(self, title, date_str, time_start, duration_minutes, location,
                      calendar_name="Calendar", tentative=False, recurrence=None, end_date=None):
@@ -286,6 +306,13 @@ class _FakeCalendar:
             "title": title, "date": date_str, "time_start": time_start,
             "location": location, "tentative": tentative,
         })
+        return True
+
+    def delete_event(self, uid, calendar_name="Calendar"):
+        self.deletes += 1
+        if uid not in self.events:
+            return False
+        del self.events[uid]
         return True
 
     def get_events_near(self, date_str, window_days=1, calendar_name="Calendar"):
@@ -321,18 +348,24 @@ def score_pipeline_case(
 
     fake_calendar = _FakeCalendar()
     tmp_dir = Path(tempfile.mkdtemp(prefix=f"eval-state-{case['id']}-"))
+    # calendar.delete_event does not exist yet (added by a later fix) — track
+    # whether we're adding a new attribute or overriding one so it can be torn
+    # down symmetrically either way.
+    had_delete_event = hasattr(calendar_mod, "delete_event")
     saved = {
         "STATE_DIR": state_mod.STATE_DIR,
         "STATE_FILE": state_mod.STATE_FILE,
         "create_event": calendar_mod.create_event,
         "update_event": calendar_mod.update_event,
         "get_events_near": calendar_mod.get_events_near,
+        "delete_event": getattr(calendar_mod, "delete_event", None),
     }
     state_mod.STATE_DIR = tmp_dir
     state_mod.STATE_FILE = tmp_dir / "state.json"
     calendar_mod.create_event = fake_calendar.create_event
     calendar_mod.update_event = fake_calendar.update_event
     calendar_mod.get_events_near = fake_calendar.get_events_near
+    calendar_mod.delete_event = fake_calendar.delete_event
 
     cfg = {**config.DEFAULTS, "dedup_model": dedup_model}
     outcomes: list[str] = []
@@ -350,12 +383,18 @@ def score_pipeline_case(
         calendar_mod.create_event = saved["create_event"]
         calendar_mod.update_event = saved["update_event"]
         calendar_mod.get_events_near = saved["get_events_near"]
+        if had_delete_event:
+            calendar_mod.delete_event = saved["delete_event"]
+        else:
+            del calendar_mod.delete_event
 
     failures: list[str] = []
     if fake_calendar.creates != expected.get("creates", 0):
         failures.append(f"creates {fake_calendar.creates} != {expected.get('creates', 0)}")
     if fake_calendar.updates != expected.get("updates", 0):
         failures.append(f"updates {fake_calendar.updates} != {expected.get('updates', 0)}")
+    if fake_calendar.deletes != expected.get("deletes", 0):
+        failures.append(f"deletes {fake_calendar.deletes} != {expected.get('deletes', 0)}")
     if final_expected and not failures:
         finals = list(fake_calendar.events.values())
         if not any(not _check_event_fields(final_expected, e) for e in finals):
@@ -402,11 +441,17 @@ def summarize(
     pipeline_results: list[dict] | None = None,
 ) -> dict:
     gated = [r for r in results if not r["known_failure"]]
-    negatives = [r for r in results if r["category"] == "hard_negative"]
+    # A known_failure hard_negative is an aspirational case tracking a fix not
+    # yet implemented (e.g. an ambiguous-anchor case the model isn't expected
+    # to resolve correctly yet) — it must not fail the zero-FP gate, so it's
+    # excluded the same way it's excluded from `gated` accuracy.
+    negatives = [r for r in results if r["category"] == "hard_negative" and not r["known_failure"]]
+    known_failure_negatives = [r for r in results if r["category"] == "hard_negative" and r["known_failure"]]
     tentatives = [r for r in gated if r["category"] == "tentative"]
     bystanders = [r for r in results if r["category"] == "bystander"]
     positives = [r for r in gated if r["expected_has_event"] and r["category"] != "tentative"]
     fps = sum(1 for r in negatives if r["predicted_has_event"])
+    known_failure_fps = [r["id"] for r in known_failure_negatives if r["predicted_has_event"]]
 
     conf: dict[str, list[float]] = defaultdict(list)
     for r in results:
@@ -419,6 +464,7 @@ def summarize(
         "tentative_recall": (sum(r["passed"] for r in tentatives) / len(tentatives)) if tentatives else 0.0,
         "false_positive_rate": (fps / len(negatives)) if negatives else 0.0,
         "false_positives": fps,
+        "known_failure_false_positives": known_failure_fps,
         "n_total": len(results),
         "n_gated": len(gated),
         "n_passed_gated": sum(r["passed"] for r in gated),
@@ -475,6 +521,11 @@ def print_report(
     print(f"  mean confidence by category: {summary['mean_confidence_by_category']}")
     if summary["known_failures"]:
         print(f"  known failures (tracked):    {', '.join(summary['known_failures'])}")
+    if summary.get("known_failure_false_positives"):
+        print(
+            "  known-failure FPs (not gated): "
+            f"{', '.join(summary['known_failure_false_positives'])}"
+        )
     if summary.get("bystander_leaks"):
         print(f"  BYSTANDER LEAKS:             {', '.join(summary['bystander_leaks'])}")
     if pipeline_results is not None:
@@ -536,6 +587,11 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Run the detector eval suite.")
     ap.add_argument("--model", default=detector.MODEL)
     ap.add_argument("--dedup-model", default="claude-haiku-4-5")
+    ap.add_argument(
+        "--dedup-day-window", type=int, default=1,
+        help="candidate window (days) for dedup-pair scoring; widen to exercise "
+             "far-apart pairs once production's dedup_day_window is widened",
+    )
     ap.add_argument("--judge", action="store_true", help="add LLM title-quality scoring")
     ap.add_argument("-k", "--filter", default=None, help="only run cases whose id contains this")
     ap.add_argument("--golden", default=str(loader.GOLDEN_PATH))
@@ -564,7 +620,9 @@ def main() -> None:
         print(f"  eval clock pinned to: {eval_today.isoformat()} ({eval_today.strftime('%A')})")
         results = run(cases, model=args.model, judge=args.judge, today=eval_today)
         results_by_id = {r["id"]: r for r in results}
-        dedup_results = score_dedup_pairs(cases, results_by_id, model=args.dedup_model)
+        dedup_results = score_dedup_pairs(
+            cases, results_by_id, model=args.dedup_model, day_window=args.dedup_day_window
+        )
         pipeline_results = run_pipeline(
             cases, model=args.model, dedup_model=args.dedup_model, today=eval_today
         )
