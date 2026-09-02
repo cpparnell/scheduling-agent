@@ -6,6 +6,8 @@ from datetime import date as _date, datetime, timedelta
 
 import anthropic
 
+from scheduling_agent.datepatterns import EXPLICIT_DATE_RE
+
 logger = logging.getLogger(__name__)
 
 MODEL = "claude-haiku-4-5-20251001"
@@ -232,13 +234,31 @@ EVENT_SCHEMA = RESPONSE_SCHEMA
 
 def _format_thread(thread: dict, today: datetime | None = None) -> str:
     now = today or datetime.now()
+    # A naive `now` (production's live wall clock, or the eval harness's
+    # pinned date) is presumed to already be local time; attach the local
+    # zone without shifting the wall-clock value. An already-aware `now`
+    # (not currently produced by any caller) is left as-is.
+    now = now if now.tzinfo else now.astimezone()
+    local_tz = now.tzinfo
+
+    offset = now.utcoffset() or timedelta(0)
+    total_minutes = int(offset.total_seconds() // 60)
+    sign = "+" if total_minutes >= 0 else "-"
+    hh, mm = divmod(abs(total_minutes), 60)
+    offset_str = f"UTC{sign}{hh:02d}:{mm:02d}"
+    tz_abbr = now.strftime("%Z") or offset_str
+
     today_str = now.strftime("%A, %B %d, %Y")
     participants = ", ".join(thread.get("participants", ["unknown"]))
-    lines = [f"[Today is {today_str}]", f"[Participants: {participants}]", ""]
+    lines = [
+        f"[Today is {today_str} ({tz_abbr}, {offset_str})]",
+        f"[Participants: {participants}]",
+        "",
+    ]
     for msg in thread.get("messages", []):
         sender = "Me" if msg.get("from_me") else msg.get("sender", "Them")
-        sent_at = datetime.fromtimestamp(msg.get("unix_ts", 0))
-        ts = sent_at.strftime("%a %m/%d %I:%M%p")
+        sent_at = datetime.fromtimestamp(msg.get("unix_ts", 0), tz=local_tz)
+        ts = sent_at.strftime("%a %m/%d/%Y %I:%M%p")
         age_days = (now.date() - sent_at.date()).days
         age_suffix = f", sent {age_days} day{'s' if age_days != 1 else ''} ago" if age_days >= 1 else ""
         lines.append(f"{sender} ({ts}{age_suffix}): {msg.get('text', '')}")
@@ -274,7 +294,16 @@ _WRAPPING_QUOTES = re.compile(r'^([\'"])(.*)\1$', re.DOTALL)
 _WORD_RE = re.compile(r"[a-z0-9']+")
 
 _MIN_FUZZY_TOKENS = 3
-_FUZZY_COVERAGE_THRESHOLD = 0.8
+_FUZZY_COVERAGE_THRESHOLD = 0.9
+
+# Negation/change-of-plan markers. If the matched message contains one of
+# these that the quoted evidence fragment does NOT, the fuzzy match is
+# rejected — otherwise an evidence quote could validate its own negation
+# ("dinner Friday, NOT at 7" would fuzzy-match evidence "dinner Friday at 7").
+_NEGATION_RE = re.compile(
+    r"\bnot\b|n't\b|\bno\b|\bnever\b|\bcancel(?:led)?\b|\binstead\b|\bmoved\b",
+    re.IGNORECASE,
+)
 
 
 def _normalize_for_match(text: str) -> str:
@@ -294,15 +323,48 @@ def _strip_quote_wrappers(fragment: str) -> str:
     return fragment
 
 
+def _ordered_coverage(fragment_tokens: list[str], message_tokens: list[str]) -> float:
+    """Fraction of fragment_tokens found in message_tokens IN ORDER (a greedy
+    subsequence match: each fragment token must occur at or after the
+    position of the previous match). Unlike a token-SET overlap, this can't
+    be fooled by a message whose words merely overlap the fragment in a
+    different order or with a meaning-flipping word inserted mid-fragment."""
+    if not fragment_tokens:
+        return 0.0
+    pos = 0
+    matched = 0
+    for tok in fragment_tokens:
+        for k in range(pos, len(message_tokens)):
+            if message_tokens[k] == tok:
+                matched += 1
+                pos = k + 1
+                break
+    return matched / len(fragment_tokens)
+
+
+def _negation_mismatch(fragment_norm: str, message_norm: str) -> bool:
+    """True if the message contains a negation/change-of-plan word the
+    evidence fragment doesn't itself quote — a sign the fragment is quoting
+    around a negation rather than an affirmative statement."""
+    msg_negations = set(_NEGATION_RE.findall(message_norm))
+    if not msg_negations:
+        return False
+    frag_negations = set(_NEGATION_RE.findall(fragment_norm))
+    return not msg_negations.issubset(frag_negations)
+
+
 def _fuzzy_covered(fragment_norm: str, message_norm: str) -> bool:
-    ev_tokens = set(_WORD_RE.findall(fragment_norm))
+    ev_tokens = _WORD_RE.findall(fragment_norm)
     if len(ev_tokens) < _MIN_FUZZY_TOKENS:
         return False
-    msg_tokens = set(_WORD_RE.findall(message_norm))
+    msg_tokens = _WORD_RE.findall(message_norm)
     if not msg_tokens:
         return False
-    coverage = len(ev_tokens & msg_tokens) / len(ev_tokens)
-    return coverage >= _FUZZY_COVERAGE_THRESHOLD
+    if _ordered_coverage(ev_tokens, msg_tokens) < _FUZZY_COVERAGE_THRESHOLD:
+        return False
+    if _negation_mismatch(fragment_norm, message_norm):
+        return False
+    return True
 
 
 def _evidence_found(evidence: str, thread: dict) -> bool:
@@ -312,7 +374,9 @@ def _evidence_found(evidence: str, thread: dict) -> bool:
 
     evidence_norm = _normalize_for_match(evidence)
     if not evidence_norm:
-        return True
+        # Empty/whitespace-only evidence fails the gate rather than bypassing
+        # it — a required schema field left blank is not proof of anything.
+        return False
     if evidence_norm in haystack:
         return True
 
@@ -353,11 +417,12 @@ _WEEKDAY_INDEX = {
 }
 
 # Matches a bare weekday name/abbreviation, excluding ones preceded by "last"
-# (a past reference, e.g. "last Friday" — never a signal to shift a future
-# date). The lookbehind is fixed-width ("last" + one whitespace char) so it's
-# valid in Python's re engine.
+# or "next" (both name a specific relative occurrence already resolved by the
+# model's own date arithmetic — not a signal to shift the detected date via
+# this deterministic heuristic). Each lookbehind is fixed-width ("last "/
+# "next ", 5 chars) so both are valid in Python's re engine.
 _WEEKDAY_MENTION_RE = re.compile(
-    r"(?<!last\s)\b(" + "|".join(sorted(_WEEKDAY_INDEX, key=len, reverse=True)) + r")\b",
+    r"(?<!last\s)(?<!next\s)\b(" + "|".join(sorted(_WEEKDAY_INDEX, key=len, reverse=True)) + r")\b",
     re.IGNORECASE,
 )
 
@@ -372,8 +437,11 @@ def _reconcile_weekday(event: dict, chat_id) -> None:
     arithmetic unreliably even when the prompt states "today" explicitly.
     Shifts by the minimal signed delta (at most +/-3 days) so a date anchored
     far in the future only nudges within its anchor week; skips when no
-    weekday is named, the date already matches, or more than one distinct
-    weekday is named (ambiguous — do not guess)."""
+    weekday is named, the date already matches, more than one distinct
+    weekday is named (ambiguous — do not guess), or the model's own evidence
+    already quotes an explicit date (a month name, numeric date, or ordinal
+    day) — that anchor wins over weekday-shift heuristics rather than being
+    overridden by an incidental weekday mentioned in the same quote."""
     date_str = event.get("date")
     if not date_str:
         return
@@ -382,7 +450,12 @@ def _reconcile_weekday(event: dict, chat_id) -> None:
     except ValueError:
         return
 
-    named = _named_weekdays(event.get("evidence") or "") | _named_weekdays(event.get("date_evidence") or "")
+    evidence_text = event.get("evidence") or ""
+    date_evidence_text = event.get("date_evidence") or ""
+    if EXPLICIT_DATE_RE.search(evidence_text) or EXPLICIT_DATE_RE.search(date_evidence_text):
+        return
+
+    named = _named_weekdays(evidence_text) | _named_weekdays(date_evidence_text)
     if len(named) != 1:
         return
     target = next(iter(named))
@@ -501,28 +574,28 @@ def detect_plans(
                 if not event.get("date"):
                     continue
 
-                date_evidence = event.get("date_evidence")
-                if date_evidence and not _evidence_found(date_evidence, thread):
+                date_evidence = event.get("date_evidence") or ""
+                if not _evidence_found(date_evidence, thread):
                     logger.warning(
-                        "  -> Date evidence not found verbatim in thread %s: %r",
+                        "  -> Date evidence missing or not found verbatim in thread %s: %r",
                         thread["chat_id"], date_evidence,
                     )
                     if evidence_gate:
                         logger.warning(
-                            "  -> Dropping event with unverifiable date evidence: %s",
+                            "  -> Dropping event with missing/unverifiable date evidence: %s",
                             event.get("title"),
                         )
                         continue
 
-                evidence = event.get("evidence")
-                if evidence and not _evidence_found(evidence, thread):
+                evidence = event.get("evidence") or ""
+                if not _evidence_found(evidence, thread):
                     logger.warning(
-                        "  -> Evidence not found verbatim in thread %s: %r",
+                        "  -> Evidence missing or not found verbatim in thread %s: %r",
                         thread["chat_id"], evidence,
                     )
                     if evidence_gate:
                         logger.warning(
-                            "  -> Dropping event with unverifiable evidence: %s",
+                            "  -> Dropping event with missing/unverifiable evidence: %s",
                             event.get("title"),
                         )
                         continue
