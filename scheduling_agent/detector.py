@@ -577,7 +577,7 @@ def detect_plans(
                 date_evidence = event.get("date_evidence") or ""
                 if not _evidence_found(date_evidence, thread):
                     logger.warning(
-                        "  -> Date evidence missing or not found verbatim in thread %s: %r",
+                        "  -> Date evidence not found verbatim in thread %s: %r",
                         thread["chat_id"], date_evidence,
                     )
                     if evidence_gate:
@@ -590,7 +590,7 @@ def detect_plans(
                 evidence = event.get("evidence") or ""
                 if not _evidence_found(evidence, thread):
                     logger.warning(
-                        "  -> Evidence missing or not found verbatim in thread %s: %r",
+                        "  -> Evidence not found verbatim in thread %s: %r",
                         thread["chat_id"], evidence,
                     )
                     if evidence_gate:

@@ -34,6 +34,7 @@ def _event(**overrides):
         "recurrence": None,
         "end_date": None,
         "evidence": "yes 7pm",
+        "date_evidence": "yes 7pm",
     }
     base.update(overrides)
     return base
