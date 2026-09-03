@@ -351,6 +351,20 @@ _NEGATION_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Verbatim message text is never logged in full — only a short snippet, so
+# logs/stdout/*.log doesn't accumulate an unbounded plaintext transcript of
+# the user's messages. See state.EVIDENCE_MAX_CHARS for the same tradeoff
+# applied to what's persisted to state.json.
+_LOG_SNIPPET_CHARS = 80
+
+
+def _log_snippet(text: str | None) -> str:
+    if not text:
+        return repr(text)
+    if len(text) <= _LOG_SNIPPET_CHARS:
+        return repr(text)
+    return repr(text[:_LOG_SNIPPET_CHARS].rstrip() + "…")
+
 
 def _normalize_for_match(text: str) -> str:
     text = unicodedata.normalize("NFKC", text)
@@ -444,7 +458,7 @@ def _evidence_found(evidence: str, thread: dict) -> bool:
             continue
         if any(_fuzzy_covered(fragment_norm, msg_norm) for msg_norm in message_norms):
             logger.info(
-                "  -> Evidence matched only via fuzzy fallback: %r", raw_fragment
+                "  -> Evidence matched only via fuzzy fallback: %s", _log_snippet(raw_fragment)
             )
             continue
         return False
@@ -667,8 +681,8 @@ def detect_plans(
                 date_evidence = event.get("date_evidence") or ""
                 if not _evidence_found(date_evidence, thread):
                     logger.warning(
-                        "  -> Date evidence not found verbatim in thread %s: %r",
-                        thread["chat_id"], date_evidence,
+                        "  -> Date evidence not found verbatim in thread %s: %s",
+                        thread["chat_id"], _log_snippet(date_evidence),
                     )
                     if evidence_gate:
                         logger.warning(
@@ -680,8 +694,8 @@ def detect_plans(
                 evidence = event.get("evidence") or ""
                 if not _evidence_found(evidence, thread):
                     logger.warning(
-                        "  -> Evidence not found verbatim in thread %s: %r",
-                        thread["chat_id"], evidence,
+                        "  -> Evidence not found verbatim in thread %s: %s",
+                        thread["chat_id"], _log_snippet(evidence),
                     )
                     if evidence_gate:
                         logger.warning(

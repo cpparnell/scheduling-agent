@@ -54,6 +54,10 @@ DEFAULTS = {
     # replays the same context window). Disable to fall back to the
     # unmarked prompt.
     "context_marking_enabled": True,
+    # Backstop poll interval: process_new_messages() also runs on this timer,
+    # independent of the filesystem watcher, in case a chat.db change event is
+    # ever missed. Set to 0 to disable.
+    "poll_interval_minutes": 15,
 }
 
 

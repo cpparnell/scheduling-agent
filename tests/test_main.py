@@ -1,3 +1,4 @@
+import threading
 import time
 
 import pytest
@@ -682,3 +683,68 @@ def test_watermark_held_when_thread_fails_then_advanced_after_retries(
     main.process_new_messages(cfg)
     assert state.get_last_timestamp() == newest_apple
     assert state.get_watermark_hold() == {"ts": None, "count": 0}
+
+
+class TestRunGate:
+    """The watcher (blocking) and poll-fallback timer (skip_if_busy) both
+    drive the same run function; a shared _RunGate must ensure they never
+    execute it concurrently, since state._save() has no locking of its own."""
+
+    def test_skip_if_busy_does_not_run_while_blocking_holds_the_lock(self):
+        started = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        def run():
+            calls.append("start")
+            started.set()
+            release.wait(timeout=5)
+            calls.append("end")
+
+        gate = main._RunGate(run)
+        t = threading.Thread(target=gate.blocking)
+        t.start()
+        started.wait(timeout=5)
+
+        # A concurrent poll tick must skip rather than run or block.
+        gate.skip_if_busy()
+        assert calls == ["start"]
+
+        release.set()
+        t.join(timeout=5)
+        assert calls == ["start", "end"]
+
+    def test_skip_if_busy_runs_when_lock_is_free(self):
+        calls = []
+        gate = main._RunGate(lambda: calls.append("ran"))
+
+        gate.skip_if_busy()
+
+        assert calls == ["ran"]
+
+    def test_blocking_runs_are_serialized_not_concurrent(self):
+        order = []
+        lock_held = threading.Lock()
+
+        def run():
+            # A non-blocking acquire fails if another `run` is mid-flight,
+            # proving the gate never lets two runs overlap.
+            assert lock_held.acquire(blocking=False)
+            order.append("enter")
+            time.sleep(0.05)
+            order.append("exit")
+            lock_held.release()
+
+        gate = main._RunGate(run)
+        threads = [threading.Thread(target=gate.blocking) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+
+        assert order.count("enter") == 5
+        assert order.count("exit") == 5
+        # Each enter is immediately followed by its own exit.
+        for i in range(0, len(order), 2):
+            assert order[i] == "enter"
+            assert order[i + 1] == "exit"

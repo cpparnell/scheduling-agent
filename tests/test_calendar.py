@@ -49,6 +49,23 @@ def test_quotes_in_title_and_location_are_escaped(capture_osascript):
     assert '\\"Spot\\"' in script
 
 
+def test_trailing_backslash_in_title_does_not_escape_closing_quote(capture_osascript):
+    # A naive .replace('"', '\\"') on a title ending in a backslash would let
+    # the backslash escape the closing quote instead of itself, spilling the
+    # rest of the string (here, an all-caps SUFFIX) out of the quoted literal
+    # and into the raw AppleScript.
+    calendar.create_event('Trip\\', "2026-06-13", "19:00", 60, None)
+    script = capture_osascript["script"]
+    assert 'summary:"Trip\\\\"' in script
+    assert '\\\\", start date' in script
+
+
+def test_backslash_and_quote_both_escaped(capture_osascript):
+    calendar.create_event('C:\\path "here"', "2026-06-13", "19:00", 60, None)
+    script = capture_osascript["script"]
+    assert 'C:\\\\path \\"here\\"' in script
+
+
 def test_date_and_time_render_expected_applescript_literal(capture_osascript):
     calendar.create_event("Dinner", "2026-06-13", "19:00", 60, None)
     script = capture_osascript["script"]

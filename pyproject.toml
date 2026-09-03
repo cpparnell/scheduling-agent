@@ -1,3 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "scheduling-agent"
+version = "0.7.0"
+description = "Listens to iMessages and creates Apple Calendar events when you make plans."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "anthropic==0.109.1",
+    "watchdog==6.0.0",
+    "python-dotenv==1.2.2",
+]
+
+[project.scripts]
+scheduling-agent = "scheduling_agent.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["scheduling_agent"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests", "evals"]
 # Default run excludes paid eval tests. Run them explicitly with: pytest -m eval

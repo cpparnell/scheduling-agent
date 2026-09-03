@@ -22,6 +22,19 @@ TITLE_DEDUP_WINDOW_DAYS = 28
 # state.json small; they're no longer useful for dedup/adjudication.
 EVENT_RECORD_RETENTION_DAYS = 90
 
+# Verbatim message evidence is truncated to this length before it's ever
+# written to disk. state.json otherwise accumulates an unbounded, unencrypted
+# archive of quoted personal message text. dedup.py's LLM adjudicator still
+# reads this field to compare candidate plans, so this is a real tradeoff —
+# a short snippet keeps that comparison useful without keeping full quotes.
+EVIDENCE_MAX_CHARS = 240
+
+
+def _truncate_evidence(evidence: str | None) -> str | None:
+    if evidence is None or len(evidence) <= EVIDENCE_MAX_CHARS:
+        return evidence
+    return evidence[:EVIDENCE_MAX_CHARS].rstrip() + "…"
+
 
 def _new_state() -> dict:
     return {
@@ -273,7 +286,7 @@ def make_record(
         "title": title,
         "location": location,
         "status": status,
-        "evidence": evidence,
+        "evidence": _truncate_evidence(evidence),
         "confidence": confidence,
         "calendar_uid": calendar_uid,
         "created_at": now,
@@ -399,6 +412,8 @@ def update_record(
 
     changed = {}
     for field, new_value in changes.items():
+        if field == "evidence":
+            new_value = _truncate_evidence(new_value)
         old_value = record.get(field)
         if old_value != new_value:
             changed[field] = [old_value, new_value]
