@@ -323,6 +323,7 @@ def process_new_messages(cfg: dict) -> None:
         threads,
         evidence_gate=cfg["evidence_gate_enabled"],
         context_marking_enabled=cfg["context_marking_enabled"],
+        date_resolver_enabled=cfg["date_resolver_enabled"],
     )
 
     counts = {"created": 0, "updated": 0, "cancelled": 0, "skipped": 0}

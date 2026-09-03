@@ -111,6 +111,15 @@ below), sending it to the LLM adjudicator as a probable mis-dated re-mention ins
 creating a near-term duplicate. Relatedly, a weekday named on the same
 day it's said ("this Thursday" sent on a Thursday) resolves to that day, not next week.
 
+`_reconcile_weekday`'s deterministic shift is capped at 3 days, so it can't repair a
+wrong-*week* error — a bare weekday with no explicit-date anchor near it still defaults to
+"next occurrence after the message was sent," which is wrong when the real anchor sits
+elsewhere in the thread and the single detection call missed it. A second-pass resolver call
+(`date_resolver_enabled`, on by default) catches this: it fires only when the date has no
+explicit-date anchor nearby *and* the thread contains some other date-like content that could
+plausibly change the answer (skipping the extra call otherwise), re-examines the whole thread
+for a competing anchor, and overrides the default only at confidence ≥ 0.8.
+
 **Verbatim evidence matching.** The hallucination guard requires `evidence`/`date_evidence`
 to appear in the thread — empty or missing evidence fails the gate outright rather than
 bypassing it. The model doesn't always quote a real match byte-for-byte, though: it prepends
@@ -259,6 +268,7 @@ The config file lives at `~/.scheduling-agent/config.json` and is created with d
 | `cancellation_enabled` | `true` | Let a detected cancellation of a previously-created event delete it from the calendar; off logs the detection without deleting |
 | `max_watermark_retries` | `3` | How many consecutive polls to retry a thread whose detection failed before giving up and advancing past it |
 | `context_marking_enabled` | `true` | Mark replayed context vs. newly-arrived messages in the prompt and instruct the model not to re-emit a plan whose only trace is old context — disable to fall back to the unmarked prompt |
+| `date_resolver_enabled` | `true` | Run a second-pass haiku call to re-check a bare-weekday date with no nearby explicit-date anchor, when the thread has other date-like content that could override the "next occurrence" default |
 | `poll_interval_minutes` | `15` | Backstop poll interval, independent of the filesystem watcher, in case a `chat.db` change event is ever missed. `0` disables it |
 
 Upgrading from v0.4: `tentative_confidence_threshold` was removed (a stale key in an existing

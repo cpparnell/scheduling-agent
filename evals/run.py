@@ -386,6 +386,7 @@ def score_pipeline_case(
                 [thread], model=model, evidence_gate=cfg["evidence_gate_enabled"],
                 today=datetime.combine(today, time(12, 0)),
                 context_marking_enabled=cfg["context_marking_enabled"],
+                date_resolver_enabled=cfg["date_resolver_enabled"],
             )
             for event in events:
                 outcomes.append(main.process_event(event, cfg))

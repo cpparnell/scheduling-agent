@@ -574,6 +574,119 @@ def test_evidence_prefix_strip_does_not_eat_real_colon_content(fake_anthropic):
     assert len(results) == 1
 
 
+# --- Second-pass date resolver (F6c) -----------------------------------------
+
+
+def test_date_resolver_skips_when_no_weekday_named(fake_anthropic):
+    client = fake_anthropic([{"chosen_date": "2026-07-01", "confidence": 0.9}])
+    event = _event(date="2026-06-13", evidence="yes!", date_evidence="yes!")
+    detector._second_pass_date_resolution(event, _thread(), model="claude-haiku-4-5")
+    assert event["date"] == "2026-06-13"
+    assert client.messages.calls == []
+
+
+def test_date_resolver_skips_when_explicit_date_already_anchored(fake_anthropic):
+    client = fake_anthropic([{"chosen_date": "2026-07-01", "confidence": 0.9}])
+    event = _event(
+        date="2026-06-13", evidence="dinner June 13th, see you Thursday",
+        date_evidence="dinner June 13th, see you Thursday",
+    )
+    detector._second_pass_date_resolution(event, _thread(), model="claude-haiku-4-5")
+    assert event["date"] == "2026-06-13"
+    assert client.messages.calls == []
+
+
+def test_date_resolver_skips_when_thread_has_no_other_anchor(fake_anthropic):
+    # A bare weekday with nothing else date-like anywhere in the thread has no
+    # competing anchor to plausibly resolve against — not worth the call.
+    client = fake_anthropic([{"chosen_date": "2026-07-01", "confidence": 0.9}])
+    event = _event(date="2026-06-13", evidence="dinner this Saturday?", date_evidence="dinner this Saturday?")
+    thread = _thread(messages=[
+        {"sender": "+15551234567", "text": "dinner this Saturday?", "from_me": False, "unix_ts": 1700000000.0},
+        {"sender": "me", "text": "yes!", "from_me": True, "unix_ts": 1700000100.0},
+    ])
+    detector._second_pass_date_resolution(event, thread, model="claude-haiku-4-5")
+    assert event["date"] == "2026-06-13"
+    assert client.messages.calls == []
+
+
+def test_date_resolver_overrides_with_high_confidence_alternative(fake_anthropic):
+    fake_anthropic([{"chosen_date": "2026-09-19", "confidence": 0.9}])
+    event = _event(date="2026-06-13", evidence="dinner this Saturday?", date_evidence="dinner this Saturday?")
+    thread = _thread(messages=[
+        {"sender": "+15551234567", "text": "the reunion is Sept 19", "from_me": False, "unix_ts": 1600000000.0},
+        {"sender": "+15551234567", "text": "dinner this Saturday?", "from_me": False, "unix_ts": 1700000000.0},
+        {"sender": "me", "text": "yes!", "from_me": True, "unix_ts": 1700000100.0},
+    ])
+    detector._second_pass_date_resolution(event, thread, model="claude-haiku-4-5")
+    assert event["date"] == "2026-09-19"
+
+
+def test_date_resolver_ignores_low_confidence_alternative(fake_anthropic):
+    fake_anthropic([{"chosen_date": "2026-09-19", "confidence": 0.5}])
+    event = _event(date="2026-06-13", evidence="dinner this Saturday?", date_evidence="dinner this Saturday?")
+    thread = _thread(messages=[
+        {"sender": "+15551234567", "text": "the reunion is Sept 19", "from_me": False, "unix_ts": 1600000000.0},
+        {"sender": "+15551234567", "text": "dinner this Saturday?", "from_me": False, "unix_ts": 1700000000.0},
+        {"sender": "me", "text": "yes!", "from_me": True, "unix_ts": 1700000100.0},
+    ])
+    detector._second_pass_date_resolution(event, thread, model="claude-haiku-4-5")
+    assert event["date"] == "2026-06-13"
+
+
+def test_date_resolver_ignores_same_date_response(fake_anthropic):
+    fake_anthropic([{"chosen_date": "2026-06-13", "confidence": 0.95}])
+    event = _event(date="2026-06-13", evidence="dinner this Saturday?", date_evidence="dinner this Saturday?")
+    thread = _thread(messages=[
+        {"sender": "+15551234567", "text": "the reunion is Sept 19", "from_me": False, "unix_ts": 1600000000.0},
+        {"sender": "+15551234567", "text": "dinner this Saturday?", "from_me": False, "unix_ts": 1700000000.0},
+        {"sender": "me", "text": "yes!", "from_me": True, "unix_ts": 1700000100.0},
+    ])
+    detector._second_pass_date_resolution(event, thread, model="claude-haiku-4-5")
+    assert event["date"] == "2026-06-13"
+
+
+def test_date_resolver_ignores_malformed_chosen_date(fake_anthropic):
+    fake_anthropic([{"chosen_date": "not-a-date", "confidence": 0.95}])
+    event = _event(date="2026-06-13", evidence="dinner this Saturday?", date_evidence="dinner this Saturday?")
+    thread = _thread(messages=[
+        {"sender": "+15551234567", "text": "the reunion is Sept 19", "from_me": False, "unix_ts": 1600000000.0},
+        {"sender": "+15551234567", "text": "dinner this Saturday?", "from_me": False, "unix_ts": 1700000000.0},
+        {"sender": "me", "text": "yes!", "from_me": True, "unix_ts": 1700000100.0},
+    ])
+    detector._second_pass_date_resolution(event, thread, model="claude-haiku-4-5")
+    assert event["date"] == "2026-06-13"
+
+
+def test_date_resolver_api_error_leaves_date_untouched(fake_anthropic):
+    fake_anthropic([RuntimeError("boom")])
+    event = _event(date="2026-06-13", evidence="dinner this Saturday?", date_evidence="dinner this Saturday?")
+    thread = _thread(messages=[
+        {"sender": "+15551234567", "text": "the reunion is Sept 19", "from_me": False, "unix_ts": 1600000000.0},
+        {"sender": "+15551234567", "text": "dinner this Saturday?", "from_me": False, "unix_ts": 1700000000.0},
+        {"sender": "me", "text": "yes!", "from_me": True, "unix_ts": 1700000100.0},
+    ])
+    detector._second_pass_date_resolution(event, thread, model="claude-haiku-4-5")
+    assert event["date"] == "2026-06-13"
+
+
+def test_date_resolver_disabled_via_detect_plans_flag(fake_anthropic):
+    # detect_plans should never invoke the resolver at all when disabled —
+    # verified indirectly: only one API call (the detection call) happens
+    # even though the detected event has a resolvable bare weekday and the
+    # thread contains another anchor.
+    thread = _thread(messages=[
+        {"sender": "+15551234567", "text": "the reunion is Sept 19", "from_me": False, "unix_ts": 1600000000.0},
+        {"sender": "+15551234567", "text": "dinner this Saturday?", "from_me": False, "unix_ts": 1700000000.0},
+        {"sender": "me", "text": "yes!", "from_me": True, "unix_ts": 1700000100.0},
+    ])
+    client = fake_anthropic([_response(_event(
+        date="2026-06-13", evidence="dinner this Saturday?", date_evidence="dinner this Saturday?",
+    ))])
+    detector.detect_plans([thread], date_resolver_enabled=False)
+    assert len(client.messages.calls) == 1
+
+
 # --- Weekday math hardening (_reconcile_weekday) ----------------------------
 
 

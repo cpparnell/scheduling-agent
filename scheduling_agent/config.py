@@ -72,6 +72,12 @@ DEFAULTS = {
     # replays the same context window). Disable to fall back to the
     # unmarked prompt.
     "context_marking_enabled": True,
+    # Fire a dedicated second-pass haiku call to re-check a bare-weekday date
+    # that had no explicit-date anchor near it, when the thread has other
+    # date-like content that could plausibly override the "next occurrence"
+    # default (F6c — attacks wrong-WEEK errors _reconcile_weekday's +/-3-day
+    # shift can't repair). Disable to skip the extra call entirely.
+    "date_resolver_enabled": True,
     # Whether a detected cancellation of a previously-created event is allowed
     # to delete it from the calendar. Only ever touches events the agent
     # itself created (calendar_uid recorded in state) — disable to log the
