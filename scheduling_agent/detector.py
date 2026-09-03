@@ -6,6 +6,8 @@ from datetime import date as _date, datetime, timedelta
 
 import anthropic
 
+from scheduling_agent.datepatterns import EXPLICIT_DATE_RE
+
 logger = logging.getLogger(__name__)
 
 MODEL = "claude-haiku-4-5-20251001"
@@ -146,6 +148,30 @@ message as `evidence`.
 Respond with a JSON object only. No prose.
 """
 
+# Appended to SYSTEM_PROMPT (when context_marking_enabled) for threads that
+# mix already-processed context with newly-arrived messages. Every poll
+# re-sends the same context window, so without this rule the model would
+# re-emit the same plan every time any new message arrives in the chat.
+_CONTEXT_MARKING_ADDENDUM = """
+
+**Already-processed context**: This thread mixes context — messages from a
+previous analysis, marked "[--- earlier messages, already processed —
+context only ---]" — with messages that just arrived, marked "[--- new
+messages ---]". Only emit a plan if at least one NEW message carries
+scheduling-relevant information about it: the proposal itself, an
+acceptance or decline, a change to the date/time/location, or a
+cancellation. If everything that establishes a plan sits in the earlier
+context and the new message(s) don't add anything relevant, emit nothing —
+it was already handled. A new message that merely reacts to an
+already-established plan ("so excited!!", "lol", an emoji) is NOT
+scheduling-relevant and must not cause you to re-emit it. This rule is
+about withholding re-emission, not about ignoring context: still use the
+context to fill in a plan's details (date, time, location) when a new
+message's scheduling-relevant content refers back to it — e.g. a late
+acceptance of an invitation that was proposed in the context, or a
+reschedule/cancellation of a plan established there.
+"""
+
 EVENT_ITEM_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -230,15 +256,55 @@ RESPONSE_SCHEMA = {
 EVENT_SCHEMA = RESPONSE_SCHEMA
 
 
-def _format_thread(thread: dict, today: datetime | None = None) -> str:
+_CONTEXT_HEADER = "[--- earlier messages, already processed — context only ---]"
+_NEW_HEADER = "[--- new messages ---]"
+
+
+def _format_thread(
+    thread: dict, today: datetime | None = None, context_marking_enabled: bool = True
+) -> str:
     now = today or datetime.now()
+    # A naive `now` (production's live wall clock, or the eval harness's
+    # pinned date) is presumed to already be local time; attach the local
+    # zone without shifting the wall-clock value. An already-aware `now`
+    # (not currently produced by any caller) is left as-is.
+    now = now if now.tzinfo else now.astimezone()
+    local_tz = now.tzinfo
+
+    offset = now.utcoffset() or timedelta(0)
+    total_minutes = int(offset.total_seconds() // 60)
+    sign = "+" if total_minutes >= 0 else "-"
+    hh, mm = divmod(abs(total_minutes), 60)
+    offset_str = f"UTC{sign}{hh:02d}:{mm:02d}"
+    tz_abbr = now.strftime("%Z") or offset_str
+
     today_str = now.strftime("%A, %B %d, %Y")
     participants = ", ".join(thread.get("participants", ["unknown"]))
-    lines = [f"[Today is {today_str}]", f"[Participants: {participants}]", ""]
-    for msg in thread.get("messages", []):
+    lines = [
+        f"[Today is {today_str} ({tz_abbr}, {offset_str})]",
+        f"[Participants: {participants}]",
+        "",
+    ]
+    messages = thread.get("messages", [])
+    # Only insert the context/new-message separators when the thread actually
+    # mixes both (some message tagged is_context=True by reader._prepend_context
+    # or evals/loader.materialize_polls) — a single-poll thread where every
+    # message is "new" renders exactly as it did before this feature existed.
+    mark_context = context_marking_enabled and any(m.get("is_context") for m in messages)
+    context_header_shown = False
+    new_header_shown = False
+    for msg in messages:
+        if mark_context:
+            is_ctx = bool(msg.get("is_context"))
+            if is_ctx and not context_header_shown:
+                lines.append(_CONTEXT_HEADER)
+                context_header_shown = True
+            if not is_ctx and not new_header_shown:
+                lines.append(_NEW_HEADER)
+                new_header_shown = True
         sender = "Me" if msg.get("from_me") else msg.get("sender", "Them")
-        sent_at = datetime.fromtimestamp(msg.get("unix_ts", 0))
-        ts = sent_at.strftime("%a %m/%d %I:%M%p")
+        sent_at = datetime.fromtimestamp(msg.get("unix_ts", 0), tz=local_tz)
+        ts = sent_at.strftime("%a %m/%d/%Y %I:%M%p")
         age_days = (now.date() - sent_at.date()).days
         age_suffix = f", sent {age_days} day{'s' if age_days != 1 else ''} ago" if age_days >= 1 else ""
         lines.append(f"{sender} ({ts}{age_suffix}): {msg.get('text', '')}")
@@ -274,7 +340,16 @@ _WRAPPING_QUOTES = re.compile(r'^([\'"])(.*)\1$', re.DOTALL)
 _WORD_RE = re.compile(r"[a-z0-9']+")
 
 _MIN_FUZZY_TOKENS = 3
-_FUZZY_COVERAGE_THRESHOLD = 0.8
+_FUZZY_COVERAGE_THRESHOLD = 0.9
+
+# Negation/change-of-plan markers. If the matched message contains one of
+# these that the quoted evidence fragment does NOT, the fuzzy match is
+# rejected — otherwise an evidence quote could validate its own negation
+# ("dinner Friday, NOT at 7" would fuzzy-match evidence "dinner Friday at 7").
+_NEGATION_RE = re.compile(
+    r"\bnot\b|n't\b|\bno\b|\bnever\b|\bcancel(?:led)?\b|\binstead\b|\bmoved\b",
+    re.IGNORECASE,
+)
 
 # Verbatim message text is never logged in full — only a short snippet, so
 # logs/stdout/*.log doesn't accumulate an unbounded plaintext transcript of
@@ -308,15 +383,48 @@ def _strip_quote_wrappers(fragment: str) -> str:
     return fragment
 
 
+def _ordered_coverage(fragment_tokens: list[str], message_tokens: list[str]) -> float:
+    """Fraction of fragment_tokens found in message_tokens IN ORDER (a greedy
+    subsequence match: each fragment token must occur at or after the
+    position of the previous match). Unlike a token-SET overlap, this can't
+    be fooled by a message whose words merely overlap the fragment in a
+    different order or with a meaning-flipping word inserted mid-fragment."""
+    if not fragment_tokens:
+        return 0.0
+    pos = 0
+    matched = 0
+    for tok in fragment_tokens:
+        for k in range(pos, len(message_tokens)):
+            if message_tokens[k] == tok:
+                matched += 1
+                pos = k + 1
+                break
+    return matched / len(fragment_tokens)
+
+
+def _negation_mismatch(fragment_norm: str, message_norm: str) -> bool:
+    """True if the message contains a negation/change-of-plan word the
+    evidence fragment doesn't itself quote — a sign the fragment is quoting
+    around a negation rather than an affirmative statement."""
+    msg_negations = set(_NEGATION_RE.findall(message_norm))
+    if not msg_negations:
+        return False
+    frag_negations = set(_NEGATION_RE.findall(fragment_norm))
+    return not msg_negations.issubset(frag_negations)
+
+
 def _fuzzy_covered(fragment_norm: str, message_norm: str) -> bool:
-    ev_tokens = set(_WORD_RE.findall(fragment_norm))
+    ev_tokens = _WORD_RE.findall(fragment_norm)
     if len(ev_tokens) < _MIN_FUZZY_TOKENS:
         return False
-    msg_tokens = set(_WORD_RE.findall(message_norm))
+    msg_tokens = _WORD_RE.findall(message_norm)
     if not msg_tokens:
         return False
-    coverage = len(ev_tokens & msg_tokens) / len(ev_tokens)
-    return coverage >= _FUZZY_COVERAGE_THRESHOLD
+    if _ordered_coverage(ev_tokens, msg_tokens) < _FUZZY_COVERAGE_THRESHOLD:
+        return False
+    if _negation_mismatch(fragment_norm, message_norm):
+        return False
+    return True
 
 
 def _evidence_found(evidence: str, thread: dict) -> bool:
@@ -326,7 +434,9 @@ def _evidence_found(evidence: str, thread: dict) -> bool:
 
     evidence_norm = _normalize_for_match(evidence)
     if not evidence_norm:
-        return True
+        # Empty/whitespace-only evidence fails the gate rather than bypassing
+        # it — a required schema field left blank is not proof of anything.
+        return False
     if evidence_norm in haystack:
         return True
 
@@ -367,11 +477,12 @@ _WEEKDAY_INDEX = {
 }
 
 # Matches a bare weekday name/abbreviation, excluding ones preceded by "last"
-# (a past reference, e.g. "last Friday" — never a signal to shift a future
-# date). The lookbehind is fixed-width ("last" + one whitespace char) so it's
-# valid in Python's re engine.
+# or "next" (both name a specific relative occurrence already resolved by the
+# model's own date arithmetic — not a signal to shift the detected date via
+# this deterministic heuristic). Each lookbehind is fixed-width ("last "/
+# "next ", 5 chars) so both are valid in Python's re engine.
 _WEEKDAY_MENTION_RE = re.compile(
-    r"(?<!last\s)\b(" + "|".join(sorted(_WEEKDAY_INDEX, key=len, reverse=True)) + r")\b",
+    r"(?<!last\s)(?<!next\s)\b(" + "|".join(sorted(_WEEKDAY_INDEX, key=len, reverse=True)) + r")\b",
     re.IGNORECASE,
 )
 
@@ -386,8 +497,11 @@ def _reconcile_weekday(event: dict, chat_id) -> None:
     arithmetic unreliably even when the prompt states "today" explicitly.
     Shifts by the minimal signed delta (at most +/-3 days) so a date anchored
     far in the future only nudges within its anchor week; skips when no
-    weekday is named, the date already matches, or more than one distinct
-    weekday is named (ambiguous — do not guess)."""
+    weekday is named, the date already matches, more than one distinct
+    weekday is named (ambiguous — do not guess), or the model's own evidence
+    already quotes an explicit date (a month name, numeric date, or ordinal
+    day) — that anchor wins over weekday-shift heuristics rather than being
+    overridden by an incidental weekday mentioned in the same quote."""
     date_str = event.get("date")
     if not date_str:
         return
@@ -396,7 +510,12 @@ def _reconcile_weekday(event: dict, chat_id) -> None:
     except ValueError:
         return
 
-    named = _named_weekdays(event.get("evidence") or "") | _named_weekdays(event.get("date_evidence") or "")
+    evidence_text = event.get("evidence") or ""
+    date_evidence_text = event.get("date_evidence") or ""
+    if EXPLICIT_DATE_RE.search(evidence_text) or EXPLICIT_DATE_RE.search(date_evidence_text):
+        return
+
+    named = _named_weekdays(evidence_text) | _named_weekdays(date_evidence_text)
     if len(named) != 1:
         return
     target = next(iter(named))
@@ -423,17 +542,50 @@ def _reconcile_weekday(event: dict, chat_id) -> None:
             pass
 
 
+def _new_messages(thread: dict) -> list[dict]:
+    """The thread's messages that aren't already-processed context — i.e. the
+    ones from THIS poll. When the thread carries no context-marking info at
+    all (single-poll cases, or context marking disabled), every message
+    counts as new, matching pre-F1 behavior."""
+    messages = thread.get("messages", [])
+    if not any(m.get("is_context") for m in messages):
+        return messages
+    return [m for m in messages if not m.get("is_context")]
+
+
+def _new_message_from_user(thread: dict) -> bool:
+    """Whether any NEW (this-poll) message is from "Me". Used both by
+    _demote_if_user_silent (within-poll group-silence check) and tagged onto
+    each event as event["_new_msg_from_user"] for main.py's cross-poll
+    anti-flap guard (F7), which has no access to the thread itself."""
+    return any(m.get("from_me") for m in _new_messages(thread))
+
+
 def _demote_if_user_silent(event: dict, thread: dict) -> None:
     """In a multi-participant thread where the user ("Me") never sent a
     message, another person's acceptance can't confirm or tentatively commit
     the plan FOR the user — demote to "unanswered" so the calendar's
     ownership/status gates hold it back until the user actually responds. A
-    later real acceptance re-detects and creates the event normally."""
-    if len(thread.get("participants", [])) <= 1:
+    later real acceptance re-detects and creates the event normally.
+
+    "Group" is judged by distinct senders seen in the thread, not just the
+    queried `participants` list — chat_handle_join excludes the user, so a
+    2-person group chat can show participants=[one other handle] if a handle
+    row is ever missing, indistinguishable from a genuine 1:1 by list length
+    alone. Distinct non-"Me" senders is a more reliable group signal.
+
+    Only NEW (this-poll) messages are checked for user silence — an old
+    acceptance from a prior poll doesn't retroactively justify a status this
+    poll is otherwise not re-establishing from new content."""
+    other_senders = {
+        m.get("sender") for m in thread.get("messages", []) if not m.get("from_me")
+    }
+    is_group = len(thread.get("participants", [])) > 1 or len(other_senders) > 1
+    if not is_group:
         return
     if event.get("status") not in ("confirmed", "tentative"):
         return
-    if any(m.get("from_me") for m in thread.get("messages", [])):
+    if _new_message_from_user(thread):
         return
     logger.info(
         "  -> Demoting to unanswered: user never responded in group thread %s",
@@ -447,6 +599,7 @@ def detect_plans(
     model: str = MODEL,
     evidence_gate: bool = True,
     today: datetime | None = None,
+    context_marking_enabled: bool = True,
 ) -> tuple[list[dict], set]:
     """
     Analyze a list of conversation threads for plans.
@@ -463,9 +616,17 @@ def detect_plans(
     `today` is forwarded to `_format_thread` so callers (the eval harness) can
     pin what the model sees as "today"; production callers leave it None and
     get the live wall clock.
+
+    `context_marking_enabled` (mirrors config.DEFAULTS) inserts the
+    already-processed-context / new-messages separators (see
+    _CONTEXT_MARKING_ADDENDUM) so the model doesn't re-emit a plan whose only
+    trace is old context replayed by reader._prepend_context every poll. A
+    thread with no is_context-tagged messages (any single-poll case) is
+    unaffected either way.
     """
     results = []
     failed_chat_ids = set()
+    system_prompt = SYSTEM_PROMPT + (_CONTEXT_MARKING_ADDENDUM if context_marking_enabled else "")
 
     for thread in threads:
         participants = ", ".join(thread.get("participants", ["unknown"]))
@@ -479,11 +640,13 @@ def detect_plans(
         )
 
         try:
-            formatted = _format_thread(thread, today=today)
+            formatted = _format_thread(
+                thread, today=today, context_marking_enabled=context_marking_enabled
+            )
             response = _get_client().messages.create(
                 model=model,
                 max_tokens=2048,
-                system=SYSTEM_PROMPT,
+                system=system_prompt,
                 messages=[{
                     "role": "user",
                     "content": f"Analyze this iMessage thread for plans:\n\n{formatted}"
@@ -515,28 +678,28 @@ def detect_plans(
                 if not event.get("date"):
                     continue
 
-                date_evidence = event.get("date_evidence")
-                if date_evidence and not _evidence_found(date_evidence, thread):
+                date_evidence = event.get("date_evidence") or ""
+                if not _evidence_found(date_evidence, thread):
                     logger.warning(
                         "  -> Date evidence not found verbatim in thread %s: %s",
                         thread["chat_id"], _log_snippet(date_evidence),
                     )
                     if evidence_gate:
                         logger.warning(
-                            "  -> Dropping event with unverifiable date evidence: %s",
+                            "  -> Dropping event with missing/unverifiable date evidence: %s",
                             event.get("title"),
                         )
                         continue
 
-                evidence = event.get("evidence")
-                if evidence and not _evidence_found(evidence, thread):
+                evidence = event.get("evidence") or ""
+                if not _evidence_found(evidence, thread):
                     logger.warning(
                         "  -> Evidence not found verbatim in thread %s: %s",
                         thread["chat_id"], _log_snippet(evidence),
                     )
                     if evidence_gate:
                         logger.warning(
-                            "  -> Dropping event with unverifiable evidence: %s",
+                            "  -> Dropping event with missing/unverifiable evidence: %s",
                             event.get("title"),
                         )
                         continue
@@ -552,6 +715,9 @@ def detect_plans(
                     event.get("confidence", 0),
                 )
                 event["chat_id"] = thread["chat_id"]
+                # Consumed by main.py's anti-flap guard (F7), which has no
+                # access to the thread itself — see _new_message_from_user.
+                event["_new_msg_from_user"] = _new_message_from_user(thread)
                 results.append(event)
 
         except Exception as e:

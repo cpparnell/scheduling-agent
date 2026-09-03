@@ -1,4 +1,6 @@
 import json
+import os
+from datetime import date as date_type, timedelta
 
 from scheduling_agent import state
 
@@ -87,11 +89,14 @@ def test_pre_versioning_state_migrates_and_persists_on_load():
     assert state.get_last_timestamp() == 999
     assert "abc123" in state._load()["created_events"]
 
-    # The upgrade is persisted to disk so later reads are clean.
+    # The upgrade is persisted to disk so later reads are clean. The migrated
+    # hash has no matching event record, so it's stamped with today's date
+    # (v5: created_events is hash -> date, not a bare list — see test_v4_to_v5_*).
     on_disk = json.loads(state.STATE_FILE.read_text())
     assert on_disk["schema_version"] == state.CURRENT_SCHEMA_VERSION
     assert on_disk["last_processed_timestamp"] == 999
-    assert on_disk["created_events"] == ["abc123"]
+    assert isinstance(on_disk["created_events"], dict)
+    assert "abc123" in on_disk["created_events"]
 
 
 def test_normalize_title_strips_month_names():
@@ -128,7 +133,7 @@ def test_migrate_is_noop_for_current_version():
     data = {
         "schema_version": state.CURRENT_SCHEMA_VERSION,
         "last_processed_timestamp": 5,
-        "created_events": ["x"],
+        "created_events": {"x": "2026-06-01"},
     }
     assert state._migrate(dict(data)) == data
 
@@ -143,7 +148,10 @@ def test_v2_to_v3_migration_preserves_existing_data_and_adds_events():
     migrated = state._migrate(dict(legacy))
     assert migrated["schema_version"] == state.CURRENT_SCHEMA_VERSION
     assert migrated["last_processed_timestamp"] == 999
-    assert migrated["created_events"] == ["abc123"]
+    # No matching event record for "abc123" (events starts empty at v3), so
+    # the v5 step stamps it with today's date rather than a fixed one.
+    assert isinstance(migrated["created_events"], dict)
+    assert "abc123" in migrated["created_events"]
     assert migrated["title_events"] == {"1:dinner": "2026-06-01"}
     assert migrated["events"] == []
     assert migrated["watermark_hold"] == {"ts": None, "count": 0}
@@ -154,7 +162,8 @@ def test_v0_to_v3_migration_chain():
     migrated = state._migrate(dict(legacy))
     assert migrated["schema_version"] == state.CURRENT_SCHEMA_VERSION
     assert migrated["last_processed_timestamp"] == 42
-    assert migrated["created_events"] == ["x"]
+    assert isinstance(migrated["created_events"], dict)
+    assert "x" in migrated["created_events"]
     assert migrated["title_events"] == {}
     assert migrated["events"] == []
     assert migrated["watermark_hold"] == {"ts": None, "count": 0}
@@ -255,9 +264,148 @@ def test_v0_to_v4_migration_chain():
     legacy = {"last_processed_timestamp": 42, "created_events": ["x"]}
     migrated = state._migrate(dict(legacy))
     assert migrated["schema_version"] == state.CURRENT_SCHEMA_VERSION
-    assert migrated["created_events"] == ["x"]
+    assert isinstance(migrated["created_events"], dict)
+    assert "x" in migrated["created_events"]
     assert migrated["events"] == []
     assert migrated["journal"] == []
+
+
+# --- v5: created_events becomes hash -> date ---------------------------------
+
+
+def test_v4_to_v5_migration_converts_created_events_to_dict():
+    legacy = {
+        "schema_version": 4,
+        "last_processed_timestamp": 999,
+        "created_events": ["abc123", "orphan-hash"],
+        "title_events": {"1:dinner": "2026-06-01"},
+        "events": [{
+            "canonical_id": "c1",
+            "hash": "abc123",
+            "chat_id": 1,
+            "date": "2026-06-01",
+            "time_start": "19:00",
+            "title": "Dinner",
+            "chat_ids": [1],
+            "created_at": "2026-06-01T10:00:00",
+            "updated_at": "2026-06-01T10:00:00",
+            "confidence": None,
+            "revisions": [],
+            "suppressed": False,
+        }],
+        "journal": [],
+        "watermark_hold": {"ts": None, "count": 0},
+    }
+    migrated = state._migrate(dict(legacy))
+    assert migrated["schema_version"] == state.CURRENT_SCHEMA_VERSION
+    # A hash with a matching event record picks up that record's date...
+    assert migrated["created_events"]["abc123"] == "2026-06-01"
+    # ...one with no matching record falls back to today's date rather than
+    # being dropped (it still needs to dedup against future detections).
+    assert migrated["created_events"]["orphan-hash"] == date_type.today().isoformat()
+
+
+def test_prune_state_drops_created_events_and_title_events_with_stale_records():
+    old_date = (date_type.today() - timedelta(days=state.EVENT_RECORD_RETENTION_DAYS + 5)).isoformat()
+    recent_date = date_type.today().isoformat()
+    data = {
+        "events": [],
+        "created_events": {"stale-hash": old_date, "fresh-hash": recent_date},
+        "title_events": {"1:old plan": old_date, "1:new plan": recent_date},
+    }
+    state._prune_state(data)
+    assert "stale-hash" not in data["created_events"]
+    assert "fresh-hash" in data["created_events"]
+    assert "1:old plan" not in data["title_events"]
+    assert "1:new plan" in data["title_events"]
+
+
+def test_prune_state_keeps_recent_event_hash_and_title_key_in_sync():
+    # A record just inside the retention window keeps its hash and title key
+    # alive together, so is_duplicate()=True and find_record() never disagree.
+    state.record_event(1, "2026-06-13", "19:00", "Dinner with Sam")
+    data = state._load()
+    record = data["events"][0]
+    assert record["hash"] in data["created_events"]
+    key = state._title_key(1, "Dinner with Sam")
+    assert key in data["title_events"]
+
+
+# --- v6: observations map (F7 anti-flap guard) -------------------------------
+
+
+def test_v5_to_v6_migration_adds_empty_observations():
+    legacy = {
+        "schema_version": 5,
+        "created_events": {},
+        "title_events": {},
+        "events": [],
+        "journal": [],
+        "watermark_hold": {"ts": None, "count": 0},
+    }
+    migrated = state._migrate(dict(legacy))
+    assert migrated["schema_version"] == state.CURRENT_SCHEMA_VERSION
+    assert migrated["observations"] == {}
+
+
+def test_v0_to_v6_migration_chain_adds_observations():
+    legacy = {"last_processed_timestamp": 42, "created_events": ["x"]}
+    migrated = state._migrate(dict(legacy))
+    assert migrated["schema_version"] == state.CURRENT_SCHEMA_VERSION
+    assert migrated["observations"] == {}
+
+
+def test_record_observation_round_trips():
+    state.record_observation(1, "2026-06-13", "19:00", "Dinner", "unanswered")
+
+    obs = state.get_observation(1, "2026-06-13", "19:00", "Dinner")
+    assert obs is not None
+    assert obs["last_status"] == "unanswered"
+    assert obs["date"] == "2026-06-13"
+    assert obs["count"] == 1
+
+
+def test_get_observation_returns_none_when_never_recorded():
+    assert state.get_observation(1, "2026-06-13", "19:00", "Dinner") is None
+
+
+def test_record_observation_increments_count_and_updates_status():
+    state.record_observation(1, "2026-06-13", "19:00", "Dinner", "unanswered")
+    state.record_observation(1, "2026-06-13", "19:00", "Dinner", "low-confidence")
+
+    obs = state.get_observation(1, "2026-06-13", "19:00", "Dinner")
+    assert obs["count"] == 2
+    assert obs["last_status"] == "low-confidence"
+
+
+def test_prune_state_drops_stale_observations():
+    old_date = (date_type.today() - timedelta(days=state.EVENT_RECORD_RETENTION_DAYS + 5)).isoformat()
+    recent_date = date_type.today().isoformat()
+    data = {
+        "events": [],
+        "created_events": {},
+        "title_events": {},
+        "observations": {
+            "stale-hash": {"last_status": "unanswered", "date": old_date, "count": 1},
+            "fresh-hash": {"last_status": "unanswered", "date": recent_date, "count": 1},
+        },
+    }
+    state._prune_state(data)
+    assert "stale-hash" not in data["observations"]
+    assert "fresh-hash" in data["observations"]
+
+
+def test_prune_state_keeps_malformed_observation_date_rather_than_dropping():
+    data = {
+        "events": [],
+        "created_events": {},
+        "title_events": {},
+        "observations": {
+            "weird-hash": {"last_status": "unanswered", "date": None, "count": 1},
+        },
+    }
+    state._prune_state(data)
+    assert "weird-hash" in data["observations"]
 
 
 def test_pending_journal_entry_trips_is_duplicate():
@@ -348,6 +496,44 @@ def test_get_active_events_excludes_suppressed_includes_pending():
     titles = {r["title"] for r in state.get_active_events()}
 
     assert titles == {"Dinner", "Concert"}
+
+
+# --- atomic save --------------------------------------------------------------
+
+
+def test_save_leaves_no_leftover_temp_files():
+    state.record_event(1, "2026-06-13", "19:00", "Dinner")
+    leftovers = list(state.STATE_DIR.glob(".state-*.json.tmp"))
+    assert leftovers == []
+    assert state.STATE_FILE.exists()
+
+
+def test_save_is_atomic_via_rename(monkeypatch):
+    # A crash between the temp-file write and the rename must never leave a
+    # truncated/partial state.json — os.replace is a single atomic syscall,
+    # so the real file is either the old content or the fully-written new
+    # content, never a half-written mix. Simulate that boundary by failing
+    # deliberately right before the rename and confirming the real file (if
+    # it exists at all) still parses cleanly with its prior content intact.
+    state.record_event(1, "2026-06-13", "19:00", "Dinner")
+    before = state.STATE_FILE.read_text()
+
+    real_replace = os.replace
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated crash before rename")
+
+    monkeypatch.setattr(state.os, "replace", boom)
+    try:
+        state.record_event(2, "2026-06-14", "19:00", "Lunch")
+    except RuntimeError:
+        pass
+    monkeypatch.setattr(state.os, "replace", real_replace)
+
+    # The real file was never touched by the failed write.
+    assert state.STATE_FILE.read_text() == before
+    # No leftover temp file survives the failure.
+    assert list(state.STATE_DIR.glob(".state-*.json.tmp")) == []
 
 
 # --- evidence truncation ------------------------------------------------------

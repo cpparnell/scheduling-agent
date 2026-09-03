@@ -55,6 +55,7 @@ def _event():
             "recurrence": None,
             "end_date": None,
             "evidence": "yes! 7pm",
+            "date_evidence": "dinner friday at lucia's?",
         }]
     }
 

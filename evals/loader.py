@@ -73,9 +73,17 @@ def _substitute(text: str, today: date) -> str:
     return _PLACEHOLDER.sub(repl, text)
 
 
-def _materialize_messages(raw_messages: list[dict], participants: list[str], today: date, now: float) -> list[dict]:
+def _materialize_messages(
+    raw_messages: list[dict], participants: list[str], today: date, now: float,
+    context_flags: list[bool] | None = None,
+) -> list[dict]:
+    """``context_flags``, when given, is a parallel list of booleans marking
+    which raw messages are prior-poll context vs. new-to-this-poll (mirrors
+    production's ``reader._prepend_context`` replay). Only meaningful for
+    ``materialize_polls`` — single-poll cases have no context, so callers that
+    omit it get every message unmarked (``is_context`` False)."""
     messages = []
-    for msg in raw_messages:
+    for i, msg in enumerate(raw_messages):
         if msg.get("from_me"):
             sender = "me"
         else:
@@ -88,6 +96,7 @@ def _materialize_messages(raw_messages: list[dict], participants: list[str], tod
             "text": _substitute(msg["text"], today),
             "from_me": msg.get("from_me", False),
             "unix_ts": now - msg.get("hours_ago", 1) * 3600,
+            "is_context": bool(context_flags[i]) if context_flags is not None else False,
         })
     return messages
 
@@ -129,13 +138,17 @@ def materialize_polls(case: dict, today: date | None = None, now: float | None =
     for i, poll in enumerate(case["polls"]):
         chat_id = poll.get("chat_id", case["id"])
         raw = []
-        for prior in case["polls"][: i + 1]:
+        context_flags = []
+        for p, prior in enumerate(case["polls"][: i + 1]):
             if prior.get("chat_id", case["id"]) == chat_id:
                 raw.extend(prior["messages"])
+                context_flags.extend([p < i] * len(prior["messages"]))
         threads.append({
             "chat_id": chat_id,
             "participants": poll.get("participants", participants),
-            "messages": _materialize_messages(raw, poll.get("participants", participants), today, now),
+            "messages": _materialize_messages(
+                raw, poll.get("participants", participants), today, now, context_flags=context_flags
+            ),
         })
     return threads
 

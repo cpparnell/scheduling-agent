@@ -1,6 +1,8 @@
 import hashlib
 import json
+import os
 import re
+import tempfile
 import uuid
 from datetime import date as date_type, datetime, timedelta
 from pathlib import Path
@@ -10,7 +12,7 @@ STATE_FILE = STATE_DIR / "state.json"
 
 # Bump this whenever the on-disk state shape changes, and add a corresponding
 # step in _migrate(). Files written before versioning are treated as version 0.
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 6
 
 # Events with the same chat + normalized title within this many days are treated
 # as the same occurrence and deduplicated.
@@ -38,7 +40,9 @@ def _new_state() -> dict:
     return {
         "schema_version": CURRENT_SCHEMA_VERSION,
         "last_processed_timestamp": None,
-        "created_events": [],
+        # Maps dedup hash -> ISO date, so pruning can drop stale hashes in step
+        # with the records they came from (see _prune_state).
+        "created_events": {},
         # Maps "{chat_id}:{normalized_title}" -> most-recent ISO date recorded.
         # Used to catch the same event being detected with a different date.
         "title_events": {},
@@ -55,6 +59,13 @@ def _new_state() -> dict:
         # Tracks how many consecutive polls have failed to advance the
         # watermark past a bad thread, so main.py can cap retries.
         "watermark_hold": {"ts": None, "count": 0},
+        # Maps dedup hash -> {last_status, last_seen, date, count} for
+        # detections main.process_event skipped (unanswered, not-participant,
+        # low-confidence) — these previously left no record at all, so a
+        # single flaky poll's confirmation of a hash last seen "unanswered"
+        # had no history to check against. See record_observation/
+        # get_observation and main.py's anti-flap guard.
+        "observations": {},
     }
 
 
@@ -92,6 +103,28 @@ def _migrate(data: dict) -> dict:
             record.setdefault("revisions", [])
         data.setdefault("journal", [])
         version = 4
+    if version < 5:
+        # v5: created_events becomes hash -> date (was a bare list of hashes),
+        # so it can be pruned in lockstep with `events` and `title_events"
+        # instead of growing unbounded and silently outliving the records it
+        # dedups against (is_duplicate() true, find_record() None).
+        old_created = data.get("created_events", [])
+        if isinstance(old_created, list):
+            events_by_hash = {
+                r.get("hash"): r.get("date")
+                for r in data.get("events", [])
+                if r.get("hash") and r.get("date")
+            }
+            today_str = date_type.today().isoformat()
+            data["created_events"] = {
+                h: events_by_hash.get(h, today_str) for h in old_created
+            }
+        version = 5
+    if version < 6:
+        # v6: observations map for skipped (not created) detections, so an
+        # anti-flap check has history to consult instead of none at all.
+        data.setdefault("observations", {})
+        version = 6
     data["schema_version"] = CURRENT_SCHEMA_VERSION
     return data
 
@@ -111,9 +144,23 @@ def _load() -> dict:
 
 
 def _save(data: dict) -> None:
+    """Write state.json atomically: a crash or concurrent read mid-write can
+    never observe a truncated/partial file, since the write lands on a temp
+    file first and only becomes STATE_FILE via a single atomic rename."""
     STATE_DIR.mkdir(exist_ok=True)
-    with open(STATE_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+    fd, tmp_path = tempfile.mkstemp(dir=STATE_DIR, prefix=".state-", suffix=".json.tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, STATE_FILE)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def get_last_timestamp() -> int | None:
@@ -159,7 +206,7 @@ def _pending_create_records(data: dict) -> list[dict]:
 def is_duplicate(chat_id: int, date: str, time_start: str | None, title: str) -> bool:
     data = _load()
     h = event_hash(chat_id, date, time_start, title)
-    if h in data.get("created_events", []):
+    if h in data.get("created_events", {}):
         return True
 
     pending = _pending_create_records(data)
@@ -302,9 +349,8 @@ def get_pending_journal() -> list[dict]:
 
 def _commit_record(data: dict, record: dict) -> None:
     """Add a record's hash, title key, and the record itself to `data` (caller saves)."""
-    created = set(data.get("created_events", []))
-    created.add(record["hash"])
-    data["created_events"] = list(created)
+    created = data.setdefault("created_events", {})
+    created[record["hash"]] = record["date"]
 
     key = _title_key(record["chat_id"], record["title"])
     title_events = data.setdefault("title_events", {})
@@ -314,7 +360,7 @@ def _commit_record(data: dict, record: dict) -> None:
 
     events = data.setdefault("events", [])
     events.append(record)
-    data["events"] = _prune_old_events(events)
+    _prune_state(data)
 
 
 def record_event(
@@ -387,9 +433,8 @@ def update_record(
             record["chat_id"], record["date"], record.get("time_start"), record["title"]
         )
         record["hash"] = new_hash
-        created = set(data.get("created_events", []))
-        created.add(new_hash)  # old hash stays: prior wording remains deduped
-        data["created_events"] = list(created)
+        created = data.setdefault("created_events", {})
+        created[new_hash] = record["date"]  # old hash stays: prior wording remains deduped
 
         key = _title_key(record["chat_id"], record["title"])
         title_events = data.setdefault("title_events", {})
@@ -397,20 +442,96 @@ def update_record(
         if not existing or record["date"] > existing:
             title_events[key] = record["date"]
 
+        _prune_state(data)
+
     _save(data)
     return True
 
 
-def _prune_old_events(events: list[dict]) -> list[dict]:
+def _prune_state(data: dict) -> None:
+    """Prune `events`, `created_events`, `title_events`, and `observations`
+    together against the same retention cutoff, in place. Keeping the first
+    three in lockstep is what lets is_duplicate() and find_record() agree: a
+    hash or title key that outlives the record it came from is what
+    previously caused is_duplicate()=True / find_record()=None (a duplicate
+    detection silently dropped with no record to reconcile against).
+    `observations` never had this failure mode (it's read defensively via
+    get_observation, not asserted against) but is pruned the same way so it
+    doesn't grow unbounded either."""
     cutoff = date_type.today() - timedelta(days=EVENT_RECORD_RETENTION_DAYS)
+
     kept = []
-    for record in events:
+    for record in data.get("events", []):
         try:
             if date_type.fromisoformat(record["date"]) >= cutoff:
                 kept.append(record)
         except (KeyError, ValueError, TypeError):
             kept.append(record)
-    return kept
+    data["events"] = kept
+
+    created = data.get("created_events", {})
+    pruned_created = {}
+    for h, d in created.items():
+        try:
+            if date_type.fromisoformat(d) >= cutoff:
+                pruned_created[h] = d
+        except (ValueError, TypeError):
+            pruned_created[h] = d  # malformed date: keep rather than silently un-dedup
+    data["created_events"] = pruned_created
+
+    title_events = data.get("title_events", {})
+    pruned_title = {}
+    for k, d in title_events.items():
+        try:
+            if date_type.fromisoformat(d) >= cutoff:
+                pruned_title[k] = d
+        except (ValueError, TypeError):
+            pruned_title[k] = d
+    data["title_events"] = pruned_title
+
+    observations = data.get("observations", {})
+    pruned_observations = {}
+    for h, obs in observations.items():
+        d = obs.get("date")
+        try:
+            if d is not None and date_type.fromisoformat(d) >= cutoff:
+                pruned_observations[h] = obs
+            elif d is None:
+                pruned_observations[h] = obs  # malformed: keep rather than silently drop
+        except (ValueError, TypeError):
+            pruned_observations[h] = obs
+    data["observations"] = pruned_observations
+
+
+# --- Observations (F7 anti-flap guard) --------------------------------------
+
+
+def record_observation(
+    chat_id: int, date: str, time_start: str | None, title: str, status: str
+) -> None:
+    """Record that a detection was skipped (not created) with this status —
+    unanswered, not-participant, or low-confidence. Written even though no
+    calendar event resulted, so a later poll can tell a genuine acceptance
+    apart from a single flaky re-classification of stale replayed context
+    (see main.py's anti-flap guard, which consults get_observation)."""
+    data = _load()
+    h = event_hash(chat_id, date, time_start, title)
+    observations = data.setdefault("observations", {})
+    prev = observations.get(h)
+    observations[h] = {
+        "last_status": status,
+        "last_seen": datetime.now().isoformat(),
+        "date": date,
+        "count": (prev.get("count", 0) + 1) if prev else 1,
+    }
+    _prune_state(data)
+    _save(data)
+
+
+def get_observation(chat_id: int, date: str, time_start: str | None, title: str) -> dict | None:
+    data = _load()
+    h = event_hash(chat_id, date, time_start, title)
+    return data.get("observations", {}).get(h)
 
 
 def get_events_near(date_str: str, window_days: int = 1) -> list[dict]:

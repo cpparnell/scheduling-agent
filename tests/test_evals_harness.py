@@ -71,7 +71,10 @@ def _detector_event(**overrides):
         "participation_evidence": "Me accepted",
         "recurrence": None,
         "end_date": None,
-        "evidence": None,
+        # Literal (no placeholder substitution) so it's verbatim in the poll
+        # messages regardless of which {day+N} resolution is in play.
+        "evidence": "yes!",
+        "date_evidence": "yes!",
     }
     base.update(overrides)
     return base

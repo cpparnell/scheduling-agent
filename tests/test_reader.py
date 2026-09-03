@@ -298,3 +298,159 @@ def test_lowercase_may_is_not_a_date(fake_chat_db):
 
     msgs = [m["text"] for m in threads[0]["messages"]]
     assert "we may want to hang out sometime" not in msgs
+
+
+# --- F6d: broadened anchor patterns, cold-start harvesting, lookback-from-now --
+
+
+def test_holiday_anchor_beyond_window_is_prepended(fake_chat_db):
+    fake_chat_db([_windowed_chat("cabin trip is Labor Day weekend!", anchor_hours_ago=24 * 20)])
+
+    cutoff = reader.unix_to_apple(_recent(24))
+    threads = reader.get_threads_since(cutoff, lookback_days=7, blocked=[])
+
+    msgs = [m["text"] for m in threads[0]["messages"]]
+    assert "cabin trip is Labor Day weekend!" in msgs
+    assert msgs[0] == "cabin trip is Labor Day weekend!"
+
+
+def test_thanksgiving_anchor_beyond_window_is_prepended(fake_chat_db):
+    fake_chat_db([_windowed_chat("we're doing the big dinner over Thanksgiving", anchor_hours_ago=24 * 20)])
+
+    cutoff = reader.unix_to_apple(_recent(24))
+    threads = reader.get_threads_since(cutoff, lookback_days=7, blocked=[])
+
+    msgs = [m["text"] for m in threads[0]["messages"]]
+    assert "we're doing the big dinner over Thanksgiving" in msgs
+
+
+def test_week_of_anchor_beyond_window_is_prepended(fake_chat_db):
+    fake_chat_db([_windowed_chat("the trip is the week of the conference", anchor_hours_ago=24 * 20)])
+
+    cutoff = reader.unix_to_apple(_recent(24))
+    threads = reader.get_threads_since(cutoff, lookback_days=7, blocked=[])
+
+    msgs = [m["text"] for m in threads[0]["messages"]]
+    assert "the trip is the week of the conference" in msgs
+
+
+def test_cold_start_harvests_date_anchor_beyond_lookback(fake_chat_db):
+    # First-ever run (no watermark): the primary query only reaches
+    # lookback_days back, but a date anchor further back than that should
+    # still be harvested rather than seeing zero anchors on day one.
+    fake_chat_db([{
+        "participants": ["+15551234567"],
+        "messages": [
+            {"text": "the trip is October 10!", "from_me": False, "unix_ts": _recent(24 * 20)},
+            {"text": "on friday we leave", "from_me": False, "unix_ts": _recent(1)},
+        ],
+    }])
+
+    threads = reader.get_threads_since(None, lookback_days=7, blocked=[])
+
+    msgs = [m["text"] for m in threads[0]["messages"]]
+    assert "the trip is October 10!" in msgs
+    assert msgs[0] == "the trip is October 10!"
+    assert msgs[-1] == "on friday we leave"
+
+
+def test_cold_start_does_not_replay_non_anchor_context(fake_chat_db):
+    # Cold start harvests date anchors only, not a full context-window replay
+    # (every message inside lookback_days is already "new" on a first run).
+    fake_chat_db([{
+        "participants": ["+15551234567"],
+        "messages": [
+            {"text": "just catching up, nothing new", "from_me": False, "unix_ts": _recent(24 * 20)},
+            {"text": "on friday we leave", "from_me": False, "unix_ts": _recent(1)},
+        ],
+    }])
+
+    threads = reader.get_threads_since(None, lookback_days=7, blocked=[])
+
+    msgs = [m["text"] for m in threads[0]["messages"]]
+    assert "just catching up, nothing new" not in msgs
+
+
+def test_date_context_lookback_measured_from_now_not_cutoff(fake_chat_db):
+    # A stale watermark (60-day-old cutoff, simulating an idle machine) must
+    # not extend the anchor lookback further into the past than
+    # date_context_lookback_days actually measured from now. An anchor 120
+    # days before now falls outside a 90-day-from-now lookback even though
+    # it would fall inside a 90-day-from-the-stale-cutoff lookback (150 days
+    # back) — the bug this test guards against.
+    cutoff_hours_ago = 24 * 60
+    anchor_hours_ago = 24 * 120
+
+    messages = [{"text": "the trip is October 10!", "from_me": False, "unix_ts": _recent(anchor_hours_ago)}]
+    for i in range(31):  # push the anchor out of the 30-message context window
+        messages.append({
+            "text": f"filler {i}", "from_me": False,
+            "unix_ts": _recent(cutoff_hours_ago + 40 - i * 0.5),
+        })
+    messages.append({"text": "on friday we leave", "from_me": False, "unix_ts": _recent(1)})
+    fake_chat_db([{"participants": ["+15551234567"], "messages": messages}])
+
+    cutoff = reader.unix_to_apple(_recent(cutoff_hours_ago))
+    threads = reader.get_threads_since(
+        cutoff, lookback_days=7, blocked=[], date_context_lookback_days=90
+    )
+
+    msgs = [m["text"] for m in threads[0]["messages"]]
+    assert "the trip is October 10!" not in msgs
+
+    # The same anchor, with a lookback wide enough to actually reach it, IS
+    # included — confirming the bound is real and just correctly measured.
+    threads_wide = reader.get_threads_since(
+        cutoff, lookback_days=7, blocked=[], date_context_lookback_days=150
+    )
+    msgs_wide = [m["text"] for m in threads_wide[0]["messages"]]
+    assert "the trip is October 10!" in msgs_wide
+
+
+# --- F1: is_context tagging -------------------------------------------------
+
+
+def test_new_messages_are_tagged_is_context_false(fake_chat_db):
+    fake_chat_db([{
+        "participants": ["+15551234567"],
+        "messages": [
+            {"text": "dinner friday?", "from_me": False, "unix_ts": _recent(1)},
+        ],
+    }])
+
+    threads = reader.get_threads_since(None, lookback_days=7, blocked=[])
+
+    assert threads[0]["messages"][0]["is_context"] is False
+
+
+def test_prepended_context_window_messages_are_tagged_is_context_true(fake_chat_db):
+    fake_chat_db([_windowed_chat("the trip is October 10!", anchor_hours_ago=24 * 20)])
+
+    cutoff = reader.unix_to_apple(_recent(24))
+    threads = reader.get_threads_since(cutoff, lookback_days=7, blocked=[])
+
+    msgs = threads[0]["messages"]
+    by_text = {m["text"]: m["is_context"] for m in msgs}
+    # The date anchor and the filler context messages are all replayed
+    # context; only the post-cutoff message is genuinely new this poll.
+    assert by_text["the trip is October 10!"] is True
+    assert by_text["filler 30"] is True  # newest filler, guaranteed inside the 30-window
+    assert by_text["on friday we leave"] is False
+
+
+def test_cold_start_anchor_is_tagged_is_context_true(fake_chat_db):
+    # Cold-start anchors (F6d) are still context, not new — even though
+    # there's no replay window, they aren't this-poll's own content either.
+    fake_chat_db([{
+        "participants": ["+15551234567"],
+        "messages": [
+            {"text": "the trip is October 10!", "from_me": False, "unix_ts": _recent(24 * 20)},
+            {"text": "on friday we leave", "from_me": False, "unix_ts": _recent(1)},
+        ],
+    }])
+
+    threads = reader.get_threads_since(None, lookback_days=7, blocked=[])
+
+    by_text = {m["text"]: m["is_context"] for m in threads[0]["messages"]}
+    assert by_text["the trip is October 10!"] is True
+    assert by_text["on friday we leave"] is False

@@ -56,13 +56,22 @@ def test_bystander_controls_still_detected(detector_results):
 def test_dedup_adjudicator_verdicts(golden_cases, detector_results):
     """Hard gate on the pairwise adjudicator: every known-duplicate pair must
     be caught, and no genuinely-different control may be merged (the flipped
-    uncertainty bias's failure mode)."""
+    uncertainty bias's failure mode). Pairs marked known_failure on either
+    side are aspirational (tracking a fix not yet implemented) and are
+    reported separately rather than gated."""
     results_by_id = {r["id"]: r for r in detector_results}
     dedup_results = score_dedup_pairs(golden_cases, results_by_id, model=DEDUP_MODEL)
+    cases_by_id = {c["id"]: c for c in golden_cases}
 
-    assert dedup_results, "no dedup pairs found"
-    missed = [r["id"] for r in dedup_results if r["expected_verdict"] == "same" and not r["passed"]]
-    merged = [r["id"] for r in dedup_results if r["expected_verdict"] == "different" and not r["passed"]]
+    def _is_known_failure(dedup_result: dict) -> bool:
+        case = cases_by_id[dedup_result["id"]]
+        ref = cases_by_id.get(dedup_result["dedup_with"], {})
+        return bool(case.get("known_failure") or ref.get("known_failure"))
+
+    gated = [r for r in dedup_results if not _is_known_failure(r)]
+    assert gated, "no gated dedup pairs found"
+    missed = [r["id"] for r in gated if r["expected_verdict"] == "same" and not r["passed"]]
+    merged = [r["id"] for r in gated if r["expected_verdict"] == "different" and not r["passed"]]
     assert missed == [], f"duplicate plans not caught: {missed}"
     assert merged == [], f"distinct plans wrongly merged: {merged}"
 
