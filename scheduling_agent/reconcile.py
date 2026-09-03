@@ -169,11 +169,11 @@ def _disposition(
     - "new_occurrence": same recurring activity, but a genuinely distinct
       future instance — never merged into the matched record; create.
     """
-    if matched.get("source") == "calendar" or "canonical_id" not in matched:
-        return Decision("skip_duplicate", matched=matched, source=source, reasoning=reasoning)
-
     if relationship == "new_occurrence":
         return Decision("create", reasoning=reasoning)
+
+    if matched.get("source") == "calendar" or "canonical_id" not in matched:
+        return Decision("skip_duplicate", matched=matched, source=source, reasoning=reasoning)
 
     # A clearly weaker detection never overwrites a stronger record.
     stored_confidence = matched.get("confidence") or 0

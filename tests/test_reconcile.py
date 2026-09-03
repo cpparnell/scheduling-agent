@@ -115,6 +115,16 @@ def test_disposition_calendar_only_match_never_updates():
     assert decision.action == "skip_duplicate"
 
 
+def test_disposition_calendar_only_match_new_occurrence_creates():
+    # new_occurrence must be honored ahead of the calendar-only/unowned skip —
+    # a distinct future occurrence is never suppressed just because the
+    # matched record happens to be a calendar-only row.
+    matched = {"title": "Dinner with Sam", "date": "2099-01-15", "time_start": "20:00",
+               "location": None, "calendar_uid": "UID-9", "source": "calendar"}
+    decision = reconcile._disposition(_event(), matched, "llm", None, relationship="new_occurrence")
+    assert decision.action == "create"
+
+
 def test_disposition_lower_confidence_detection_never_updates():
     decision = reconcile._disposition(
         _event(confidence=0.5, time_start="20:00"), _record(confidence=0.9), "llm", None
@@ -400,6 +410,25 @@ def test_calendar_only_candidate_reaches_llm(monkeypatch, fake_dedup_anthropic):
 
     assert decision.action == "skip_duplicate"
     assert decision.matched["calendar_uid"] == "UID-7"
+
+
+def test_calendar_only_candidate_new_occurrence_still_creates(monkeypatch, fake_dedup_anthropic):
+    # A new_occurrence verdict must be honored regardless of the matched
+    # record's source — a calendar-only/unowned match is not a reason to
+    # suppress a genuinely distinct future occurrence (and skip_duplicate
+    # here would also permanently suppress it in state, since source="llm").
+    fake_dedup_anthropic(
+        [{"is_duplicate": True, "duplicate_of": 0, "relationship": "new_occurrence", "reasoning": "next cycle"}]
+    )
+    monkeypatch.setattr(
+        calendar, "get_events_near",
+        lambda *a, **k: [{"title": "Sam bday celebration", "date": "2099-01-15", "time_start": "19:00",
+                          "location": None, "calendar_uid": "UID-7", "source": "calendar"}],
+    )
+
+    decision = reconcile.reconcile(_event(chat_id=1), _cfg(calendar_query_enabled=True))
+
+    assert decision.action == "create"
 
 
 # --- far-date candidate layer ---------------------------------------------------
