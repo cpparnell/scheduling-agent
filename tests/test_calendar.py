@@ -171,6 +171,29 @@ def test_update_event_timeout_returns_false(capture_osascript):
     assert calendar.update_event("UID-42", "Dinner", "2026-06-13", "20:00", 60, None) is False
 
 
+# --- delete_event --------------------------------------------------------------
+
+
+def test_delete_event_targets_uid_and_calendar(capture_osascript):
+    ok = calendar.delete_event("UID-42", calendar_name="Home")
+    assert ok is True
+    script = capture_osascript["script"]
+    assert 'first calendar whose name is "Home"' in script
+    assert 'every event of targetCalendar whose uid is "UID-42"' in script
+    assert "delete theEvent" in script
+
+
+def test_delete_event_failure_returns_false(capture_osascript):
+    capture_osascript["returncode"] = 1
+    capture_osascript["stderr"] = "no such calendar"
+    assert calendar.delete_event("UID-42") is False
+
+
+def test_delete_event_timeout_returns_false(capture_osascript):
+    capture_osascript["raise"] = subprocess.TimeoutExpired(cmd="osascript", timeout=15)
+    assert calendar.delete_event("UID-42") is False
+
+
 # --- get_events_near ----------------------------------------------------------
 
 FS = calendar._FIELD_SEP

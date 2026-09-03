@@ -24,6 +24,9 @@ DEFAULTS = {
     # for detections the deterministic layers couldn't match.
     "dedup_enabled": True,
     "dedup_model": "claude-haiku-4-5",
+    # Hard same-slot cutoff for the deterministic exact/fuzzy layers — no LLM
+    # call backs these up, so they stay narrow. dedup_candidate_day_window
+    # (below) is the wider window the LLM adjudicator sees.
     "dedup_day_window": 1,
     # If the adjudicator call itself fails, create the event rather than risk
     # silently dropping a real plan (a visible duplicate is easy to fix).
@@ -39,6 +42,21 @@ DEFAULTS = {
     # adjudicator (catches a bare weekday mis-resolved to a near-term date).
     # Looser than fuzzy_title_threshold because the LLM makes the final call.
     "far_title_similarity": 0.4,
+    # Same screening bar, but for records in a DIFFERENT chat than the new
+    # detection — title overlap alone is a weaker signal across conversations,
+    # so this is stricter than the same-chat bar (catches e.g. a plan set in a
+    # group chat then re-mentioned or rescheduled in a 1:1).
+    "far_title_similarity_cross_chat": 0.5,
+    # How many days out reconciliation looks for adjudication candidates
+    # (state + calendar query). Wider than dedup_day_window, which stays the
+    # deterministic fuzzy layer's hard same-slot cutoff — only the LLM
+    # adjudicator sees the wider window, so a week-out reschedule reaches it
+    # instead of guaranteed-duplicating.
+    "dedup_candidate_day_window": 7,
+    # Ceiling on how far a reschedule can move a stored event's date in one
+    # reconciliation step. Bounds the blast radius of a wrong adjudicator call
+    # moving a real plan to an implausible date.
+    "reschedule_max_days": 30,
     # Drop detected events whose quoted evidence isn't found verbatim in the
     # thread (hallucination guard). Disable to log-and-keep instead.
     "evidence_gate_enabled": True,
@@ -54,6 +72,17 @@ DEFAULTS = {
     # replays the same context window). Disable to fall back to the
     # unmarked prompt.
     "context_marking_enabled": True,
+    # Fire a dedicated second-pass haiku call to re-check a bare-weekday date
+    # that had no explicit-date anchor near it, when the thread has other
+    # date-like content that could plausibly override the "next occurrence"
+    # default (F6c — attacks wrong-WEEK errors _reconcile_weekday's +/-3-day
+    # shift can't repair). Disable to skip the extra call entirely.
+    "date_resolver_enabled": True,
+    # Whether a detected cancellation of a previously-created event is allowed
+    # to delete it from the calendar. Only ever touches events the agent
+    # itself created (calendar_uid recorded in state) — disable to log the
+    # detection without ever calling calendar.delete_event.
+    "cancellation_enabled": True,
     # Backstop poll interval: process_new_messages() also runs on this timer,
     # independent of the filesystem watcher, in case a chat.db change event is
     # ever missed. Set to 0 to disable.

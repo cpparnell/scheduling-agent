@@ -5,7 +5,7 @@ import pytest
 
 from evals import loader
 from evals.run import run, run_pipeline, score_dedup_pairs, summarize
-from scheduling_agent import detector
+from scheduling_agent import config, detector
 
 pytestmark = pytest.mark.eval
 
@@ -60,7 +60,10 @@ def test_dedup_adjudicator_verdicts(golden_cases, detector_results):
     side are aspirational (tracking a fix not yet implemented) and are
     reported separately rather than gated."""
     results_by_id = {r["id"]: r for r in detector_results}
-    dedup_results = score_dedup_pairs(golden_cases, results_by_id, model=DEDUP_MODEL)
+    dedup_results = score_dedup_pairs(
+        golden_cases, results_by_id, model=DEDUP_MODEL,
+        day_window=config.DEFAULTS["dedup_candidate_day_window"],
+    )
     cases_by_id = {c["id"]: c for c in golden_cases}
 
     def _is_known_failure(dedup_result: dict) -> bool:

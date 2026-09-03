@@ -6,7 +6,8 @@ from datetime import date as _date, datetime, timedelta
 
 import anthropic
 
-from scheduling_agent.datepatterns import EXPLICIT_DATE_RE
+from scheduling_agent.datepatterns import ANCHOR_PATTERN, EXPLICIT_DATE_RE
+from scheduling_agent import usage_tracker
 
 logger = logging.getLogger(__name__)
 
@@ -86,9 +87,18 @@ while "Me" never proposed it and never sent anything about it — that is still
 unanswered FOR THE USER, never confirmed or tentative. (This does NOT apply when "Me"
 is the one who proposed the plan — see tentative above for that case.)
 
+**cancelled**: A plan that was previously agreed to (confirmed or tentative — the user
+had accepted it, in this thread) is explicitly called off in a NEW message: "actually
+we have to cancel", "can't do Friday anymore, sorry", "trip's off". Emit it with
+`status: "cancelled"`, using the ORIGINAL date/time/title of the plan being called off
+(not a guessed replacement), and set `evidence` to the message that cancels it. This is
+different from a plain decline below — cancelled means a plan the user had already
+agreed to is now being undone, not an invitation being turned down for the first time.
+
 Do NOT emit a plan when:
 - No specific invitation exists ("we should hang out sometime")
-- The user explicitly declined or the plan was cancelled
+- The user declines an invitation they had never previously agreed to — there is no
+  existing plan to cancel, so this is simply not a plan at all, not a "cancelled" one
 - No reasonably specific date is mentioned
 - The thread only references a past event
 - The proposal was superseded by a reschedule request ("can we push it?", "let's do
@@ -203,8 +213,8 @@ EVENT_ITEM_SCHEMA = {
         },
         "status": {
             "type": "string",
-            "enum": ["confirmed", "tentative", "unanswered"],
-            "description": "confirmed if the user is attending with clear agreement; tentative if the user explicitly hedged ('maybe', 'I'll try'); unanswered if the user has not responded to the invitation"
+            "enum": ["confirmed", "tentative", "unanswered", "cancelled"],
+            "description": "confirmed if the user is attending with clear agreement; tentative if the user explicitly hedged ('maybe', 'I'll try'); unanswered if the user has not responded to the invitation; cancelled if a previously-agreed plan is explicitly called off in a new message"
         },
         "user_is_participant": {
             "type": "boolean",
@@ -542,6 +552,103 @@ def _reconcile_weekday(event: dict, chat_id) -> None:
             pass
 
 
+_DATE_RESOLVER_MODEL_MAX_TOKENS = 200
+
+_DATE_RESOLVER_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "chosen_date": {
+            "type": "string",
+            "description": "ISO 8601 date (YYYY-MM-DD) that best represents when this plan happens",
+        },
+        "confidence": {
+            "type": "number",
+            "description": "0.0-1.0 confidence that chosen_date is correct",
+        },
+    },
+    "required": ["chosen_date", "confidence"],
+}
+
+_DATE_RESOLVER_SYSTEM_PROMPT = """A plan's date was tentatively resolved to {default_date} by defaulting a bare
+weekday ("{weekday}") to its next occurrence after the message was sent, because no anchor was
+found near that mention. Re-examine the ENTIRE thread below for any OTHER message that anchors
+this same plan to a different date — an explicit date, a named month, a holiday, "week of the
+Nth" — that would place it on a {weekday} other than {default_date}.
+
+Only override the default when a specific, clearly-related anchor supports a different date.
+If you find one, return that date with confidence >= 0.8. If nothing in the thread clearly
+overrides the default, return {default_date} with lower confidence rather than guessing.
+
+Respond with JSON only."""
+
+
+def _second_pass_date_resolution(
+    event: dict, thread: dict, model: str, today: datetime | None = None
+) -> None:
+    """F6c: a bare weekday with no explicit-date anchor near it defaults to
+    "next occurrence" — correct for most cases, but wrong when the real
+    anchor sits elsewhere in the thread and the single detection call missed
+    it (C5: `_reconcile_weekday`'s deterministic +/-3-day shift can't repair a
+    wrong-WEEK error). Fires a dedicated haiku call, but only when there's
+    something in the thread that could plausibly change the answer — a
+    thread with no date-like content anywhere else can't have a competing
+    anchor, so skip the extra cost."""
+    date_str = event.get("date")
+    if not date_str:
+        return
+
+    evidence_text = event.get("evidence") or ""
+    date_evidence_text = event.get("date_evidence") or ""
+    if EXPLICIT_DATE_RE.search(evidence_text) or EXPLICIT_DATE_RE.search(date_evidence_text):
+        return  # already anchored to an explicit date; nothing to resolve
+
+    named = _named_weekdays(evidence_text) | _named_weekdays(date_evidence_text)
+    if len(named) != 1:
+        return
+    # _WEEKDAY_INDEX lists each day's full name before its abbreviations, so
+    # the first match for a given index is always the full name.
+    weekday_name = next(k for k, v in _WEEKDAY_INDEX.items() if v == next(iter(named)))
+
+    if not any(ANCHOR_PATTERN.search(m.get("text", "")) for m in thread.get("messages", [])):
+        return  # nothing thread-wide could plausibly anchor a different date
+
+    system_prompt = _DATE_RESOLVER_SYSTEM_PROMPT.format(weekday=weekday_name.capitalize(), default_date=date_str)
+    formatted = _format_thread(thread, today=today, context_marking_enabled=False)
+
+    try:
+        response = _get_client().messages.create(
+            model=model,
+            max_tokens=_DATE_RESOLVER_MODEL_MAX_TOKENS,
+            system=system_prompt,
+            messages=[{"role": "user", "content": f"Thread:\n\n{formatted}"}],
+            output_config={"format": {"type": "json_schema", "schema": _DATE_RESOLVER_SCHEMA}},
+        )
+        usage_tracker.record(model, getattr(response, "usage", None))
+        text = next((b.text for b in response.content if b.type == "text"), None)
+        if not text:
+            return
+        result = json.loads(text)
+    except Exception as e:
+        logger.warning("Second-pass date resolution failed for %r: %s", event.get("title"), e)
+        return
+
+    chosen = result.get("chosen_date")
+    confidence = result.get("confidence") or 0
+    if not chosen or chosen == date_str or confidence < 0.8:
+        return
+    try:
+        datetime.strptime(chosen, "%Y-%m-%d")
+    except (ValueError, TypeError):
+        return
+
+    logger.info(
+        "  -> Second-pass date resolver overriding %s -> %s for %r (confidence %.2f)",
+        date_str, chosen, event.get("title"), confidence,
+    )
+    event["date"] = chosen
+
+
 def _new_messages(thread: dict) -> list[dict]:
     """The thread's messages that aren't already-processed context — i.e. the
     ones from THIS poll. When the thread carries no context-marking info at
@@ -600,6 +707,7 @@ def detect_plans(
     evidence_gate: bool = True,
     today: datetime | None = None,
     context_marking_enabled: bool = True,
+    date_resolver_enabled: bool = True,
 ) -> tuple[list[dict], set]:
     """
     Analyze a list of conversation threads for plans.
@@ -623,6 +731,11 @@ def detect_plans(
     trace is old context replayed by reader._prepend_context every poll. A
     thread with no is_context-tagged messages (any single-poll case) is
     unaffected either way.
+
+    `date_resolver_enabled` (mirrors config.DEFAULTS) runs a second-pass
+    disambiguation call (see `_second_pass_date_resolution`) when a bare
+    weekday had no explicit-date anchor near it and the thread contains
+    other date-like content that could plausibly override the default.
     """
     results = []
     failed_chat_ids = set()
@@ -653,6 +766,7 @@ def detect_plans(
                 }],
                 output_config={"format": {"type": "json_schema", "schema": RESPONSE_SCHEMA}}
             )
+            usage_tracker.record(model, getattr(response, "usage", None))
 
             text = next(
                 (b.text for b in response.content if b.type == "text"),
@@ -705,6 +819,8 @@ def detect_plans(
                         continue
 
                 _reconcile_weekday(event, thread["chat_id"])
+                if date_resolver_enabled:
+                    _second_pass_date_resolution(event, thread, model=model, today=today)
                 _demote_if_user_silent(event, thread)
 
                 logger.info(

@@ -7,6 +7,8 @@ import json
 
 import anthropic
 
+from scheduling_agent import usage_tracker
+
 JUDGE_MODEL = "claude-opus-4-8"
 
 _client = None
@@ -48,6 +50,7 @@ def score_title(thread: dict, title: str, model: str = JUDGE_MODEL) -> int | Non
             messages=[{"role": "user", "content": prompt}],
             output_config={"format": {"type": "json_schema", "schema": _SCHEMA}},
         )
+        usage_tracker.record(model, getattr(resp, "usage", None))
         text = next((b.text for b in resp.content if b.type == "text"), None)
         return json.loads(text)["score"] if text else None
     except (json.JSONDecodeError, KeyError, anthropic.APIError):

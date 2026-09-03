@@ -43,6 +43,12 @@ class _TextBlock:
         self.text = text
 
 
+_FAKE_USAGE = SimpleNamespace(
+    input_tokens=0, output_tokens=0,
+    cache_creation_input_tokens=0, cache_read_input_tokens=0,
+)
+
+
 class _FakeMessages:
     def __init__(self, payloads):
         self._payloads = list(payloads)
@@ -56,7 +62,7 @@ class _FakeMessages:
         if isinstance(payload, Exception):
             raise payload
         text = payload if isinstance(payload, str) else json.dumps(payload)
-        return SimpleNamespace(content=[_TextBlock(text)])
+        return SimpleNamespace(content=[_TextBlock(text)], usage=_FAKE_USAGE)
 
 
 class FakeClient:

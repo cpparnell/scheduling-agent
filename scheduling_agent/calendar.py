@@ -185,6 +185,40 @@ end tell
         return False
 
 
+def delete_event(uid: str, calendar_name: str = "Calendar") -> bool:
+    """
+    Delete an existing Apple Calendar event by UID. Returns True on success
+    (including when the event no longer exists — the end state matches
+    intent), False on any other failure.
+    """
+    try:
+        safe_calendar = _escape_as_string(calendar_name)
+        safe_uid = _escape_as_string(uid)
+
+        script = f"""
+tell application "Calendar"
+    set targetCalendar to first calendar whose name is "{safe_calendar}"
+    set matched to (every event of targetCalendar whose uid is "{safe_uid}")
+    repeat with theEvent in matched
+        delete theEvent
+    end repeat
+end tell
+"""
+
+        if _run_osascript(script) is None:
+            return False
+
+        logger.info("Deleted calendar event %s", uid)
+        return True
+
+    except subprocess.TimeoutExpired:
+        logger.error("Calendar deletion timed out for uid: %s", uid)
+        return False
+    except Exception as e:
+        logger.error("Failed to delete calendar event %s: %s", uid, e)
+        return False
+
+
 # Field/row separators for the get_events_near AppleScript output. ASCII unit
 # and record separators can't plausibly appear in event titles or locations.
 _FIELD_SEP = "\x1f"

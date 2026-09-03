@@ -20,7 +20,7 @@ chat.db changes
   → reconcile.py (matches the detection against the canonical event store — and optionally
                   the live calendar — before anything is written: exact hash → deterministic
                   fuzzy match → LLM adjudicator)
-  → calendar.py  (creates the event, or updates the existing one on a reschedule/upgrade)
+  → calendar.py  (creates, updates, or deletes the calendar event)
   → state.py     (write-ahead journal + canonical event record + checkpoint + observations)
 ```
 
@@ -32,17 +32,50 @@ a sibling's wedding, a group plan the user declined — are logged and skipped, 
 means the user was invited and *explicitly hedged* ("maybe", "I'll try") — it is a
 classification, not a lower confidence tier, and is judged against the same confidence bar.
 An invitation the user hasn't answered at all is `unanswered` and never creates an event;
-when the user later replies, the plan is re-detected with its new status.
+when the user later replies, the plan is re-detected with its new status. `cancelled` means a
+plan the user had *already agreed to* is explicitly called off in a new message — this is
+different from a plain decline, which never emits anything at all (there is no existing plan
+to cancel).
+
+**Cancellation.** A `cancelled` detection never creates or updates through the normal
+reconcile path — it reconciles to find the matching record, and only when that record is
+one the agent itself created (has a `calendar_uid` in state) does it delete the calendar
+event and mark the record cancelled; a match against a calendar-only or unowned event, or no
+match at all, is a no-op. Gated by `cancellation_enabled` (default on). There is no "revival"
+path in this version: a fresh confirmation of a cancelled plan on the same date won't reopen
+it (the record's hash is left in place so replayed context can't re-create it either) — a
+genuinely new date for the same plan arrives as a `reschedule`/`new_occurrence` instead (see
+below).
 
 **Reconciliation instead of create-by-default.** Every detection is matched against the
 canonical event store (`state.json`) before any calendar write: an exact hash/title-window
 check, then a deterministic fuzzy match (normalized-title overlap + compatible date/time,
 across chats), then an LLM adjudicator for the genuinely ambiguous cases — biased toward
 "same" when uncertain, because a wrong merge just updates the existing event while a missed
-duplicate spams the calendar. With `calendar_query_enabled`, events already on the target
-calendar (created manually, or before a state reset) join the candidate set. A match with
-material new information — a reschedule, a newly stated location, tentative → confirmed —
-**updates** the existing calendar event; anything else is skipped as a duplicate.
+duplicate spams the calendar. The exact and fuzzy layers stay narrow (`dedup_day_window`,
+1 day by default — no adjudicator backs them up, so they can't afford to be wrong); the
+adjudicator sees a much wider window (`dedup_candidate_day_window`, 7 days) so a
+week-out reschedule reaches it instead of guaranteed-duplicating. With
+`calendar_query_enabled`, events already on the target calendar (created manually, or
+before a state reset) join the candidate set. The dedup hash and title-window key are both
+chat + date + a normalized, order-insensitive token set of the title — "dinner with Sam" and
+"Sam dinner" collide on purpose, and neither key factors in `time_start` any more, so a
+time-confidence flap (7pm one poll, all-day the next) can't fork the same plan into two
+records. A match with material new information — a newly stated location, tentative →
+confirmed — **updates** the existing calendar event; anything else is skipped as a duplicate.
+
+**Reschedules vs. new occurrences.** A matched detection far from its record's stored date
+used to always be treated as a duplicate mention (correct for a mis-dated re-mention, wrong
+for an actual reschedule or a recurring plan's next occurrence). The LLM adjudicator now
+also classifies *how* a matched plan relates to the new detection: `duplicate` (same
+occurrence, stored date stands — a far "duplicate" verdict never overwrites a good date with
+a mis-resolved one), `reschedule` (the group explicitly moved it — the record's date is
+updated, capped at `reschedule_max_days`, and requires the new detection to be `confirmed`
+for any move bigger than a day), or `new_occurrence` (a recurring plan's genuinely distinct
+next instance — never merged, always creates). The same far-date-layer scan that used to be
+same-chat-only now also considers a different chat's records, at a stricter title-similarity
+bar (`far_title_similarity_cross_chat`) than the same-chat one, so a plan set in a group chat
+and rescheduled in a 1:1 is still found.
 
 **New-vs-context marking.** Every poll replays the last 30 messages per chat (plus older
 date anchors) so the model can see plans that span several messages — but that means a
@@ -72,10 +105,20 @@ the evidence already quotes an explicit date (an incidental weekday mentioned al
 real date shouldn't override it) or names "next `<weekday>`" (excluded the same way "last
 `<weekday>`" already was). Message timestamps carry a year and the local timezone, so a
 5-month-out anchor doesn't get silently mis-resolved across a year boundary. Reconciliation
-also has a far-date layer that catches a same-chat detection whose title matches an event
-already recorded far away, sending it to the LLM adjudicator as a probable mis-dated
-re-mention instead of creating a near-term duplicate. Relatedly, a weekday named on the same
+also has a far-date layer that catches a detection whose title matches an event already
+recorded far away (same chat or a different one — see "Reschedules vs. new occurrences"
+below), sending it to the LLM adjudicator as a probable mis-dated re-mention instead of
+creating a near-term duplicate. Relatedly, a weekday named on the same
 day it's said ("this Thursday" sent on a Thursday) resolves to that day, not next week.
+
+`_reconcile_weekday`'s deterministic shift is capped at 3 days, so it can't repair a
+wrong-*week* error — a bare weekday with no explicit-date anchor near it still defaults to
+"next occurrence after the message was sent," which is wrong when the real anchor sits
+elsewhere in the thread and the single detection call missed it. A second-pass resolver call
+(`date_resolver_enabled`, on by default) catches this: it fires only when the date has no
+explicit-date anchor nearby *and* the thread contains some other date-like content that could
+plausibly change the answer (skipping the extra call otherwise), re-examines the whole thread
+for a competing anchor, and overrides the default only at confidence ≥ 0.8.
 
 **Verbatim evidence matching.** The hallucination guard requires `evidence`/`date_evidence`
 to appear in the thread — empty or missing evidence fails the gate outright rather than
@@ -212,15 +255,20 @@ The config file lives at `~/.scheduling-agent/config.json` and is created with d
 | `time_confidence_threshold` | `0.9` | Minimum confidence in the extracted clock time to keep it; below this the event is created all-day instead |
 | `dedup_enabled` | `true` | Whether the LLM adjudicator runs as reconciliation's last layer |
 | `dedup_model` | `"claude-haiku-4-5"` | Model used for dedup adjudication |
-| `dedup_day_window` | `1` | How many days on either side of a new plan's date count as "nearby" for reconciliation candidates |
+| `dedup_day_window` | `1` | Hard same-slot cutoff for the deterministic exact/fuzzy layers — no LLM call backs them up, so they stay narrow |
+| `dedup_candidate_day_window` | `7` | How many days on either side of a new plan's date the LLM adjudicator's candidate window covers (wider than `dedup_day_window` since the adjudicator can catch a wrong call) |
+| `reschedule_max_days` | `30` | Ceiling on how far a `reschedule` adjudicator verdict may move a stored event's date in one step |
 | `dedup_fail_open` | `true` | If the adjudicator call itself fails, create the event rather than risk dropping a real plan |
 | `calendar_query_enabled` | `true` | Read events back from the target calendar as reconciliation candidates (catches manually created events and lost state) |
 | `fuzzy_title_threshold` | `0.6` | Minimum normalized-title token overlap for the deterministic fuzzy layer to match without the LLM |
 | `far_title_similarity` | `0.4` | Screening bar for the far-date layer: same-chat records with at least this much title overlap but a distant date go to the LLM adjudicator (catches a bare weekday mis-resolved to a near-term date) |
+| `far_title_similarity_cross_chat` | `0.5` | Same screening bar for a record in a *different* chat — stricter, since title overlap alone is a weaker signal across conversations |
 | `evidence_gate_enabled` | `true` | Drop detected plans whose quoted evidence (or date evidence) isn't found verbatim in the thread (hallucination guard) |
 | `reconcile_update_enabled` | `true` | Let reconciliation matches update the existing calendar event (reschedules, added locations); off treats them as skips |
+| `cancellation_enabled` | `true` | Let a detected cancellation of a previously-created event delete it from the calendar; off logs the detection without deleting |
 | `max_watermark_retries` | `3` | How many consecutive polls to retry a thread whose detection failed before giving up and advancing past it |
 | `context_marking_enabled` | `true` | Mark replayed context vs. newly-arrived messages in the prompt and instruct the model not to re-emit a plan whose only trace is old context — disable to fall back to the unmarked prompt |
+| `date_resolver_enabled` | `true` | Run a second-pass haiku call to re-check a bare-weekday date with no nearby explicit-date anchor, when the thread has other date-like content that could override the "next occurrence" default |
 | `poll_interval_minutes` | `15` | Backstop poll interval, independent of the filesystem watcher, in case a `chat.db` change event is ever missed. `0` disables it |
 
 Upgrading from v0.4: `tentative_confidence_threshold` was removed (a stale key in an existing
@@ -231,7 +279,9 @@ State (the last-processed message timestamp, dedup hashes, descriptive records o
 events — including the calendar event UID — used for dedup adjudication, and a lightweight
 map of recently-skipped detections used by the anti-flap guard) is stored in
 `~/.scheduling-agent/state.json`, written atomically and migrated automatically across schema
-versions (currently v6). Quoted message `evidence` is truncated to `state.EVIDENCE_MAX_CHARS`
+versions (currently v7 — dedup hashes and title keys are chat + date + a normalized,
+order-insensitive token set of the title, no longer time_start). Quoted message `evidence` is
+truncated to `state.EVIDENCE_MAX_CHARS`
 (240 characters) before being written, and log lines that would otherwise include a verbatim
 quote are truncated the same way — enough context for the dedup adjudicator to keep working,
 without keeping a full plaintext transcript on disk indefinitely. Run `scheduling-agent --purge`
@@ -283,7 +333,10 @@ message) that must not re-create an already-existing event. Some scenarios are
 marked `known_failure` in `evals/golden.jsonl` — encoding target behavior for
 a fix not yet implemented, tracked separately from the pass/fail gate so the
 suite stays green while the work is in progress. This calls the real model, so
-it needs `ANTHROPIC_API_KEY` and costs roughly $0.10 per run.
+it needs `ANTHROPIC_API_KEY` and costs real money — every call (detector,
+dedup adjudicator, and `--judge`) is metered by `scheduling_agent/usage_tracker.py`
+and the run's total/average cost is printed at the end and written to
+`report.json` under `"cost"` (see below).
 
 `pytest -m eval` enforces hard gates: zero false positives on hard negatives,
 zero bystander leaks, all known-duplicate pairs caught with no controls merged,
@@ -316,6 +369,34 @@ printed to the console. The golden cases (`evals/golden.jsonl`) use date
 placeholders that are resolved relative to the current day at runtime, so they
 never go stale.
 
+**Cost tracking.** Every API call made during a run (detector, dedup
+adjudicator, and the optional `--judge` title scorer) is metered by
+`scheduling_agent/usage_tracker.py`, which prices tokens per-model against a
+hardcoded rate table (kept in sync with current published pricing). A run's
+console output ends with a `=== Cost ===` block, and `report.json` carries the
+same numbers under `"cost"`:
+
+```json
+"cost": {
+  "total_calls": 179,
+  "total_input_tokens": 132000,
+  "total_output_tokens": 29000,
+  "total_cost_usd": 0.2774,
+  "cost_per_run_usd": 0.2774,
+  "cost_per_eval_usd": 0.0020,
+  "by_model": { "claude-haiku-4-5-20251001": { "calls": 179, "cost_usd": 0.2774 } }
+}
+```
+
+`cost_per_run_usd` is the whole run's total; `cost_per_eval_usd` averages that
+total over the golden cases actually run (post `-k` filtering) — one case can
+still drive several API calls (detection + dedup + pipeline), so this is a
+per-case average, not a per-call one. A model without a known price (e.g. a
+brand-new snapshot not yet added to the rate table) is still counted in
+`total_calls`/token totals but excluded from `total_cost_usd`, and
+`unpriced_calls` flags that the total is a floor rather than exact — add the
+model's price to `_PRICING_PER_MTOK` in `usage_tracker.py` to fix it.
+
 **Log directories** — three separate locations, one per entry point: `logs/stdout/`
 (the live agent, `scheduling-agent`), `logs/evals/` (`python -m evals.run`), and
 `logs/tests/` (`pytest`). The live agent's log file rotates at 10MB (5 backups
@@ -338,7 +419,8 @@ scheduling_agent/
 ├── detector.py        # Claude Haiku plan detection (participation, status, evidence gate)
 ├── reconcile.py       # Matches detections against known events: exact → fuzzy → LLM
 ├── dedup.py           # LLM adjudicator: is a new detection the same plan as an existing event?
-├── calendar.py        # Apple Calendar create/update/query via osascript (timed + all-day)
+├── calendar.py        # Apple Calendar create/update/delete/query via osascript (timed + all-day)
+├── usage_tracker.py   # Per-call token/cost accounting for detector/dedup/judge API calls
 └── watcher.py         # Filesystem watcher with debounce
 scripts/
 ├── setup.sh                    # venv + install + API key + launchd prompt

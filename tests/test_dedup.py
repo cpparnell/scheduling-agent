@@ -97,6 +97,23 @@ def test_adjudicate_happy_path_duplicate(fake_dedup_anthropic):
     assert verdict["duplicate_of"] == 0
 
 
+def test_adjudicate_happy_path_reschedule_relationship(fake_dedup_anthropic):
+    fake_dedup_anthropic(
+        [{"is_duplicate": True, "duplicate_of": 0, "relationship": "reschedule", "reasoning": "moved to Sat"}]
+    )
+
+    verdict = dedup.adjudicate(_new_event(), [_record()], model="claude-haiku-4-5")
+
+    assert verdict["relationship"] == "reschedule"
+
+
+def test_adjudicator_schema_requires_relationship_field():
+    assert "relationship" in dedup.ADJUDICATOR_SCHEMA["required"]
+    assert set(dedup.ADJUDICATOR_SCHEMA["properties"]["relationship"]["enum"]) == {
+        "duplicate", "reschedule", "new_occurrence",
+    }
+
+
 def test_adjudicate_happy_path_not_duplicate(fake_dedup_anthropic):
     fake_dedup_anthropic([{"is_duplicate": False, "duplicate_of": None, "reasoning": "different activity"}])
 

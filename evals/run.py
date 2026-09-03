@@ -24,7 +24,7 @@ from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
 from evals import loader
-from scheduling_agent import dedup, detector
+from scheduling_agent import config, dedup, detector, usage_tracker
 
 LOGS_DIR = Path(__file__).parent.parent / "logs"
 REPORTS_DIR = LOGS_DIR / "evals"
@@ -187,8 +187,19 @@ def score_case(case: dict, model: str, today: date | None = None) -> dict:
         got = events[0] if events else None
     else:
         got = events[0] if events else None
-        predicted_has_event = got is not None
         expected_has_event = expected["has_event"]
+
+        if expected_has_event:
+            predicted_has_event = got is not None
+        else:
+            # For a hard_negative, only an event that would actually reach the
+            # calendar counts as a false positive. A "cancelled" classification
+            # (F4) recognizing that a previously-agreed plan was called off is
+            # the correct detection for that case, not junk — it only ever
+            # deletes an existing agent-owned record, never creates one.
+            reaching = [e for e in events if _would_reach_calendar(e)]
+            predicted_has_event = bool(reaching)
+            got = reaching[0] if reaching else got
 
         if predicted_has_event != expected_has_event:
             failures.append(
@@ -375,6 +386,7 @@ def score_pipeline_case(
                 [thread], model=model, evidence_gate=cfg["evidence_gate_enabled"],
                 today=datetime.combine(today, time(12, 0)),
                 context_marking_enabled=cfg["context_marking_enabled"],
+                date_resolver_enabled=cfg["date_resolver_enabled"],
             )
             for event in events:
                 outcomes.append(main.process_event(event, cfg))
@@ -494,6 +506,39 @@ def summarize(
     return summary
 
 
+def cost_summary(n_cases: int) -> dict:
+    """Snapshot of `usage_tracker`'s accumulated cost for this run (call after
+    all phases finish, with the tracker reset at the start of the run so it
+    covers only this invocation). `cost_per_eval_usd` averages the run's total
+    cost over `n_cases` — the golden cases actually run (post -k filtering) —
+    not the number of raw API calls, since one case can drive detector +
+    dedup + pipeline calls."""
+    summary = usage_tracker.summary()
+    summary["cost_per_run_usd"] = summary["total_cost_usd"]
+    summary["cost_per_eval_usd"] = (
+        round(summary["total_cost_usd"] / n_cases, 6) if n_cases else None
+    )
+    return summary
+
+
+def print_cost_summary(cost: dict) -> None:
+    print(f"\n=== Cost ===")
+    print(f"  total cost (this run):        ${cost['cost_per_run_usd']:.4f}")
+    if cost["cost_per_eval_usd"] is not None:
+        print(f"  average cost per eval case:   ${cost['cost_per_eval_usd']:.4f}")
+    print(
+        f"  total calls: {cost['total_calls']}  "
+        f"(input tokens: {cost['total_input_tokens']}, output tokens: {cost['total_output_tokens']})"
+    )
+    if cost["unpriced_calls"]:
+        print(
+            f"  WARNING: {cost['unpriced_calls']} call(s) used a model with no known "
+            "pricing — total cost is a floor, not exact"
+        )
+    for model, m in cost["by_model"].items():
+        print(f"    {model}: {m['calls']} call(s), ${m['cost_usd']:.4f}")
+
+
 def print_report(
     results: list[dict], summary: dict, model: str,
     dedup_results: list[dict] | None = None,
@@ -548,6 +593,7 @@ def write_report(
     results: list[dict], summary: dict, model: str, run_dir: Path,
     dedup_results: list[dict] | None = None,
     pipeline_results: list[dict] | None = None,
+    cost: dict | None = None,
 ) -> Path:
     run_dir.mkdir(parents=True, exist_ok=True)
     path = run_dir / "report.json"
@@ -556,6 +602,8 @@ def write_report(
         report["dedup_results"] = dedup_results
     if pipeline_results is not None:
         report["pipeline_results"] = pipeline_results
+    if cost is not None:
+        report["cost"] = cost
     path.write_text(json.dumps(report, indent=2))
     return path
 
@@ -589,9 +637,9 @@ def main() -> None:
     ap.add_argument("--model", default=detector.MODEL)
     ap.add_argument("--dedup-model", default="claude-haiku-4-5")
     ap.add_argument(
-        "--dedup-day-window", type=int, default=1,
-        help="candidate window (days) for dedup-pair scoring; widen to exercise "
-             "far-apart pairs once production's dedup_day_window is widened",
+        "--dedup-day-window", type=int, default=config.DEFAULTS["dedup_candidate_day_window"],
+        help="candidate window (days) for dedup-pair scoring; matches production's "
+             "dedup_candidate_day_window by default",
     )
     ap.add_argument("--judge", action="store_true", help="add LLM title-quality scoring")
     ap.add_argument("-k", "--filter", default=None, help="only run cases whose id contains this")
@@ -617,6 +665,7 @@ def main() -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     stdout_path = run_dir / "stdout.log"
 
+    usage_tracker.reset()  # so the run's cost totals don't include prior calls
     with stdout_path.open("w") as log_file, _Tee(log_file):
         print(f"  eval clock pinned to: {eval_today.isoformat()} ({eval_today.strftime('%A')})")
         results = run(cases, model=args.model, judge=args.judge, today=eval_today)
@@ -630,7 +679,11 @@ def main() -> None:
         summary = summarize(results, dedup_results, pipeline_results)
         summary["eval_today"] = eval_today.isoformat()
         print_report(results, summary, args.model, dedup_results, pipeline_results)
-        path = write_report(results, summary, args.model, run_dir, dedup_results, pipeline_results)
+        cost = cost_summary(len(cases))
+        print_cost_summary(cost)
+        path = write_report(
+            results, summary, args.model, run_dir, dedup_results, pipeline_results, cost
+        )
         print(f"\n  report: {path}")
         print(f"  stdout log: {stdout_path}")
 

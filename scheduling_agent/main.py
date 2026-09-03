@@ -112,6 +112,34 @@ def process_event(event: dict, cfg: dict) -> str:
         state.record_observation(chat_id, date, time_start, title, "low-confidence")
         return "skipped:low-confidence"
 
+    # Cancellation (F4): a previously-established plan explicitly called off.
+    # Never creates or updates through the normal reconcile action — it only
+    # ever deletes an event the agent itself created (a calendar-only or
+    # unowned match is left alone), and a detection with no match at all is a
+    # no-op rather than a signal to create anything.
+    if status == "cancelled":
+        if not cfg.get("cancellation_enabled", True):
+            logger.info("Cancellation detected but cancellation_enabled=False: %s on %s", title, date)
+            return "skipped:cancellation-disabled"
+        matched = reconcile.reconcile(event, cfg).matched
+        if matched is None or "canonical_id" not in matched or not matched.get("calendar_uid"):
+            logger.info("Cancellation detected but no agent-owned event matches: %s on %s", title, date)
+            return "skipped:cancel-no-match"
+        jid = state.journal_intent({"canonical_id": matched["canonical_id"]}, op="cancel")
+        ok = calendar.delete_event(matched["calendar_uid"], calendar_name=cfg["target_calendar"])
+        if not ok:
+            logger.error("Failed to delete calendar event: %s", matched.get("title"))
+            state.journal_drop(jid)
+            return "skipped:cancel-failed"
+        state.update_record(
+            matched["canonical_id"], {"status": "cancelled"}, reason=evidence, chat_id=chat_id,
+        )
+        state.journal_commit(jid)
+        logger.info(
+            "Cancelled event %r (uid=%s): %s", matched.get("title"), matched["calendar_uid"], evidence,
+        )
+        return "cancelled"
+
     if time_start is not None and time_confidence < cfg["time_confidence_threshold"]:
         logger.info(
             "Demoting to all-day (time_confidence %.2f < %.2f): %s",
@@ -295,17 +323,19 @@ def process_new_messages(cfg: dict) -> None:
         threads,
         evidence_gate=cfg["evidence_gate_enabled"],
         context_marking_enabled=cfg["context_marking_enabled"],
+        date_resolver_enabled=cfg["date_resolver_enabled"],
     )
 
-    counts = {"created": 0, "updated": 0, "skipped": 0}
+    counts = {"created": 0, "updated": 0, "cancelled": 0, "skipped": 0}
     for event in events:
         result = process_event(event, cfg)
         counts["skipped" if result.startswith("skipped") else result] += 1
 
     logger.info(
-        "Done — %d created, %d updated, %d skipped, %d threads processed",
+        "Done — %d created, %d updated, %d cancelled, %d skipped, %d threads processed",
         counts["created"],
         counts["updated"],
+        counts["cancelled"],
         counts["skipped"],
         len(threads),
     )
