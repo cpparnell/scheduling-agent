@@ -24,7 +24,7 @@ from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
 from evals import loader
-from scheduling_agent import config, dedup, detector
+from scheduling_agent import config, dedup, detector, usage_tracker
 
 LOGS_DIR = Path(__file__).parent.parent / "logs"
 REPORTS_DIR = LOGS_DIR / "evals"
@@ -494,6 +494,39 @@ def summarize(
     return summary
 
 
+def cost_summary(n_cases: int) -> dict:
+    """Snapshot of `usage_tracker`'s accumulated cost for this run (call after
+    all phases finish, with the tracker reset at the start of the run so it
+    covers only this invocation). `cost_per_eval_usd` averages the run's total
+    cost over `n_cases` — the golden cases actually run (post -k filtering) —
+    not the number of raw API calls, since one case can drive detector +
+    dedup + pipeline calls."""
+    summary = usage_tracker.summary()
+    summary["cost_per_run_usd"] = summary["total_cost_usd"]
+    summary["cost_per_eval_usd"] = (
+        round(summary["total_cost_usd"] / n_cases, 6) if n_cases else None
+    )
+    return summary
+
+
+def print_cost_summary(cost: dict) -> None:
+    print(f"\n=== Cost ===")
+    print(f"  total cost (this run):        ${cost['cost_per_run_usd']:.4f}")
+    if cost["cost_per_eval_usd"] is not None:
+        print(f"  average cost per eval case:   ${cost['cost_per_eval_usd']:.4f}")
+    print(
+        f"  total calls: {cost['total_calls']}  "
+        f"(input tokens: {cost['total_input_tokens']}, output tokens: {cost['total_output_tokens']})"
+    )
+    if cost["unpriced_calls"]:
+        print(
+            f"  WARNING: {cost['unpriced_calls']} call(s) used a model with no known "
+            "pricing — total cost is a floor, not exact"
+        )
+    for model, m in cost["by_model"].items():
+        print(f"    {model}: {m['calls']} call(s), ${m['cost_usd']:.4f}")
+
+
 def print_report(
     results: list[dict], summary: dict, model: str,
     dedup_results: list[dict] | None = None,
@@ -548,6 +581,7 @@ def write_report(
     results: list[dict], summary: dict, model: str, run_dir: Path,
     dedup_results: list[dict] | None = None,
     pipeline_results: list[dict] | None = None,
+    cost: dict | None = None,
 ) -> Path:
     run_dir.mkdir(parents=True, exist_ok=True)
     path = run_dir / "report.json"
@@ -556,6 +590,8 @@ def write_report(
         report["dedup_results"] = dedup_results
     if pipeline_results is not None:
         report["pipeline_results"] = pipeline_results
+    if cost is not None:
+        report["cost"] = cost
     path.write_text(json.dumps(report, indent=2))
     return path
 
@@ -617,6 +653,7 @@ def main() -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     stdout_path = run_dir / "stdout.log"
 
+    usage_tracker.reset()  # so the run's cost totals don't include prior calls
     with stdout_path.open("w") as log_file, _Tee(log_file):
         print(f"  eval clock pinned to: {eval_today.isoformat()} ({eval_today.strftime('%A')})")
         results = run(cases, model=args.model, judge=args.judge, today=eval_today)
@@ -630,7 +667,11 @@ def main() -> None:
         summary = summarize(results, dedup_results, pipeline_results)
         summary["eval_today"] = eval_today.isoformat()
         print_report(results, summary, args.model, dedup_results, pipeline_results)
-        path = write_report(results, summary, args.model, run_dir, dedup_results, pipeline_results)
+        cost = cost_summary(len(cases))
+        print_cost_summary(cost)
+        path = write_report(
+            results, summary, args.model, run_dir, dedup_results, pipeline_results, cost
+        )
         print(f"\n  report: {path}")
         print(f"  stdout log: {stdout_path}")
 

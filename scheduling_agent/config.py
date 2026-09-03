@@ -72,6 +72,11 @@ DEFAULTS = {
     # replays the same context window). Disable to fall back to the
     # unmarked prompt.
     "context_marking_enabled": True,
+    # Whether a detected cancellation of a previously-created event is allowed
+    # to delete it from the calendar. Only ever touches events the agent
+    # itself created (calendar_uid recorded in state) — disable to log the
+    # detection without ever calling calendar.delete_event.
+    "cancellation_enabled": True,
     # Backstop poll interval: process_new_messages() also runs on this timer,
     # independent of the filesystem watcher, in case a chat.db change event is
     # ever missed. Set to 0 to disable.

@@ -309,7 +309,10 @@ message) that must not re-create an already-existing event. Some scenarios are
 marked `known_failure` in `evals/golden.jsonl` — encoding target behavior for
 a fix not yet implemented, tracked separately from the pass/fail gate so the
 suite stays green while the work is in progress. This calls the real model, so
-it needs `ANTHROPIC_API_KEY` and costs roughly $0.10 per run.
+it needs `ANTHROPIC_API_KEY` and costs real money — every call (detector,
+dedup adjudicator, and `--judge`) is metered by `scheduling_agent/usage_tracker.py`
+and the run's total/average cost is printed at the end and written to
+`report.json` under `"cost"` (see below).
 
 `pytest -m eval` enforces hard gates: zero false positives on hard negatives,
 zero bystander leaks, all known-duplicate pairs caught with no controls merged,
@@ -341,6 +344,34 @@ diffing across prompt or model changes) and `stdout.log`, mirroring everything
 printed to the console. The golden cases (`evals/golden.jsonl`) use date
 placeholders that are resolved relative to the current day at runtime, so they
 never go stale.
+
+**Cost tracking.** Every API call made during a run (detector, dedup
+adjudicator, and the optional `--judge` title scorer) is metered by
+`scheduling_agent/usage_tracker.py`, which prices tokens per-model against a
+hardcoded rate table (kept in sync with current published pricing). A run's
+console output ends with a `=== Cost ===` block, and `report.json` carries the
+same numbers under `"cost"`:
+
+```json
+"cost": {
+  "total_calls": 179,
+  "total_input_tokens": 132000,
+  "total_output_tokens": 29000,
+  "total_cost_usd": 0.2774,
+  "cost_per_run_usd": 0.2774,
+  "cost_per_eval_usd": 0.0020,
+  "by_model": { "claude-haiku-4-5-20251001": { "calls": 179, "cost_usd": 0.2774 } }
+}
+```
+
+`cost_per_run_usd` is the whole run's total; `cost_per_eval_usd` averages that
+total over the golden cases actually run (post `-k` filtering) — one case can
+still drive several API calls (detection + dedup + pipeline), so this is a
+per-case average, not a per-call one. A model without a known price (e.g. a
+brand-new snapshot not yet added to the rate table) is still counted in
+`total_calls`/token totals but excluded from `total_cost_usd`, and
+`unpriced_calls` flags that the total is a floor rather than exact — add the
+model's price to `_PRICING_PER_MTOK` in `usage_tracker.py` to fix it.
 
 **Log directories** — three separate locations, one per entry point: `logs/stdout/`
 (the live agent, `scheduling-agent`), `logs/evals/` (`python -m evals.run`), and

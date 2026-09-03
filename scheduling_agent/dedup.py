@@ -4,6 +4,8 @@ from datetime import date as date_type
 
 import anthropic
 
+from scheduling_agent import usage_tracker
+
 logger = logging.getLogger(__name__)
 
 _client = None
@@ -151,6 +153,7 @@ def adjudicate(event: dict, candidates: list[dict], model: str) -> dict | None:
             messages=[{"role": "user", "content": prompt}],
             output_config={"format": {"type": "json_schema", "schema": ADJUDICATOR_SCHEMA}},
         )
+        usage_tracker.record(model, getattr(response, "usage", None))
         text = next((b.text for b in response.content if b.type == "text"), None)
         if not text:
             return None

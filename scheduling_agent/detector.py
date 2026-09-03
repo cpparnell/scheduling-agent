@@ -7,6 +7,7 @@ from datetime import date as _date, datetime, timedelta
 import anthropic
 
 from scheduling_agent.datepatterns import EXPLICIT_DATE_RE
+from scheduling_agent import usage_tracker
 
 logger = logging.getLogger(__name__)
 
@@ -86,9 +87,18 @@ while "Me" never proposed it and never sent anything about it — that is still
 unanswered FOR THE USER, never confirmed or tentative. (This does NOT apply when "Me"
 is the one who proposed the plan — see tentative above for that case.)
 
+**cancelled**: A plan that was previously agreed to (confirmed or tentative — the user
+had accepted it, in this thread) is explicitly called off in a NEW message: "actually
+we have to cancel", "can't do Friday anymore, sorry", "trip's off". Emit it with
+`status: "cancelled"`, using the ORIGINAL date/time/title of the plan being called off
+(not a guessed replacement), and set `evidence` to the message that cancels it. This is
+different from a plain decline below — cancelled means a plan the user had already
+agreed to is now being undone, not an invitation being turned down for the first time.
+
 Do NOT emit a plan when:
 - No specific invitation exists ("we should hang out sometime")
-- The user explicitly declined or the plan was cancelled
+- The user declines an invitation they had never previously agreed to — there is no
+  existing plan to cancel, so this is simply not a plan at all, not a "cancelled" one
 - No reasonably specific date is mentioned
 - The thread only references a past event
 - The proposal was superseded by a reschedule request ("can we push it?", "let's do
@@ -203,8 +213,8 @@ EVENT_ITEM_SCHEMA = {
         },
         "status": {
             "type": "string",
-            "enum": ["confirmed", "tentative", "unanswered"],
-            "description": "confirmed if the user is attending with clear agreement; tentative if the user explicitly hedged ('maybe', 'I'll try'); unanswered if the user has not responded to the invitation"
+            "enum": ["confirmed", "tentative", "unanswered", "cancelled"],
+            "description": "confirmed if the user is attending with clear agreement; tentative if the user explicitly hedged ('maybe', 'I'll try'); unanswered if the user has not responded to the invitation; cancelled if a previously-agreed plan is explicitly called off in a new message"
         },
         "user_is_participant": {
             "type": "boolean",
@@ -653,6 +663,7 @@ def detect_plans(
                 }],
                 output_config={"format": {"type": "json_schema", "schema": RESPONSE_SCHEMA}}
             )
+            usage_tracker.record(model, getattr(response, "usage", None))
 
             text = next(
                 (b.text for b in response.content if b.type == "text"),

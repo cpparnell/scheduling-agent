@@ -73,6 +73,19 @@ def spy_update_event(monkeypatch):
 
 
 @pytest.fixture
+def spy_delete_event(monkeypatch):
+    """Replace calendar.delete_event with a spy returning a configurable bool."""
+    state_ = {"calls": [], "return_value": True}
+
+    def fake(uid, **kwargs):
+        state_["calls"].append({"uid": uid, **kwargs})
+        return state_["return_value"]
+
+    monkeypatch.setattr(calendar, "delete_event", fake)
+    return state_
+
+
+@pytest.fixture
 def one_chat_db(fake_chat_db):
     """A single chat (chat_id == 1) with one recent message; returns the newest
     message's stored apple timestamp for assertions."""
@@ -498,6 +511,85 @@ def test_reconcile_update_disabled_treats_update_as_duplicate(
     suppressed = [e for e in state._load()["events"] if e["suppressed"]]
     assert len(suppressed) == 1
     assert suppressed[0]["duplicate_of_uid"] == "uid-123"
+
+
+# --- cancellation (F4) --------------------------------------------------------
+
+
+def test_cancelled_event_deletes_agent_owned_calendar_event(
+    one_chat_db, fake_anthropic, spy_create_event, spy_delete_event
+):
+    state.record_event(
+        1, FUTURE_DATE, "19:00", "Dinner",
+        status="confirmed", confidence=0.9, calendar_uid="uid-123",
+    )
+    fake_anthropic([_response(_event(status="cancelled"))])
+
+    result = main.process_new_messages(_cfg())
+
+    assert spy_create_event["calls"] == []
+    assert spy_delete_event["calls"] == [{"uid": "uid-123", "calendar_name": "Work"}]
+    record = next(e for e in state._load()["events"] if e["calendar_uid"] == "uid-123")
+    assert record["status"] == "cancelled"
+    assert state.get_pending_journal() == []
+
+
+def test_cancelled_event_with_no_match_is_noop(
+    one_chat_db, fake_anthropic, spy_create_event, spy_delete_event
+):
+    fake_anthropic([_response(_event(status="cancelled"))])
+
+    main.process_new_messages(_cfg())
+
+    assert spy_create_event["calls"] == []
+    assert spy_delete_event["calls"] == []
+
+
+def test_cancelled_event_never_deletes_unowned_calendar_match(
+    monkeypatch, one_chat_db, fake_anthropic, spy_create_event, spy_delete_event
+):
+    monkeypatch.setattr(calendar, "get_events_near", lambda *a, **k: [{
+        "title": "Dinner", "date": FUTURE_DATE, "time_start": "19:00",
+        "location": None, "calendar_uid": "UID-7", "source": "calendar",
+    }])
+    fake_anthropic([_response(_event(status="cancelled"))])
+
+    main.process_new_messages(_cfg(calendar_query_enabled=True))
+
+    assert spy_delete_event["calls"] == []
+
+
+def test_cancellation_disabled_config_skips_delete(
+    one_chat_db, fake_anthropic, spy_create_event, spy_delete_event
+):
+    state.record_event(
+        1, FUTURE_DATE, "19:00", "Dinner",
+        status="confirmed", confidence=0.9, calendar_uid="uid-123",
+    )
+    fake_anthropic([_response(_event(status="cancelled"))])
+
+    main.process_new_messages(_cfg(cancellation_enabled=False))
+
+    assert spy_delete_event["calls"] == []
+    record = next(e for e in state._load()["events"] if e["calendar_uid"] == "uid-123")
+    assert record["status"] == "confirmed"
+
+
+def test_failed_calendar_delete_rolls_back_journal_and_state(
+    one_chat_db, fake_anthropic, spy_create_event, spy_delete_event
+):
+    spy_delete_event["return_value"] = False
+    state.record_event(
+        1, FUTURE_DATE, "19:00", "Dinner",
+        status="confirmed", confidence=0.9, calendar_uid="uid-123",
+    )
+    fake_anthropic([_response(_event(status="cancelled"))])
+
+    main.process_new_messages(_cfg())
+
+    record = next(e for e in state._load()["events"] if e["calendar_uid"] == "uid-123")
+    assert record["status"] == "confirmed"  # unchanged, will retry next detection
+    assert state.get_pending_journal() == []
 
 
 def test_failed_calendar_update_rolls_back_journal_and_state(
