@@ -20,7 +20,7 @@ chat.db changes
   → reconcile.py (matches the detection against the canonical event store — and optionally
                   the live calendar — before anything is written: exact hash → deterministic
                   fuzzy match → LLM adjudicator)
-  → calendar.py  (creates the event, or updates the existing one on a reschedule/upgrade)
+  → calendar.py  (creates, updates, or deletes the calendar event)
   → state.py     (write-ahead journal + canonical event record + checkpoint + observations)
 ```
 
@@ -32,7 +32,20 @@ a sibling's wedding, a group plan the user declined — are logged and skipped, 
 means the user was invited and *explicitly hedged* ("maybe", "I'll try") — it is a
 classification, not a lower confidence tier, and is judged against the same confidence bar.
 An invitation the user hasn't answered at all is `unanswered` and never creates an event;
-when the user later replies, the plan is re-detected with its new status.
+when the user later replies, the plan is re-detected with its new status. `cancelled` means a
+plan the user had *already agreed to* is explicitly called off in a new message — this is
+different from a plain decline, which never emits anything at all (there is no existing plan
+to cancel).
+
+**Cancellation.** A `cancelled` detection never creates or updates through the normal
+reconcile path — it reconciles to find the matching record, and only when that record is
+one the agent itself created (has a `calendar_uid` in state) does it delete the calendar
+event and mark the record cancelled; a match against a calendar-only or unowned event, or no
+match at all, is a no-op. Gated by `cancellation_enabled` (default on). There is no "revival"
+path in this version: a fresh confirmation of a cancelled plan on the same date won't reopen
+it (the record's hash is left in place so replayed context can't re-create it either) — a
+genuinely new date for the same plan arrives as a `reschedule`/`new_occurrence` instead (see
+below).
 
 **Reconciliation instead of create-by-default.** Every detection is matched against the
 canonical event store (`state.json`) before any calendar write: an exact hash/title-window
@@ -243,6 +256,7 @@ The config file lives at `~/.scheduling-agent/config.json` and is created with d
 | `far_title_similarity_cross_chat` | `0.5` | Same screening bar for a record in a *different* chat — stricter, since title overlap alone is a weaker signal across conversations |
 | `evidence_gate_enabled` | `true` | Drop detected plans whose quoted evidence (or date evidence) isn't found verbatim in the thread (hallucination guard) |
 | `reconcile_update_enabled` | `true` | Let reconciliation matches update the existing calendar event (reschedules, added locations); off treats them as skips |
+| `cancellation_enabled` | `true` | Let a detected cancellation of a previously-created event delete it from the calendar; off logs the detection without deleting |
 | `max_watermark_retries` | `3` | How many consecutive polls to retry a thread whose detection failed before giving up and advancing past it |
 | `context_marking_enabled` | `true` | Mark replayed context vs. newly-arrived messages in the prompt and instruct the model not to re-emit a plan whose only trace is old context — disable to fall back to the unmarked prompt |
 | `poll_interval_minutes` | `15` | Backstop poll interval, independent of the filesystem watcher, in case a `chat.db` change event is ever missed. `0` disables it |
@@ -395,7 +409,8 @@ scheduling_agent/
 ├── detector.py        # Claude Haiku plan detection (participation, status, evidence gate)
 ├── reconcile.py       # Matches detections against known events: exact → fuzzy → LLM
 ├── dedup.py           # LLM adjudicator: is a new detection the same plan as an existing event?
-├── calendar.py        # Apple Calendar create/update/query via osascript (timed + all-day)
+├── calendar.py        # Apple Calendar create/update/delete/query via osascript (timed + all-day)
+├── usage_tracker.py   # Per-call token/cost accounting for detector/dedup/judge API calls
 └── watcher.py         # Filesystem watcher with debounce
 scripts/
 ├── setup.sh                    # venv + install + API key + launchd prompt
