@@ -6,9 +6,16 @@ from scheduling_agent import state
 
 
 def test_event_hash_normalizes_case_and_whitespace():
-    # title-based fallback (time_start=None) still normalizes case/whitespace
     a = state.event_hash(1, "2026-06-13", None, "Dinner With Sam")
     b = state.event_hash(1, "2026-06-13", None, "  dinner with sam  ")
+    assert a == b
+
+
+def test_event_hash_normalizes_token_order():
+    # F2a: title normalization is a sorted token set, so the same words in a
+    # different order still hash identically.
+    a = state.event_hash(1, "2026-06-13", None, "Dinner with Sam")
+    b = state.event_hash(1, "2026-06-13", None, "Sam with Dinner")
     assert a == b
 
 
@@ -19,21 +26,20 @@ def test_event_hash_distinct_on_chat_date_title():
     assert state.event_hash(1, "2026-06-13", None, "Lunch") != base
 
 
-def test_event_hash_timed_collapses_different_titles():
-    # Same chat + date + time_start → same hash regardless of title (the dedup fix)
-    h = state.event_hash(1, "2026-06-13", "17:30", "Pizza at Dicey's")
-    assert state.event_hash(1, "2026-06-13", "17:30", "Drinks") == h
-
-
-def test_event_hash_timed_distinct_on_time():
+def test_event_hash_ignores_time_start():
+    # F2b: event_hash no longer keys on time_start, so a time_confidence flap
+    # between polls (7pm one poll, all-day the next) can't produce two hashes
+    # for the same plan.
     h = state.event_hash(1, "2026-06-13", "17:30", "Dinner")
-    assert state.event_hash(1, "2026-06-13", "20:00", "Dinner") != h
+    assert state.event_hash(1, "2026-06-13", "20:00", "Dinner") == h
+    assert state.event_hash(1, "2026-06-13", None, "Dinner") == h
 
 
-def test_event_hash_timed_distinct_from_untimed():
-    h_timed = state.event_hash(1, "2026-06-13", "17:30", "Dinner")
-    h_untimed = state.event_hash(1, "2026-06-13", None, "Dinner")
-    assert h_timed != h_untimed
+def test_event_hash_distinct_titles_same_time_do_not_collapse():
+    # The pre-F2 bug: different titles at the same chat/date/time used to
+    # collide (time_start was the whole key). Titles now factor in.
+    h = state.event_hash(1, "2026-06-13", "17:30", "Pizza at Dicey's")
+    assert state.event_hash(1, "2026-06-13", "17:30", "Drinks") != h
 
 
 def test_record_event_then_is_duplicate():
@@ -44,12 +50,13 @@ def test_record_event_then_is_duplicate():
     assert state.is_duplicate(1, "2026-06-13", None, "  DINNER ") is True
 
 
-def test_record_event_timed_dedup():
-    # Recording "Pizza at Dicey's" at 17:30 should block "Drinks" at the same time.
+def test_record_event_reworded_title_same_slot_is_duplicate():
     state.record_event(1, "2026-06-14", "17:30", "Pizza at Dicey's")
-    assert state.is_duplicate(1, "2026-06-14", "17:30", "Drinks") is True
-    # Different time is not a duplicate.
-    assert state.is_duplicate(1, "2026-06-14", "20:00", "Drinks") is False
+    assert state.is_duplicate(1, "2026-06-14", "17:30", "At Dicey's Pizza") is True
+    # A different time no longer changes the hash (F2b) — same plan either way.
+    assert state.is_duplicate(1, "2026-06-14", "20:00", "At Dicey's Pizza") is True
+    # A genuinely different title at the same slot is not a duplicate.
+    assert state.is_duplicate(1, "2026-06-14", "17:30", "Drinks") is False
 
 
 def test_record_event_does_not_touch_timestamp():
@@ -393,6 +400,57 @@ def test_prune_state_drops_stale_observations():
     state._prune_state(data)
     assert "stale-hash" not in data["observations"]
     assert "fresh-hash" in data["observations"]
+
+
+# --- v7: token-set title normalization + time-independent event_hash --------
+
+
+def test_v6_to_v7_migration_recomputes_hash_and_title_key():
+    legacy = {
+        "schema_version": 6,
+        "last_processed_timestamp": 999,
+        # Old (pre-v7) time_start-keyed hash, computed by hand — not
+        # reproducible via state.event_hash() any more since that now always
+        # uses the new algorithm.
+        "created_events": {"old-time-keyed-hash": "2026-06-01"},
+        "title_events": {},
+        "events": [{
+            "canonical_id": "c1",
+            "hash": "old-time-keyed-hash",
+            "chat_id": 1,
+            "date": "2026-06-01",
+            "time_start": "19:00",
+            "title": "Sam with Dinner",
+            "chat_ids": [1],
+            "created_at": "2026-06-01T10:00:00",
+            "updated_at": "2026-06-01T10:00:00",
+            "confidence": None,
+            "revisions": [],
+            "suppressed": False,
+        }],
+        "journal": [],
+        "watermark_hold": {"ts": None, "count": 0},
+        "observations": {},
+    }
+    migrated = state._migrate(dict(legacy))
+    assert migrated["schema_version"] == state.CURRENT_SCHEMA_VERSION
+
+    record = migrated["events"][0]
+    new_hash = state.event_hash(1, "2026-06-01", "19:00", "Sam with Dinner")
+    assert record["hash"] == new_hash
+    # The new hash is registered for dedup...
+    assert migrated["created_events"][new_hash] == "2026-06-01"
+    # ...and the stale pre-v7 entry is left in place rather than dropped (it
+    # ages out via the normal retention prune like anything else).
+    assert migrated["created_events"]["old-time-keyed-hash"] == "2026-06-01"
+    key = state._title_key(1, "Sam with Dinner")
+    assert migrated["title_events"][key] == "2026-06-01"
+
+
+def test_v0_to_v7_migration_chain():
+    legacy = {"last_processed_timestamp": 42, "created_events": ["x"]}
+    migrated = state._migrate(dict(legacy))
+    assert migrated["schema_version"] == state.CURRENT_SCHEMA_VERSION
 
 
 def test_prune_state_keeps_malformed_observation_date_rather_than_dropping():

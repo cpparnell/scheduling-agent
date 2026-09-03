@@ -24,7 +24,7 @@ from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
 from evals import loader
-from scheduling_agent import dedup, detector
+from scheduling_agent import config, dedup, detector
 
 LOGS_DIR = Path(__file__).parent.parent / "logs"
 REPORTS_DIR = LOGS_DIR / "evals"
@@ -589,9 +589,9 @@ def main() -> None:
     ap.add_argument("--model", default=detector.MODEL)
     ap.add_argument("--dedup-model", default="claude-haiku-4-5")
     ap.add_argument(
-        "--dedup-day-window", type=int, default=1,
-        help="candidate window (days) for dedup-pair scoring; widen to exercise "
-             "far-apart pairs once production's dedup_day_window is widened",
+        "--dedup-day-window", type=int, default=config.DEFAULTS["dedup_candidate_day_window"],
+        help="candidate window (days) for dedup-pair scoring; matches production's "
+             "dedup_candidate_day_window by default",
     )
     ap.add_argument("--judge", action="store_true", help="add LLM title-quality scoring")
     ap.add_argument("-k", "--filter", default=None, help="only run cases whose id contains this")

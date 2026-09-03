@@ -137,19 +137,35 @@ def test_failed_create_does_not_record_hash(one_chat_db, fake_anthropic, spy_cre
     assert state.is_duplicate(1, FUTURE_DATE, "19:00", "Dinner") is False
 
 
-def test_same_time_different_title_is_duplicate(
+def test_reworded_title_same_time_is_duplicate(
     one_chat_db, fake_anthropic, spy_create_event
 ):
-    # Simulate the first event already having been created (e.g. from a prior run).
+    """Title normalization is a sorted token set (F2a), so a verb-order
+    reshuffle of the same title still hits the exact-hash layer."""
+    state.record_event(1, FUTURE_DATE, "19:00", "Dinner with Sam")
+
+    fake_anthropic([_response(_event(title="Sam with Dinner", time_start="19:00"))])
+
+    main.process_new_messages(_cfg())
+
+    assert spy_create_event["calls"] == []
+
+
+def test_same_time_different_title_is_not_merged_without_dedup(
+    one_chat_db, fake_anthropic, spy_create_event
+):
+    """Same chat/date/time alone is not enough to call two events the same
+    plan — event_hash keys on date + normalized title (F2b), not time_start,
+    and with dedup disabled there's no fuzzy/LLM layer to catch a genuine
+    coincidence (two different plans discussed in one chat landing on the
+    same slot). Over-merge guard: this must create both."""
     state.record_event(1, FUTURE_DATE, "17:30", "Pizza at Dicey's")
 
-    # The detector now returns a differently-described event at the exact same time.
     fake_anthropic([_response(_event(title="Drinks", time_start="17:30"))])
 
     main.process_new_messages(_cfg())
 
-    # Must be suppressed — same chat/date/time is the same real-world event.
-    assert spy_create_event["calls"] == []
+    assert len(spy_create_event["calls"]) == 1
 
 
 def test_no_threads_does_nothing(fake_chat_db, fake_anthropic, spy_create_event):

@@ -12,7 +12,7 @@ STATE_FILE = STATE_DIR / "state.json"
 
 # Bump this whenever the on-disk state shape changes, and add a corresponding
 # step in _migrate(). Files written before versioning are treated as version 0.
-CURRENT_SCHEMA_VERSION = 6
+CURRENT_SCHEMA_VERSION = 7
 
 # Events with the same chat + normalized title within this many days are treated
 # as the same occurrence and deduplicated.
@@ -125,6 +125,29 @@ def _migrate(data: dict) -> dict:
         # anti-flap check has history to consult instead of none at all.
         data.setdefault("observations", {})
         version = 6
+    if version < 7:
+        # v7: title normalization becomes token-set (order-insensitive) and
+        # event_hash drops time_start (a time_confidence flap between polls
+        # no longer produces two hashes for the same plan). Recompute each
+        # canonical record's hash and title key under the new algorithm and
+        # merge them in; stale old-algorithm entries in created_events/
+        # title_events are left as-is (harmless — they just age out via the
+        # normal retention prune, same as any other entry).
+        for record in data.get("events", []):
+            record["hash"] = event_hash(
+                record.get("chat_id"), record.get("date"),
+                record.get("time_start"), record.get("title", ""),
+            )
+        created = data.setdefault("created_events", {})
+        title_events = data.setdefault("title_events", {})
+        for record in data.get("events", []):
+            if record.get("hash") and record.get("date"):
+                created[record["hash"]] = record["date"]
+            key = _title_key(record.get("chat_id"), record.get("title", ""))
+            d = record.get("date")
+            if d and (key not in title_events or d > title_events[key]):
+                title_events[key] = d
+        version = 7
     data["schema_version"] = CURRENT_SCHEMA_VERSION
     return data
 
@@ -168,26 +191,33 @@ def get_last_timestamp() -> int | None:
 
 
 def _normalize_title(title: str) -> str:
-    """Lowercase, strip punctuation and leading month names for title dedup."""
+    """Lowercase, strip punctuation/month names, and collapse to a sorted set
+    of unique tokens for title dedup — order-insensitive, so "dinner with Sam"
+    and "Sam dinner" key identically. Matches the fuzzy reconciliation layer's
+    Jaccard-overlap notion of title equality (reconcile._title_tokens) instead
+    of the two disagreeing (a title reworded verb-first previously produced a
+    different hash/title-key than the fuzzy layer would call a match)."""
     t = title.lower()
     t = re.sub(r'\b(january|february|march|april|may|june|july|august|september|october|november|december)\b', '', t)
     t = re.sub(r'[^\w\s]', '', t)
-    t = re.sub(r'\s+', ' ', t).strip()
-    return t
+    tokens = sorted(set(t.split()))
+    return ' '.join(tokens)
 
 
 def _title_key(chat_id: int, title: str) -> str:
     return f"{chat_id}:{_normalize_title(title)}"
 
 
-# The dedup key uses time_start when a time is present, falling back to a
-# normalized title otherwise. See _migrate() for how pre-versioning state files
-# (which used a title-only key) are handled on upgrade.
+# The dedup key is chat + date + normalized title (order-insensitive token
+# set — see _normalize_title). time_start deliberately does NOT factor in:
+# a plan detected once at 19:00 and once all-day (time_confidence dipped
+# below its threshold on one poll) is the same plan and must hash the same,
+# not silently produce two canonical records. `time_start` is kept as a
+# parameter for call-site compatibility even though unused here. See
+# _migrate() for how hashes computed under the pre-v7 (time_start-keyed)
+# algorithm are upgraded.
 def event_hash(chat_id: int, date: str, time_start: str | None, title: str) -> str:
-    if time_start is not None:
-        key = f"{chat_id}|{date}|{time_start}"
-    else:
-        key = f"{chat_id}|{date}|title:{title.strip().lower()}"
+    key = f"{chat_id}|{date}|{_normalize_title(title)}"
     return hashlib.sha256(key.encode()).hexdigest()
 
 

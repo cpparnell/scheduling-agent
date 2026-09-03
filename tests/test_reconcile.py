@@ -198,9 +198,13 @@ def test_exact_match_still_applies_new_location():
     assert decision.changes == {"location": "Lucia's"}
 
 
-def test_title_window_match_far_date_never_updates():
-    # Recurring-plan mention weeks out matches via the title window; it is a
-    # duplicate mention, not a reschedule — nothing may change.
+def test_title_window_match_far_date_routes_to_adjudicator(fake_dedup_anthropic):
+    # Recurring-plan mention weeks out matches the title window exactly, but
+    # deterministic logic can't tell a mis-dated re-mention from a genuine
+    # reschedule — the adjudicator decides (F3).
+    fake_dedup_anthropic(
+        [{"is_duplicate": True, "duplicate_of": 0, "relationship": "duplicate", "reasoning": "same mention"}]
+    )
     state.record_event(1, "2099-01-01", "19:00", "Munch at Sinha", status="confirmed", confidence=0.9)
 
     decision = reconcile.reconcile(
@@ -208,7 +212,73 @@ def test_title_window_match_far_date_never_updates():
     )
 
     assert decision.action == "skip_duplicate"
+    assert decision.source == "llm"
+
+
+def test_title_window_match_far_date_dedup_disabled_skips_conservatively():
+    state.record_event(1, "2099-01-01", "19:00", "Munch at Sinha", status="confirmed", confidence=0.9)
+
+    decision = reconcile.reconcile(
+        _event(date="2099-01-15", title="Munch at Sinha", time_start="20:00"), _cfg(dedup_enabled=False)
+    )
+
+    assert decision.action == "skip_duplicate"
     assert decision.source == "exact"
+
+
+def test_title_window_match_far_date_reschedule_verdict_updates(fake_dedup_anthropic):
+    fake_dedup_anthropic(
+        [{"is_duplicate": True, "duplicate_of": 0, "relationship": "reschedule", "reasoning": "moved"}]
+    )
+    state.record_event(1, "2099-01-01", "19:00", "Munch at Sinha", status="confirmed", confidence=0.9)
+
+    decision = reconcile.reconcile(
+        _event(date="2099-01-15", title="Munch at Sinha", time_start="20:00", status="confirmed"), _cfg()
+    )
+
+    assert decision.action == "update"
+    assert decision.changes["date"] == "2099-01-15"
+    assert decision.changes["time_start"] == "20:00"
+
+
+def test_title_window_match_far_date_reschedule_needs_confirmed(fake_dedup_anthropic):
+    fake_dedup_anthropic(
+        [{"is_duplicate": True, "duplicate_of": 0, "relationship": "reschedule", "reasoning": "maybe moved"}]
+    )
+    state.record_event(1, "2099-01-01", "19:00", "Munch at Sinha", status="confirmed", confidence=0.9)
+
+    decision = reconcile.reconcile(
+        _event(date="2099-01-15", title="Munch at Sinha", time_start="20:00", status="tentative"), _cfg()
+    )
+
+    assert decision.action == "skip_duplicate"
+
+
+def test_title_window_match_far_date_reschedule_beyond_max_days_skips(fake_dedup_anthropic):
+    fake_dedup_anthropic(
+        [{"is_duplicate": True, "duplicate_of": 0, "relationship": "reschedule", "reasoning": "far move"}]
+    )
+    state.record_event(1, "2099-01-01", "19:00", "Munch at Sinha", status="confirmed", confidence=0.9)
+
+    decision = reconcile.reconcile(
+        _event(date="2099-06-01", title="Munch at Sinha", time_start="20:00", status="confirmed"),
+        _cfg(reschedule_max_days=30),
+    )
+
+    assert decision.action == "skip_duplicate"
+
+
+def test_title_window_match_far_date_new_occurrence_creates(fake_dedup_anthropic):
+    fake_dedup_anthropic(
+        [{"is_duplicate": True, "duplicate_of": 0, "relationship": "new_occurrence", "reasoning": "next cycle"}]
+    )
+    state.record_event(1, "2099-01-01", "19:00", "Book Club", status="confirmed", confidence=0.9)
+
+    decision = reconcile.reconcile(
+        _event(date="2099-01-29", title="Book Club", time_start="19:00", status="confirmed"), _cfg()
+    )
+
+    assert decision.action == "create"
 
 
 def test_slightly_lower_confidence_can_still_update():
@@ -343,8 +413,21 @@ def test_far_candidates_same_chat_similar_title_far_date():
     assert [c["title"] for c in cands] == ["Sam dinner celebration"]
 
 
-def test_far_candidates_other_chat_excluded():
+def test_far_candidates_other_chat_included_with_strong_title(fake_dedup_anthropic):
+    # F2c: far_candidates goes cross-chat, at a stricter title-similarity bar
+    # than same-chat — a plan set in one chat and re-mentioned/rescheduled in
+    # another must still be findable.
     state.record_event(2, "2099-03-20", None, "Sam dinner celebration", confidence=0.9)
+
+    cands = reconcile.far_candidates(_event(chat_id=1), _cfg())
+
+    assert [c["title"] for c in cands] == ["Sam dinner celebration"]
+
+
+def test_far_candidates_other_chat_weak_title_excluded():
+    # Jaccard 0.4 vs "Dinner with Sam" — clears the same-chat bar (0.4) but
+    # not the stricter cross-chat one (0.5).
+    state.record_event(2, "2099-03-20", None, "Dinner Sam Thing Extra", confidence=0.9)
 
     assert reconcile.far_candidates(_event(chat_id=1), _cfg()) == []
 

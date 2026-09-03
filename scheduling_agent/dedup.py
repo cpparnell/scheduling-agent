@@ -34,14 +34,30 @@ distant date, answer is_duplicate=true — it is a mis-dated mention, not a new 
 But a recurring activity genuinely happening again (same title, clearly a new
 occurrence like next month's book club) is NOT a duplicate.
 
+When is_duplicate=true, also classify the RELATIONSHIP to the matched event:
+- "duplicate": the same occurrence — a re-wording, a mis-dated mention, or a plain
+  re-mention with no material change. Use this by default.
+- "reschedule": the group explicitly moved this SAME plan to a new date and/or time
+  ("can we push it to Saturday?" / "sure" — the new evidence is about changing when
+  it happens, not describing a fresh event).
+- "new_occurrence": a recurring activity's NEXT instance — same title/purpose, but a
+  distinct future occurrence, not a change to the matched event's date. Use this
+  (not "duplicate") for "next month's book club" style re-invitations of something
+  that already happened or is a separate cycle of a repeating plan.
+When is_duplicate=false, set relationship to "new_occurrence" as a placeholder (it
+is not used).
+
 Judge by: whether the conversations/participants overlap, whether titles and
 locations describe the same activity, whether the times are identical or plausibly
-the same slot, and what the quoted evidence messages say. When genuinely uncertain,
-answer is_duplicate=true — a plan that reaches you was already detected once, and a
-missed duplicate spams the calendar and erodes trust, while a wrong "same" verdict
-merely merges the mention into the existing event. Only answer is_duplicate=false
-when the plans are clearly distinct activities (different purpose, different people,
-or explicitly separate arrangements).
+the same slot, and what the quoted evidence messages say. When genuinely uncertain
+between "duplicate" and "different", answer is_duplicate=true — a plan that reaches
+you was already detected once, and a missed duplicate spams the calendar and erodes
+trust, while a wrong "same" verdict merely merges the mention into the existing
+event. Only answer is_duplicate=false when the plans are clearly distinct activities
+(different purpose, different people, or explicitly separate arrangements). When
+uncertain between "reschedule" and "new_occurrence" for a recurring-sounding plan,
+prefer "new_occurrence" — merging two genuinely separate occurrences into one is a
+worse error than leaving both on the calendar.
 
 Respond with JSON only.
 """
@@ -55,9 +71,15 @@ ADJUDICATOR_SCHEMA = {
             "type": ["integer", "null"],
             "description": "index (0-based) of the matching existing event in the list provided, or null",
         },
+        "relationship": {
+            "type": "string",
+            "enum": ["duplicate", "reschedule", "new_occurrence"],
+            "description": "how the new plan relates to duplicate_of when is_duplicate=true; "
+                            "placeholder value when is_duplicate=false",
+        },
         "reasoning": {"type": "string"},
     },
-    "required": ["is_duplicate", "duplicate_of", "reasoning"],
+    "required": ["is_duplicate", "duplicate_of", "relationship", "reasoning"],
 }
 
 # Never adjudicate against more than this many candidates in one call.

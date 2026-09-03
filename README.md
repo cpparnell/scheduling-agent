@@ -39,10 +39,30 @@ canonical event store (`state.json`) before any calendar write: an exact hash/ti
 check, then a deterministic fuzzy match (normalized-title overlap + compatible date/time,
 across chats), then an LLM adjudicator for the genuinely ambiguous cases — biased toward
 "same" when uncertain, because a wrong merge just updates the existing event while a missed
-duplicate spams the calendar. With `calendar_query_enabled`, events already on the target
-calendar (created manually, or before a state reset) join the candidate set. A match with
-material new information — a reschedule, a newly stated location, tentative → confirmed —
-**updates** the existing calendar event; anything else is skipped as a duplicate.
+duplicate spams the calendar. The exact and fuzzy layers stay narrow (`dedup_day_window`,
+1 day by default — no adjudicator backs them up, so they can't afford to be wrong); the
+adjudicator sees a much wider window (`dedup_candidate_day_window`, 7 days) so a
+week-out reschedule reaches it instead of guaranteed-duplicating. With
+`calendar_query_enabled`, events already on the target calendar (created manually, or
+before a state reset) join the candidate set. The dedup hash and title-window key are both
+chat + date + a normalized, order-insensitive token set of the title — "dinner with Sam" and
+"Sam dinner" collide on purpose, and neither key factors in `time_start` any more, so a
+time-confidence flap (7pm one poll, all-day the next) can't fork the same plan into two
+records. A match with material new information — a newly stated location, tentative →
+confirmed — **updates** the existing calendar event; anything else is skipped as a duplicate.
+
+**Reschedules vs. new occurrences.** A matched detection far from its record's stored date
+used to always be treated as a duplicate mention (correct for a mis-dated re-mention, wrong
+for an actual reschedule or a recurring plan's next occurrence). The LLM adjudicator now
+also classifies *how* a matched plan relates to the new detection: `duplicate` (same
+occurrence, stored date stands — a far "duplicate" verdict never overwrites a good date with
+a mis-resolved one), `reschedule` (the group explicitly moved it — the record's date is
+updated, capped at `reschedule_max_days`, and requires the new detection to be `confirmed`
+for any move bigger than a day), or `new_occurrence` (a recurring plan's genuinely distinct
+next instance — never merged, always creates). The same far-date-layer scan that used to be
+same-chat-only now also considers a different chat's records, at a stricter title-similarity
+bar (`far_title_similarity_cross_chat`) than the same-chat one, so a plan set in a group chat
+and rescheduled in a 1:1 is still found.
 
 **New-vs-context marking.** Every poll replays the last 30 messages per chat (plus older
 date anchors) so the model can see plans that span several messages — but that means a
@@ -72,9 +92,10 @@ the evidence already quotes an explicit date (an incidental weekday mentioned al
 real date shouldn't override it) or names "next `<weekday>`" (excluded the same way "last
 `<weekday>`" already was). Message timestamps carry a year and the local timezone, so a
 5-month-out anchor doesn't get silently mis-resolved across a year boundary. Reconciliation
-also has a far-date layer that catches a same-chat detection whose title matches an event
-already recorded far away, sending it to the LLM adjudicator as a probable mis-dated
-re-mention instead of creating a near-term duplicate. Relatedly, a weekday named on the same
+also has a far-date layer that catches a detection whose title matches an event already
+recorded far away (same chat or a different one — see "Reschedules vs. new occurrences"
+below), sending it to the LLM adjudicator as a probable mis-dated re-mention instead of
+creating a near-term duplicate. Relatedly, a weekday named on the same
 day it's said ("this Thursday" sent on a Thursday) resolves to that day, not next week.
 
 **Verbatim evidence matching.** The hallucination guard requires `evidence`/`date_evidence`
@@ -212,11 +233,14 @@ The config file lives at `~/.scheduling-agent/config.json` and is created with d
 | `time_confidence_threshold` | `0.9` | Minimum confidence in the extracted clock time to keep it; below this the event is created all-day instead |
 | `dedup_enabled` | `true` | Whether the LLM adjudicator runs as reconciliation's last layer |
 | `dedup_model` | `"claude-haiku-4-5"` | Model used for dedup adjudication |
-| `dedup_day_window` | `1` | How many days on either side of a new plan's date count as "nearby" for reconciliation candidates |
+| `dedup_day_window` | `1` | Hard same-slot cutoff for the deterministic exact/fuzzy layers — no LLM call backs them up, so they stay narrow |
+| `dedup_candidate_day_window` | `7` | How many days on either side of a new plan's date the LLM adjudicator's candidate window covers (wider than `dedup_day_window` since the adjudicator can catch a wrong call) |
+| `reschedule_max_days` | `30` | Ceiling on how far a `reschedule` adjudicator verdict may move a stored event's date in one step |
 | `dedup_fail_open` | `true` | If the adjudicator call itself fails, create the event rather than risk dropping a real plan |
 | `calendar_query_enabled` | `true` | Read events back from the target calendar as reconciliation candidates (catches manually created events and lost state) |
 | `fuzzy_title_threshold` | `0.6` | Minimum normalized-title token overlap for the deterministic fuzzy layer to match without the LLM |
 | `far_title_similarity` | `0.4` | Screening bar for the far-date layer: same-chat records with at least this much title overlap but a distant date go to the LLM adjudicator (catches a bare weekday mis-resolved to a near-term date) |
+| `far_title_similarity_cross_chat` | `0.5` | Same screening bar for a record in a *different* chat — stricter, since title overlap alone is a weaker signal across conversations |
 | `evidence_gate_enabled` | `true` | Drop detected plans whose quoted evidence (or date evidence) isn't found verbatim in the thread (hallucination guard) |
 | `reconcile_update_enabled` | `true` | Let reconciliation matches update the existing calendar event (reschedules, added locations); off treats them as skips |
 | `max_watermark_retries` | `3` | How many consecutive polls to retry a thread whose detection failed before giving up and advancing past it |
@@ -231,7 +255,9 @@ State (the last-processed message timestamp, dedup hashes, descriptive records o
 events — including the calendar event UID — used for dedup adjudication, and a lightweight
 map of recently-skipped detections used by the anti-flap guard) is stored in
 `~/.scheduling-agent/state.json`, written atomically and migrated automatically across schema
-versions (currently v6). Quoted message `evidence` is truncated to `state.EVIDENCE_MAX_CHARS`
+versions (currently v7 — dedup hashes and title keys are chat + date + a normalized,
+order-insensitive token set of the title, no longer time_start). Quoted message `evidence` is
+truncated to `state.EVIDENCE_MAX_CHARS`
 (240 characters) before being written, and log lines that would otherwise include a verbatim
 quote are truncated the same way — enough context for the dedup adjudicator to keep working,
 without keeping a full plaintext transcript on disk indefinitely. Run `scheduling-agent --purge`
