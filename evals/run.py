@@ -187,8 +187,19 @@ def score_case(case: dict, model: str, today: date | None = None) -> dict:
         got = events[0] if events else None
     else:
         got = events[0] if events else None
-        predicted_has_event = got is not None
         expected_has_event = expected["has_event"]
+
+        if expected_has_event:
+            predicted_has_event = got is not None
+        else:
+            # For a hard_negative, only an event that would actually reach the
+            # calendar counts as a false positive. A "cancelled" classification
+            # (F4) recognizing that a previously-agreed plan was called off is
+            # the correct detection for that case, not junk — it only ever
+            # deletes an existing agent-owned record, never creates one.
+            reaching = [e for e in events if _would_reach_calendar(e)]
+            predicted_has_event = bool(reaching)
+            got = reaching[0] if reaching else got
 
         if predicted_has_event != expected_has_event:
             failures.append(
