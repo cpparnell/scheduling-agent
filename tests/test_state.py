@@ -348,3 +348,35 @@ def test_get_active_events_excludes_suppressed_includes_pending():
     titles = {r["title"] for r in state.get_active_events()}
 
     assert titles == {"Dinner", "Concert"}
+
+
+# --- evidence truncation ------------------------------------------------------
+
+
+def test_make_record_truncates_long_evidence():
+    long_evidence = "x" * (state.EVIDENCE_MAX_CHARS + 50)
+    record = state.make_record(1, "2026-06-13", "19:00", "Dinner", evidence=long_evidence)
+    assert len(record["evidence"]) == state.EVIDENCE_MAX_CHARS + 1  # +1 for the ellipsis
+    assert record["evidence"].endswith("…")
+
+
+def test_make_record_leaves_short_evidence_untouched():
+    record = state.make_record(1, "2026-06-13", "19:00", "Dinner", evidence="dinner at 7?")
+    assert record["evidence"] == "dinner at 7?"
+
+
+def test_make_record_handles_none_evidence():
+    record = state.make_record(1, "2026-06-13", "19:00", "Dinner", evidence=None)
+    assert record["evidence"] is None
+
+
+def test_update_record_truncates_long_evidence():
+    state.record_event(1, "2026-06-13", "19:00", "Dinner")
+    record = state._load()["events"][0]
+    long_evidence = "y" * (state.EVIDENCE_MAX_CHARS + 50)
+
+    state.update_record(record["canonical_id"], {"evidence": long_evidence})
+
+    updated = state._load()["events"][0]
+    assert len(updated["evidence"]) == state.EVIDENCE_MAX_CHARS + 1
+    assert updated["evidence"].endswith("…")

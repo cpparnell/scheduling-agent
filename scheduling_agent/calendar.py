@@ -17,6 +17,15 @@ def _applescript_date(dt: datetime) -> str:
     return dt.strftime("%B %d, %Y at %I:%M:%S %p")
 
 
+def _escape_as_string(value: str) -> str:
+    """Escape a value for embedding in a double-quoted AppleScript string
+    literal. Backslashes must be escaped BEFORE quotes, or a value ending in
+    a backslash (e.g. from message-derived text) would escape the closing
+    quote instead of itself, letting the rest of the string spill into the
+    script."""
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
 def _compute_span(
     date_str: str,
     time_start: str | None,
@@ -81,14 +90,14 @@ def create_event(
         end_str = _applescript_date(end_dt)
 
         display_title = f"(Tentative) {title}" if tentative else title
-        safe_title = display_title.replace('"', '\\"')
-        safe_calendar = calendar_name.replace('"', '\\"')
+        safe_title = _escape_as_string(display_title)
+        safe_calendar = _escape_as_string(calendar_name)
 
         props = f'{{summary:"{safe_title}", start date:date "{start_str}", end date:date "{end_str}"'
         if is_allday:
             props += ", allday event:true"
         if location:
-            safe_location = location.replace('"', '\\"')
+            safe_location = _escape_as_string(location)
             props += f', location:"{safe_location}"'
         props += "}"
 
@@ -141,13 +150,13 @@ def update_event(
         )
 
         display_title = f"(Tentative) {title}" if tentative else title
-        safe_title = display_title.replace('"', '\\"')
-        safe_calendar = calendar_name.replace('"', '\\"')
-        safe_uid = uid.replace('"', '\\"')
+        safe_title = _escape_as_string(display_title)
+        safe_calendar = _escape_as_string(calendar_name)
+        safe_uid = _escape_as_string(uid)
 
         location_line = ""
         if location:
-            safe_location = location.replace('"', '\\"')
+            safe_location = _escape_as_string(location)
             location_line = f'\n    set location of theEvent to "{safe_location}"'
 
         script = f"""
@@ -198,7 +207,7 @@ def get_events_near(
         window_start = target - timedelta(days=window_days)
         window_end = target + timedelta(days=window_days + 1)  # exclusive
 
-        safe_calendar = calendar_name.replace('"', '\\"')
+        safe_calendar = _escape_as_string(calendar_name)
         script = f"""
 tell application "Calendar"
     set targetCalendar to first calendar whose name is "{safe_calendar}"

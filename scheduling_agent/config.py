@@ -48,6 +48,10 @@ DEFAULTS = {
     # How many consecutive polls to hold the watermark back for a thread that
     # keeps failing detection, before giving up and advancing past it anyway.
     "max_watermark_retries": 3,
+    # Backstop poll interval: process_new_messages() also runs on this timer,
+    # independent of the filesystem watcher, in case a chat.db change event is
+    # ever missed. Set to 0 to disable.
+    "poll_interval_minutes": 15,
 }
 
 

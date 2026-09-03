@@ -23,3 +23,6 @@ jobs:
 
       - name: Run tests
         run: pytest
+
+      - name: Audit dependencies for known vulnerabilities
+        run: pip-audit -r requirements.txt

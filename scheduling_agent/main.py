@@ -1,6 +1,10 @@
+import argparse
 import logging
+import logging.handlers
+import shutil
 import signal
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -27,7 +31,12 @@ def setup_logging() -> None:
     console.setFormatter(formatter)
     root.addHandler(console)
 
-    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    # Rotating rather than a plain FileHandler: under launchd this process runs
+    # indefinitely instead of once per terminal session, so an unbounded
+    # single file is no longer safe to assume.
+    file_handler = logging.handlers.RotatingFileHandler(
+        log_file, maxBytes=10_000_000, backupCount=5, encoding="utf-8"
+    )
     file_handler.setFormatter(formatter)
     root.addHandler(file_handler)
 
@@ -307,7 +316,107 @@ def process_new_messages(cfg: dict) -> None:
                 state.set_watermark_hold(last_ts, count)
 
 
+LAUNCHD_LOG_DIR = Path.home() / "Library" / "Logs" / "scheduling-agent"
+
+
+def purge() -> None:
+    """Delete all local state (canonical event store, journal, watermark) and
+    logs. Does not touch anything on the Calendar or in Messages."""
+    removed = []
+    if state.STATE_FILE.exists():
+        state.STATE_FILE.unlink()
+        removed.append(str(state.STATE_FILE))
+    if LOGS_DIR.parent.exists():
+        shutil.rmtree(LOGS_DIR.parent)
+        removed.append(str(LOGS_DIR.parent))
+    # launchd redirects raw stdout/stderr here (see install-launchagent.sh);
+    # it's a separate, unrotated log containing the same truncated-but-still
+    # evidence-bearing lines as logs/stdout/, so it must be purged too.
+    if LAUNCHD_LOG_DIR.exists():
+        shutil.rmtree(LAUNCHD_LOG_DIR)
+        removed.append(str(LAUNCHD_LOG_DIR))
+
+    if removed:
+        print("Removed:")
+        for path in removed:
+            print(f"  {path}")
+    else:
+        print("Nothing to remove.")
+
+
+class _RunGate:
+    """Serializes runs of `run_fn` triggered by the filesystem watcher and the
+    poll-fallback timer, since state._save() is a non-atomic write with no
+    locking of its own — concurrent runs could corrupt state.json or double
+    up a calendar event.
+
+    `blocking()` waits for the lock (used by the watcher, which should never
+    silently drop a detected change). `skip_if_busy()` does not block: if a
+    run is already in progress, the tick is skipped entirely rather than
+    queued, since the next scheduled tick will pick up any new messages.
+    """
+
+    def __init__(self, run_fn):
+        self._run_fn = run_fn
+        self._lock = threading.Lock()
+
+    def blocking(self) -> None:
+        with self._lock:
+            self._run_fn()
+
+    def skip_if_busy(self) -> None:
+        if not self._lock.acquire(blocking=False):
+            logger.info("Poll fallback skipping tick; a run is already in progress")
+            return
+        try:
+            self._run_fn()
+        finally:
+            self._lock.release()
+
+
+class _PollTimer:
+    """Repeating backstop timer that re-runs `callback` every
+    `interval_minutes`, independent of the filesystem watcher, in case a
+    chat.db change event is ever missed."""
+
+    def __init__(self, callback, interval_minutes: float):
+        self._callback = callback
+        self._interval = interval_minutes * 60
+        self._timer: threading.Timer | None = None
+
+    def start(self) -> None:
+        self._schedule()
+
+    def stop(self) -> None:
+        if self._timer is not None:
+            self._timer.cancel()
+
+    def _schedule(self) -> None:
+        self._timer = threading.Timer(self._interval, self._fire)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def _fire(self) -> None:
+        try:
+            self._callback()
+        except Exception:
+            logger.exception("Error in poll-fallback callback")
+        finally:
+            self._schedule()
+
+
 def main() -> None:
+    parser = argparse.ArgumentParser(prog="scheduling-agent")
+    parser.add_argument(
+        "--purge", action="store_true",
+        help="Delete local state and logs (~/.scheduling-agent/state.json and ./logs), then exit.",
+    )
+    args = parser.parse_args()
+
+    if args.purge:
+        purge()
+        return
+
     setup_logging()
     cfg = config.load()
     logger.info("Scheduling agent starting (calendar=%s)", cfg["target_calendar"])
@@ -316,16 +425,25 @@ def main() -> None:
     recover_journal(cfg)
     process_new_messages(cfg)
 
-    # Then watch for future changes
-    def on_change():
+    def run() -> None:
         cfg_fresh = config.load()
         process_new_messages(cfg_fresh)
 
-    observer = watcher.watch(on_change, debounce_seconds=5.0)
+    gate = _RunGate(run)
+    observer = watcher.watch(gate.blocking, debounce_seconds=5.0)
+
+    poll_timer = None
+    poll_interval = cfg.get("poll_interval_minutes") or 0
+    if poll_interval > 0:
+        poll_timer = _PollTimer(gate.skip_if_busy, poll_interval)
+        poll_timer.start()
+        logger.info("Poll fallback active every %s minute(s)", poll_interval)
 
     def shutdown(sig, frame):
         logger.info("Shutting down...")
         observer.stop()
+        if poll_timer is not None:
+            poll_timer.stop()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, shutdown)
