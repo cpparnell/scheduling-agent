@@ -225,6 +225,42 @@ def test_title_window_match_far_date_routes_to_adjudicator(fake_dedup_anthropic)
     assert decision.source == "llm"
 
 
+def test_adjudication_source_labels_the_layer_that_proposed_the_candidate(
+    fake_dedup_anthropic, caplog
+):
+    """The logged `source` must name the layer the candidate came from, so a
+    wrong merge can be traced to the layer that proposed it. A single-candidate
+    title-window match is "far_exact", not the default "near"."""
+    fake_dedup_anthropic(
+        [{"is_duplicate": True, "duplicate_of": 0, "relationship": "duplicate", "reasoning": "same"}]
+    )
+    state.record_event(1, "2099-01-01", "19:00", "Munch at Sinha", status="confirmed", confidence=0.9)
+
+    with caplog.at_level("INFO", logger="scheduling_agent.dedup"):
+        reconcile.reconcile(
+            _event(date="2099-01-15", title="Munch at Sinha", time_start="20:00"), _cfg()
+        )
+
+    line = next(r.message for r in caplog.records if "dedup_adjudication" in r.message)
+    assert '"source": "far_exact"' in line
+
+
+def test_adjudication_source_near_for_same_window_candidates(fake_dedup_anthropic, caplog):
+    fake_dedup_anthropic(
+        [{"is_duplicate": False, "duplicate_of": None, "relationship": "duplicate", "reasoning": "no"}]
+    )
+    # Different title (no title-window/fuzzy match) but a nearby date, so the
+    # candidate comes from the near layer.
+    state.record_event(1, "2099-01-15", "19:00", "Totally unrelated errand",
+                       status="confirmed", confidence=0.9)
+
+    with caplog.at_level("INFO", logger="scheduling_agent.dedup"):
+        reconcile.reconcile(_event(), _cfg())
+
+    line = next(r.message for r in caplog.records if "dedup_adjudication" in r.message)
+    assert '"source": "near"' in line
+
+
 def test_title_window_match_far_date_dedup_disabled_skips_conservatively():
     state.record_event(1, "2099-01-01", "19:00", "Munch at Sinha", status="confirmed", confidence=0.9)
 
@@ -518,3 +554,70 @@ def test_far_layer_skipped_when_near_candidates_exist(fake_dedup_anthropic):
     prompt = client.messages.calls[0]["messages"][0]["content"]
     assert "Sam bday dinner" in prompt
     assert "2099-03-20" not in prompt
+
+
+# --- Decision.relationship contract -------------------------------------------
+#
+# The field was declared and never assigned anywhere in the module. It is now
+# populated on every _disposition path, and deliberately left None on paths
+# where no relationship was ever adjudicated (an unmatched create, a failed
+# adjudicator) so "None" reads as "not adjudicated", not "duplicate".
+
+
+def test_relationship_is_set_on_an_exact_match_update():
+    state.record_event(1, "2099-01-15", "19:00", "Dinner with Sam",
+                       status="tentative", confidence=0.9)
+
+    decision = reconcile.reconcile(_event(status="confirmed"), _cfg())
+
+    assert decision.action == "update"
+    assert decision.relationship == "duplicate"
+
+
+def test_relationship_is_set_on_a_skip_duplicate():
+    state.record_event(1, "2099-01-15", "19:00", "Dinner with Sam",
+                       status="confirmed", confidence=0.9)
+
+    decision = reconcile.reconcile(_event(), _cfg())
+
+    assert decision.action == "skip_duplicate"
+    assert decision.relationship == "duplicate"
+
+
+def test_relationship_carries_the_adjudicator_verdict(fake_dedup_anthropic):
+    fake_dedup_anthropic([{
+        "is_duplicate": True, "duplicate_of": 0, "relationship": "reschedule",
+        "confidence": 0.9, "reasoning": "moved",
+    }])
+    state.record_event(1, "2099-01-01", "19:00", "Munch at Sinha",
+                       status="confirmed", confidence=0.9)
+
+    decision = reconcile.reconcile(
+        _event(date="2099-01-15", title="Munch at Sinha", time_start="20:00"), _cfg()
+    )
+
+    assert decision.relationship == "reschedule"
+
+
+def test_new_occurrence_verdict_creates_and_records_the_relationship(fake_dedup_anthropic):
+    fake_dedup_anthropic([{
+        "is_duplicate": True, "duplicate_of": 0, "relationship": "new_occurrence",
+        "confidence": 0.9, "reasoning": "next month's",
+    }])
+    state.record_event(1, "2099-01-01", "19:00", "Book Club",
+                       status="confirmed", confidence=0.9)
+
+    decision = reconcile.reconcile(
+        _event(date="2099-01-15", title="Book Club", time_start="19:00"), _cfg()
+    )
+
+    assert decision.action == "create"
+    assert decision.relationship == "new_occurrence"
+
+
+def test_unmatched_create_has_no_relationship():
+    # Nothing to relate to — None means "not adjudicated", not "duplicate".
+    decision = reconcile.reconcile(_event(), _cfg())
+
+    assert decision.action == "create"
+    assert decision.relationship is None

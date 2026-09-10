@@ -47,6 +47,19 @@ class UsageRecord:
 
 _records: list[UsageRecord] = []
 
+# Calls that raised instead of returning usage. Tracked alongside successes so
+# a consumer can tell "the model answered badly" apart from "the call never
+# happened" — an eval run whose API calls all fail otherwise reports a low
+# accuracy number that reads exactly like a catastrophic regression. Observed:
+# a run that made zero successful calls (exhausted credit balance) still
+# printed "28% accuracy, 0% false-positive rate".
+_failures: list[str] = []
+
+
+def record_failure(reason: str = "") -> None:
+    """Record one API call that failed outright (exception, empty response)."""
+    _failures.append(reason)
+
 
 def record(model: str, usage) -> UsageRecord:
     """Record one API call's usage. `usage` is the `.usage` object off an
@@ -89,6 +102,7 @@ def reset() -> None:
     """Clear all recorded usage. Call at the start of an eval run so the
     resulting totals cover only that run."""
     _records.clear()
+    _failures.clear()
 
 
 def get_records() -> list[UsageRecord]:
@@ -126,8 +140,12 @@ def summary() -> dict:
     for m in by_model.values():
         m["cost_usd"] = round(m["cost_usd"], 6)
 
+    failed = len(_failures)
+    attempted = len(_records) + failed
     return {
         "total_calls": len(_records),
+        "failed_calls": failed,
+        "call_failure_rate": round(failed / attempted, 4) if attempted else 0.0,
         "unpriced_calls": unpriced_calls,
         "total_input_tokens": total_in,
         "total_output_tokens": total_out,

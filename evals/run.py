@@ -12,6 +12,9 @@ Usage:
     python -m evals.run --model claude-sonnet-4-6
     python -m evals.run --judge                  # + LLM title-quality score
     python -m evals.run -k dinner                # only cases whose id contains 'dinner'
+    python -m evals.run --repeat 3               # 3 runs + always_failed/flaky split
+    python -m evals.run --diff RUN_A RUN_B       # failure-set diff of two finished runs
+    python -m evals.run --run-budget-minutes 30  # bound each run's wall clock
 """
 
 import argparse
@@ -22,6 +25,8 @@ import tempfile
 from collections import defaultdict
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
+
+from time import monotonic  # `time` itself is datetime.time here
 
 from evals import loader
 from scheduling_agent import config, dedup, detector, usage_tracker
@@ -226,7 +231,8 @@ def score_case(case: dict, model: str, today: date | None = None) -> dict:
 
 
 def score_dedup_pairs(
-    cases: list[dict], results_by_id: dict, model: str, day_window: int = 1
+    cases: list[dict], results_by_id: dict, model: str, day_window: int = 1,
+    deadline: "Deadline | None" = None,
 ) -> list[dict]:
     """For golden cases annotated with dedup_with/dedup_verdict, treat the
     referenced case's detected event as an "existing calendar event" and run
@@ -236,22 +242,43 @@ def score_dedup_pairs(
     ``day_window`` is threaded through to ``dedup.find_candidates`` so a wider
     (or narrower) candidate window than production's default can be exercised
     without duplicating this function — used by dedup pairs whose two halves
-    are deliberately more than a day apart (e.g. a reschedule mention)."""
+    are deliberately more than a day apart (e.g. a reschedule mention).
+
+    Every result carries a pair-aware ``known_failure``: a dedup pair is
+    aspirational if EITHER half is flagged, since a flagged detection on the
+    reference side makes the pair's verdict meaningless. Stamping it here (the
+    only place with access to `cases`) is what lets `summarize` and
+    `test_evals` gate on it without re-deriving the pairing."""
+    cases_by_id = {c["id"]: c for c in cases}
+
+    def _pair_known_failure(case: dict, ref_id: str) -> bool:
+        ref = cases_by_id.get(ref_id, {})
+        return bool(case.get("known_failure") or ref.get("known_failure"))
+
     dedup_results = []
 
-    for case in cases:
-        if "dedup_with" not in case:
-            continue
+    pair_cases = [c for c in cases if "dedup_with" in c]
+    for i, case in enumerate(pair_cases):
+        if deadline is not None and deadline.expired():
+            deadline.skip(len(pair_cases) - i)
+            print(f"  !! run budget exceeded — skipping {len(pair_cases) - i} dedup pair(s)")
+            break
 
         ref_id = case["dedup_with"]
         expected_verdict = case["dedup_verdict"]
+        known_failure = _pair_known_failure(case, ref_id)
+        # A truncated detector phase (budget exceeded, or a -k filter that
+        # caught one half of a pair) leaves an id unscored — skip the pair
+        # rather than KeyError. The run is already being marked invalid.
+        if case["id"] not in results_by_id or ref_id not in results_by_id:
+            continue
         b_events = results_by_id[case["id"]]["events"]
         a_events = results_by_id[ref_id]["events"]
 
         if not a_events or not b_events:
             dedup_results.append({
                 "id": case["id"], "dedup_with": ref_id, "expected_verdict": expected_verdict,
-                "got_verdict": None, "passed": False,
+                "got_verdict": None, "passed": False, "known_failure": known_failure,
                 "note": "missing detection on one side of the pair",
             })
             continue
@@ -282,6 +309,7 @@ def score_dedup_pairs(
             "called_llm": called_llm,
             "reasoning": reasoning,
             "passed": got_verdict == expected_verdict,
+            "known_failure": known_failure,
         })
 
     return dedup_results
@@ -427,11 +455,19 @@ def score_pipeline_case(
 
 
 def run(
-    cases: list[dict], model: str = detector.MODEL, judge: bool = False, today: date | None = None
+    cases: list[dict], model: str = detector.MODEL, judge: bool = False,
+    today: date | None = None, deadline: "Deadline | None" = None,
 ) -> list[dict]:
     today, now = _eval_clock(today)
     cases = [c for c in cases if "polls" not in c]  # pipeline cases score separately
-    results = [score_case(c, model, today=today) for c in cases]
+    results = []
+    for i, case in enumerate(cases):
+        if deadline is not None and deadline.expired():
+            deadline.skip(len(cases) - i)
+            print(f"  !! run budget exceeded — skipping {len(cases) - i} detector case(s)")
+            break
+        results.append(score_case(case, model, today=today))
+    cases = cases[:len(results)]  # keep judge's zip() aligned with what ran
     if judge:
         from evals import judge as judge_mod
         for result, case in zip(results, cases):
@@ -442,10 +478,19 @@ def run(
 
 
 def run_pipeline(
-    cases: list[dict], model: str, dedup_model: str, today: date | None = None
+    cases: list[dict], model: str, dedup_model: str, today: date | None = None,
+    deadline: "Deadline | None" = None,
 ) -> list[dict]:
     today, _ = _eval_clock(today)
-    return [score_pipeline_case(c, model, dedup_model, today=today) for c in cases if "polls" in c]
+    poll_cases = [c for c in cases if "polls" in c]
+    results = []
+    for i, case in enumerate(poll_cases):
+        if deadline is not None and deadline.expired():
+            deadline.skip(len(poll_cases) - i)
+            print(f"  !! run budget exceeded — skipping {len(poll_cases) - i} pipeline case(s)")
+            break
+        results.append(score_pipeline_case(case, model, dedup_model, today=today))
+    return results
 
 
 def summarize(
@@ -488,20 +533,30 @@ def summarize(
         "bystander_leaks": [r["id"] for r in bystanders if r["predicted_has_event"]],
     }
 
+    # Pipeline and dedup accuracy gate on known_failure exactly the way detector
+    # `accuracy` does above: an aspirational case tracking an unimplemented fix
+    # must not drag the headline number down. The ungated `*_failed_all` lists
+    # stay alongside so --diff can still see a known-failure case flip.
     if pipeline_results is not None:
+        pipeline_gated = [r for r in pipeline_results if not r.get("known_failure")]
         summary["pipeline_accuracy"] = (
-            sum(r["passed"] for r in pipeline_results) / len(pipeline_results)
-            if pipeline_results else 0.0
+            sum(r["passed"] for r in pipeline_gated) / len(pipeline_gated)
+            if pipeline_gated else 0.0
         )
-        summary["pipeline_failed"] = [r["id"] for r in pipeline_results if not r["passed"]]
+        summary["n_pipeline_gated"] = len(pipeline_gated)
+        summary["pipeline_failed"] = [r["id"] for r in pipeline_gated if not r["passed"]]
+        summary["pipeline_failed_all"] = [r["id"] for r in pipeline_results if not r["passed"]]
 
     if dedup_results is not None:
+        dedup_gated = [r for r in dedup_results if not r.get("known_failure")]
         summary["dedup_accuracy"] = (
-            sum(r["passed"] for r in dedup_results) / len(dedup_results) if dedup_results else 0.0
+            sum(r["passed"] for r in dedup_gated) / len(dedup_gated) if dedup_gated else 0.0
         )
+        summary["n_dedup_gated"] = len(dedup_gated)
         summary["dedup_same_missed"] = [
-            r["id"] for r in dedup_results if r["expected_verdict"] == "same" and not r["passed"]
+            r["id"] for r in dedup_gated if r["expected_verdict"] == "same" and not r["passed"]
         ]
+        summary["dedup_failed_all"] = [r["id"] for r in dedup_results if not r["passed"]]
 
     return summary
 
@@ -519,6 +574,83 @@ def cost_summary(n_cases: int) -> dict:
         round(summary["total_cost_usd"] / n_cases, 6) if n_cases else None
     )
     return summary
+
+
+# A run whose API calls mostly failed measured nothing. Above this share of
+# failed calls the numbers are an artifact of the outage, not of the model, and
+# must not be compared against anything.
+MAX_TOLERABLE_CALL_FAILURE_RATE = 0.10
+
+# Wall-clock ceiling for ONE full pass of the suite. dedup.REQUEST_TIMEOUT_SECONDS
+# bounds a single request, but not a run: the SDK retries each call twice by
+# default, so one bad call can burn 3x that, and ~200 calls have no collective
+# bound at all. Observed: a run sat at 0.2s of CPU per 90s of wall clock for
+# 1.5 hours against a degraded API — every individual request was "fine", the
+# run as a whole was not. A run that blows this budget is marked invalid rather
+# than left to hang, which is the same treatment an outage already gets.
+DEFAULT_RUN_BUDGET_MINUTES = 60
+
+
+class Deadline:
+    """Wall-clock budget for one pass of the suite, polled between cases.
+
+    Checked at case boundaries rather than enforced mid-request: a case in
+    flight is allowed to finish, so results are never half-written. `minutes=0`
+    (or None) disables the budget entirely."""
+
+    def __init__(self, minutes: float | None = DEFAULT_RUN_BUDGET_MINUTES):
+        self.limit_seconds = minutes * 60 if minutes else None
+        self.started = monotonic()
+        self.skipped = 0
+
+    @property
+    def elapsed(self) -> float:
+        return monotonic() - self.started
+
+    def expired(self) -> bool:
+        return self.limit_seconds is not None and self.elapsed > self.limit_seconds
+
+    def skip(self, n: int = 1) -> None:
+        self.skipped += n
+
+    @staticmethod
+    def _fmt(seconds: float) -> str:
+        # Sub-minute budgets are used in tests and quick checks; rounding them
+        # to "0 min" makes the message useless.
+        return f"{seconds:.0f}s" if seconds < 60 else f"{seconds / 60:.1f} min"
+
+    def reason(self) -> str:
+        return (
+            f"wall-clock budget exceeded ({self._fmt(self.elapsed)} > "
+            f"{self._fmt(self.limit_seconds)}); {self.skipped} case(s) not run"
+        )
+
+
+def run_validity(cost: dict, deadline: "Deadline | None" = None) -> dict:
+    """Whether a finished run's numbers mean anything.
+
+    Motivating incident: a `--repeat 3` run exhausted the account's credit
+    balance partway through. Its third run made ZERO successful API calls, so
+    every case reported "expected an event, none produced" — and the harness
+    printed "28% accuracy, 0% false-positive rate" as though that were a
+    measurement. Read as a diff against the previous run it looks exactly like
+    a catastrophic regression, which is the most expensive way to be wrong."""
+    total = cost.get("total_calls", 0)
+    failed = cost.get("failed_calls", 0)
+    rate = cost.get("call_failure_rate", 0.0)
+
+    # A truncated run scored only part of the suite; its "failures" are just
+    # the cases that never ran.
+    if deadline is not None and deadline.expired():
+        return {"valid": False, "reason": deadline.reason()}
+    if total == 0:
+        return {"valid": False, "reason":
+                f"no API call succeeded ({failed} failed) — the suite never reached the model"}
+    if rate > MAX_TOLERABLE_CALL_FAILURE_RATE:
+        return {"valid": False, "reason":
+                f"{failed} of {total + failed} API calls failed ({rate:.0%}) — "
+                "results reflect the outage, not the model"}
+    return {"valid": True, "reason": None}
 
 
 def print_cost_summary(cost: dict) -> None:
@@ -578,13 +710,22 @@ def print_report(
         print(f"\n=== Pipeline eval (multi-poll, real reconcile) ===")
         for r in pipeline_results:
             status = "PASS" if r["passed"] else "FAIL"
-            line = f"  [{status}] {r['id']}  creates={r['creates']} updates={r['updates']}"
+            flag = " (known-fail)" if r.get("known_failure") else ""
+            line = f"  [{status}] {r['id']}{flag}  creates={r['creates']} updates={r['updates']}"
             if r["failures"]:
                 line += "  — " + "; ".join(r["failures"])
             print(line)
-        print(f"\n  pipeline accuracy:            {summary['pipeline_accuracy']:.0%}")
+        print(
+            f"\n  pipeline accuracy (excl. known-fail): {summary['pipeline_accuracy']:.0%} "
+            f"({summary['n_pipeline_gated'] - len(summary['pipeline_failed'])}/"
+            f"{summary['n_pipeline_gated']})"
+        )
     if dedup_results is not None:
-        print(f"\n  dedup accuracy:               {summary['dedup_accuracy']:.0%}")
+        print(
+            f"\n  dedup accuracy (excl. known-fail):    {summary['dedup_accuracy']:.0%} "
+            f"({summary['n_dedup_gated'] - len([r for r in dedup_results if not r.get('known_failure') and not r['passed']])}/"
+            f"{summary['n_dedup_gated']})"
+        )
         if summary["dedup_same_missed"]:
             print(f"  dedup 'same' missed:          {', '.join(summary['dedup_same_missed'])}")
 
@@ -606,6 +747,174 @@ def write_report(
         report["cost"] = cost
     path.write_text(json.dumps(report, indent=2))
     return path
+
+
+SUITES = ("detector", "pipeline", "dedup")
+
+
+def load_report(path: Path) -> dict:
+    """Load a run's report.json. Accepts either the run directory or the
+    report.json path itself, so `--diff` can take the paths printed by a run."""
+    path = Path(path)
+    if path.is_dir():
+        path = path / "report.json"
+    return json.loads(path.read_text())
+
+
+def failure_sets(report: dict) -> dict[str, set[str]]:
+    """Per-suite sets of failing case ids, INCLUDING known failures — a diff
+    must be able to show a known-failure case flipping to passing, which is the
+    whole point of the flag-hygiene rule.
+
+    Tolerant of pre-PR1 reports, which have no `*_failed_all` summary keys: the
+    per-case result lists are authoritative when present, and the older summary
+    keys are the fallback."""
+    summary = report.get("summary", {})
+    out: dict[str, set[str]] = {
+        "detector": {r["id"] for r in report.get("results", []) if not r["passed"]},
+    }
+    if "pipeline_results" in report:
+        out["pipeline"] = {r["id"] for r in report["pipeline_results"] if not r["passed"]}
+    else:
+        out["pipeline"] = set(
+            summary.get("pipeline_failed_all") or summary.get("pipeline_failed") or []
+        )
+    if "dedup_results" in report:
+        out["dedup"] = {r["id"] for r in report["dedup_results"] if not r["passed"]}
+    else:
+        out["dedup"] = set(
+            summary.get("dedup_failed_all") or summary.get("dedup_same_missed") or []
+        )
+    return out
+
+
+def known_failure_ids(report: dict) -> set[str]:
+    """Every case id flagged known_failure anywhere in a report. Pre-PR1 dedup
+    results carry no flag, so the summary's `known_failures` list backfills."""
+    ids = {r["id"] for r in report.get("results", []) if r.get("known_failure")}
+    for key in ("pipeline_results", "dedup_results"):
+        ids |= {r["id"] for r in report.get(key, []) if r.get("known_failure")}
+    ids |= set(report.get("summary", {}).get("known_failures") or [])
+    return ids
+
+
+def aggregate_repeats(reports: list[dict]) -> dict:
+    """Split N runs' failures into `always_failed` (the intersection — real
+    defects) and `flaky` (union minus intersection — sampling variance). This
+    is the yardstick the whole v0.10 plan is judged against; per
+    plans/v0.10, compare failure SETS across runs, never single-run accuracy."""
+    # Runs that never reached the model measured nothing — folding them in
+    # would put every case into `always_failed` and read as total collapse.
+    invalid = [i for i, r in enumerate(reports, 1)
+               if r.get("summary", {}).get("run_valid") is False]
+    valid_reports = [r for r in reports
+                     if r.get("summary", {}).get("run_valid") is not False]
+
+    per_run = [failure_sets(r) for r in valid_reports]
+    out: dict = {
+        "n_runs": len(valid_reports),
+        "n_invalid_runs": len(invalid),
+        "invalid_runs": invalid,
+        "suites": {},
+    }
+    if not per_run:
+        out["suites"] = {s: {"always_failed": [], "flaky": [], "per_run": []} for s in SUITES}
+        out["always_failed"] = []
+        out["flaky"] = []
+        return out
+
+    for suite in SUITES:
+        sets = [fs[suite] for fs in per_run]
+        inter = set.intersection(*sets) if sets else set()
+        union = set().union(*sets) if sets else set()
+        out["suites"][suite] = {
+            "always_failed": sorted(inter),
+            "flaky": sorted(union - inter),
+            "per_run": [sorted(s) for s in sets],
+        }
+
+    overall = [set().union(*[fs[s] for s in SUITES]) for fs in per_run]
+    inter = set.intersection(*overall) if overall else set()
+    union = set().union(*overall) if overall else set()
+    out["always_failed"] = sorted(inter)
+    out["flaky"] = sorted(union - inter)
+    return out
+
+
+def print_repeat_summary(agg: dict) -> None:
+    print(f"\n=== Repeat summary ({agg['n_runs']} valid runs) ===")
+    if agg.get("n_invalid_runs"):
+        print(
+            f"  *** {agg['n_invalid_runs']} run(s) EXCLUDED as invalid "
+            f"(run{', run'.join(str(i) for i in agg['invalid_runs'])}) — API calls failed; "
+            "their numbers measured nothing."
+        )
+        if not agg["n_runs"]:
+            print("  No valid runs — nothing was measured. Fix API access and re-run.")
+            return
+    for suite in SUITES:
+        s = agg["suites"][suite]
+        print(f"  {suite}:")
+        print(f"    always failed: {', '.join(s['always_failed']) or '(none)'}")
+        print(f"    flaky:         {', '.join(s['flaky']) or '(none)'}")
+    print(f"\n  ALWAYS FAILED (all suites): {', '.join(agg['always_failed']) or '(none)'}")
+    print(f"  FLAKY (all suites):        {', '.join(agg['flaky']) or '(none)'}")
+
+
+def diff_reports(report_a: dict, report_b: dict) -> dict:
+    """Failure-set diff B against A (A = before, B = after). `newly_failing`
+    entries that are NOT flagged known_failure in B are regressions and make
+    the CLI exit nonzero."""
+    for label, report in (("A", report_a), ("B", report_b)):
+        if report.get("summary", {}).get("run_valid") is False:
+            return {
+                "suites": {s: {"newly_failing": [], "newly_passing": [], "still_failing": []}
+                           for s in SUITES},
+                "regressions": [],
+                "invalid": (
+                    f"run {label} is an INVALID run "
+                    f"({report['summary'].get('invalid_reason')}) — nothing to compare"
+                ),
+            }
+
+    fa, fb = failure_sets(report_a), failure_sets(report_b)
+    known_b = known_failure_ids(report_b)
+    out: dict = {"suites": {}, "regressions": []}
+    regressions: set[str] = set()
+    for suite in SUITES:
+        newly_failing = sorted(fb[suite] - fa[suite])
+        out["suites"][suite] = {
+            "newly_failing": newly_failing,
+            "newly_passing": sorted(fa[suite] - fb[suite]),
+            "still_failing": sorted(fa[suite] & fb[suite]),
+        }
+        # A case can fail in two suites at once (a detector miss also sinks its
+        # dedup pair) — count it as one regression, not two.
+        regressions |= {i for i in newly_failing if i not in known_b}
+    out["regressions"] = sorted(regressions)
+    return out
+
+
+def print_diff(diff: dict, label_a: str, label_b: str) -> None:
+    print(f"\n=== Failure-set diff ===\n  A (before): {label_a}\n  B (after):  {label_b}")
+    if diff.get("invalid"):
+        print(f"\n  *** CANNOT DIFF — {diff['invalid']}.")
+        return
+    for suite in SUITES:
+        s = diff["suites"][suite]
+        if not any(s.values()):
+            continue
+        print(f"\n  {suite}:")
+        if s["newly_failing"]:
+            print(f"    NEWLY FAILING: {', '.join(s['newly_failing'])}")
+        if s["newly_passing"]:
+            print(f"    newly passing: {', '.join(s['newly_passing'])}")
+        if s["still_failing"]:
+            print(f"    still failing: {', '.join(s['still_failing'])}")
+    if diff["regressions"]:
+        print(f"\n  REGRESSIONS (newly failing, not known_failure): {', '.join(diff['regressions'])}")
+    else:
+        print("\n  No regressions (no newly-failing unflagged cases).")
 
 
 class _Tee:
@@ -632,10 +941,58 @@ class _Tee:
         self._log_file.flush()
 
 
+def execute_run(args, cases: list[dict], eval_today: date, run_dir: Path) -> dict:
+    """One full pass of every phase, written to `run_dir`. Returns the report
+    dict (also persisted as run_dir/report.json)."""
+    deadline = Deadline(getattr(args, "run_budget_minutes", DEFAULT_RUN_BUDGET_MINUTES))
+    run_dir.mkdir(parents=True, exist_ok=True)
+    stdout_path = run_dir / "stdout.log"
+
+    usage_tracker.reset()  # so the run's cost totals don't include prior calls
+    with stdout_path.open("w") as log_file, _Tee(log_file):
+        print(f"  eval clock pinned to: {eval_today.isoformat()} ({eval_today.strftime('%A')})")
+        results = run(cases, model=args.model, judge=args.judge, today=eval_today,
+                      deadline=deadline)
+        results_by_id = {r["id"]: r for r in results}
+        dedup_results = score_dedup_pairs(
+            cases, results_by_id, model=args.dedup_model, day_window=args.dedup_day_window,
+            deadline=deadline,
+        )
+        pipeline_results = run_pipeline(
+            cases, model=args.model, dedup_model=args.dedup_model, today=eval_today,
+            deadline=deadline,
+        )
+        summary = summarize(results, dedup_results, pipeline_results)
+        summary["eval_today"] = eval_today.isoformat()
+        print_report(results, summary, args.model, dedup_results, pipeline_results)
+        cost = cost_summary(len(cases))
+        print_cost_summary(cost)
+        validity = run_validity(cost, deadline)
+        summary["elapsed_minutes"] = round(deadline.elapsed / 60, 2)
+        summary["run_valid"] = validity["valid"]
+        summary["invalid_reason"] = validity["reason"]
+        if not validity["valid"]:
+            print(
+                f"\n  *** INVALID RUN — {validity['reason']}.\n"
+                "      Accuracy figures above are meaningless; do not diff or "
+                "unflag against this run. Fix the API access and re-run."
+            )
+        path = write_report(
+            results, summary, args.model, run_dir, dedup_results, pipeline_results, cost
+        )
+        print(f"\n  report: {path}")
+        print(f"  stdout log: {stdout_path}")
+
+    return {
+        "model": args.model, "summary": summary, "results": results,
+        "dedup_results": dedup_results, "pipeline_results": pipeline_results, "cost": cost,
+    }
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Run the detector eval suite.")
     ap.add_argument("--model", default=detector.MODEL)
-    ap.add_argument("--dedup-model", default="claude-haiku-4-5")
+    ap.add_argument("--dedup-model", default=config.DEFAULTS["dedup_model"])
     ap.add_argument(
         "--dedup-day-window", type=int, default=config.DEFAULTS["dedup_candidate_day_window"],
         help="candidate window (days) for dedup-pair scoring; matches production's "
@@ -649,7 +1006,36 @@ def main() -> None:
         help="pin the eval clock to this ISO date (YYYY-MM-DD) instead of the "
              "default next-Wednesday-from-now; same effect as EVAL_TODAY"
     )
+    ap.add_argument(
+        "--repeat", type=int, default=1, metavar="N",
+        help="run the whole suite N times and write a repeat_summary.json splitting "
+             "failures into always_failed (real defects) vs flaky (sampling variance). "
+             "N=3 is the plan's baseline protocol — a 2-run baseline misclassifies "
+             "1-in-3 flaky cases too often to trust for flag hygiene.",
+    )
+    ap.add_argument(
+        "--run-budget-minutes", type=float, default=DEFAULT_RUN_BUDGET_MINUTES,
+        metavar="N",
+        help=f"wall-clock ceiling for ONE pass of the suite (default {DEFAULT_RUN_BUDGET_MINUTES}; "
+             "0 disables). A run that exceeds it stops at the next case boundary and is "
+             "marked invalid, so a degraded API fails in bounded time instead of hanging.",
+    )
+    ap.add_argument(
+        "--diff", nargs=2, metavar=("RUN_A", "RUN_B"), default=None,
+        help="compare two finished runs (dir or report.json each) instead of running "
+             "the suite; exits nonzero if B has newly-failing cases not flagged "
+             "known_failure",
+    )
     args = ap.parse_args()
+
+    if args.diff:
+        report_a, report_b = load_report(args.diff[0]), load_report(args.diff[1])
+        diff = diff_reports(report_a, report_b)
+        print_diff(diff, args.diff[0], args.diff[1])
+        sys.exit(1 if diff["regressions"] else 0)
+
+    if args.repeat < 1:
+        ap.error("--repeat must be >= 1")
 
     eval_today, _ = _eval_clock(date.fromisoformat(args.today) if args.today else None)
 
@@ -661,31 +1047,36 @@ def main() -> None:
         return
 
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    run_dir = REPORTS_DIR / f"{ts}_{args.model.replace('/', '_')}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    stdout_path = run_dir / "stdout.log"
+    base_dir = REPORTS_DIR / f"{ts}_{args.model.replace('/', '_')}"
 
-    usage_tracker.reset()  # so the run's cost totals don't include prior calls
-    with stdout_path.open("w") as log_file, _Tee(log_file):
-        print(f"  eval clock pinned to: {eval_today.isoformat()} ({eval_today.strftime('%A')})")
-        results = run(cases, model=args.model, judge=args.judge, today=eval_today)
-        results_by_id = {r["id"]: r for r in results}
-        dedup_results = score_dedup_pairs(
-            cases, results_by_id, model=args.dedup_model, day_window=args.dedup_day_window
-        )
-        pipeline_results = run_pipeline(
-            cases, model=args.model, dedup_model=args.dedup_model, today=eval_today
-        )
-        summary = summarize(results, dedup_results, pipeline_results)
-        summary["eval_today"] = eval_today.isoformat()
-        print_report(results, summary, args.model, dedup_results, pipeline_results)
-        cost = cost_summary(len(cases))
-        print_cost_summary(cost)
-        path = write_report(
-            results, summary, args.model, run_dir, dedup_results, pipeline_results, cost
-        )
-        print(f"\n  report: {path}")
-        print(f"  stdout log: {stdout_path}")
+    if args.repeat == 1:
+        execute_run(args, cases, eval_today, base_dir)
+        return
+
+    reports = []
+    for i in range(1, args.repeat + 1):
+        print(f"\n########## repeat {i}/{args.repeat} ##########")
+        report = execute_run(args, cases, eval_today, base_dir / f"run{i}")
+        reports.append(report)
+        # An invalid run means the API is down, out of credit, or degraded —
+        # none of which the next repeat will fix. Stop rather than spend the
+        # remaining runs' time and money producing more unusable reports.
+        if report["summary"].get("run_valid") is False and i < args.repeat:
+            print(
+                f"\n  *** Aborting after repeat {i}/{args.repeat}: "
+                f"{report['summary'].get('invalid_reason')}.\n"
+                "      Remaining repeats skipped — fix the API access and re-run."
+            )
+            break
+
+    agg = aggregate_repeats(reports)
+    agg["run_dirs"] = [str(base_dir / f"run{i}") for i in range(1, args.repeat + 1)]
+    agg["total_cost_usd"] = round(sum(r["cost"]["cost_per_run_usd"] for r in reports), 6)
+    print_repeat_summary(agg)
+    print(f"\n  total cost across {args.repeat} runs: ${agg['total_cost_usd']:.4f}")
+    summary_path = base_dir / "repeat_summary.json"
+    summary_path.write_text(json.dumps(agg, indent=2))
+    print(f"  repeat summary: {summary_path}")
 
 
 if __name__ == "__main__":

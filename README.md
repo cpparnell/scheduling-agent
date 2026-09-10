@@ -1,6 +1,6 @@
 # scheduling-agent
 
-An iMessage-to-Calendar scheduling agent for macOS. It watches your iMessage database (`~/Library/Messages/chat.db`) for new messages, uses Claude Haiku to detect plans (an explicit invite, plus a specific date), and automatically creates Apple Calendar events — no confirmation step.
+An iMessage-to-Calendar scheduling agent for macOS. It watches your iMessage database (`~/Library/Messages/chat.db`) for new messages, uses Claude Haiku to detect plans (an explicit invite, plus a specific date), and automatically creates Apple Calendar events — no confirmation step. Deduplication is adjudicated by a stronger model (Sonnet 4.6) because that judgement is harder and far rarer than detection.
 
 ## How it works
 
@@ -77,6 +77,23 @@ same-chat-only now also considers a different chat's records, at a stricter titl
 bar (`far_title_similarity_cross_chat`) than the same-chat one, so a plan set in a group chat
 and rescheduled in a 1:1 is still found.
 
+The adjudicator answers the two questions in order — *is this the same plan?*, then *how does
+it relate?* — with a single uncertainty rule for each. Sameness resolves toward `is_duplicate=true`
+(a missed duplicate spams the calendar); the relationship resolves toward `duplicate`, the
+answer that never changes when the event happens. An earlier prompt pulled both ways at once,
+telling the model to prefer `new_occurrence` when unsure about the relationship while also
+preferring "same" when unsure about sameness; that contradiction made borderline verdicts flap
+between runs. The verdict also carries a self-reported `confidence` (0–1). It is
+**observability only and never gates a decision** — the adjudicator's confidences are not calibrated
+well enough to threshold on — but it distinguishes the two failure modes that look identical
+in an eval report: a verdict the model was unsure about, versus one it was confidently wrong
+about. The second kind will not respond to prompt tuning — it means either the adjudicator's
+*input* is missing something, or the model is under-powered for the judgement. Both were
+observed on the same case: a reschedule settled over several polls was refused at 0.92
+confidence by Haiku (whose prompt never contains the "can we push it a week?" message), and
+answered correctly by Sonnet 4.6 from that same input, which is why adjudication runs on the
+stronger model.
+
 **New-vs-context marking.** Every poll replays the last 30 messages per chat (plus older
 date anchors) so the model can see plans that span several messages — but that means a
 thread's plans get *re-analyzed from scratch* on every single new message, "lol" included.
@@ -133,6 +150,15 @@ if the source message contains a negation or change word ("not", "cancelled", "i
 "moved"...) the quoted evidence doesn't — so "dinner Friday, **not** at 7" can't validate a
 fabricated "dinner Friday at 7" quote. Genuine fabrications where no message covers the
 quote are still dropped.
+
+The sender label the guard strips has to match what the prompt actually renders,
+`"{sender} ({%a %m/%d/%Y %I:%M%p}): {text}"` — note the **weekday** before the date. An
+earlier pattern required the parenthesis to be followed immediately by digits, which
+matched `Me`/phone-number senders (handled by a separate branch) but never a contact stored
+as a **name or email address**: the label survived, the verbatim check failed, and a
+correctly detected plan was silently dropped. The pattern now allows anything before the
+date inside the parentheses while still *requiring* a date to be in there, so ordinary
+message text like `"Lunch (with Sam): sounds good"` is never mistaken for a label.
 
 **Group-silence demotion.** In a multi-person thread, another participant accepting a plan
 never confirms it *for the user* — if "Me" never sent a NEW message about the plan (an old
@@ -254,7 +280,7 @@ The config file lives at `~/.scheduling-agent/config.json` and is created with d
 | `confidence_threshold` | `0.85` | Minimum Claude confidence to auto-create an event (confirmed and tentative alike — tentative is a status, not a lower bar) |
 | `time_confidence_threshold` | `0.9` | Minimum confidence in the extracted clock time to keep it; below this the event is created all-day instead |
 | `dedup_enabled` | `true` | Whether the LLM adjudicator runs as reconciliation's last layer |
-| `dedup_model` | `"claude-haiku-4-5"` | Model used for dedup adjudication |
+| `dedup_model` | `"claude-sonnet-4-6"` | Model used for dedup adjudication — a stronger model than the Haiku used for detection, since adjudication is the hard judgement and is rare (~23 of ~196 calls per eval run, so ~11% more cost). Any model is safe to set: adjudications sample at temperature 0, and the parameter is dropped for models that reject it (see *Sampling determinism* below) |
 | `dedup_day_window` | `1` | Hard same-slot cutoff for the deterministic exact/fuzzy layers — no LLM call backs them up, so they stay narrow |
 | `dedup_candidate_day_window` | `7` | How many days on either side of a new plan's date the LLM adjudicator's candidate window covers (wider than `dedup_day_window` since the adjudicator can catch a wrong call) |
 | `reschedule_max_days` | `30` | Ceiling on how far a `reschedule` adjudicator verdict may move a stored event's date in one step |
@@ -270,6 +296,35 @@ The config file lives at `~/.scheduling-agent/config.json` and is created with d
 | `context_marking_enabled` | `true` | Mark replayed context vs. newly-arrived messages in the prompt and instruct the model not to re-emit a plan whose only trace is old context — disable to fall back to the unmarked prompt |
 | `date_resolver_enabled` | `true` | Run a second-pass haiku call to re-check a bare-weekday date with no nearby explicit-date anchor, when the thread has other date-like content that could override the "next occurrence" default |
 | `poll_interval_minutes` | `15` | Backstop poll interval, independent of the filesystem watcher, in case a `chat.db` change event is ever missed. `0` disables it |
+
+**Sampling determinism.** Every LLM call the agent makes — `detect_plans`, the
+second-pass date resolver, and the dedup adjudicator — is sampled at
+temperature 0 via `dedup.sampling_kwargs()`. These are classification calls,
+and default-temperature sampling was a measured source of run-to-run flapping:
+the same borderline duplicate pair could be merged in one run and split in the
+next. Models that reject an explicit `temperature` with a 400 (the Claude 5
+family, Opus 4.7/4.8) are listed in `dedup._NO_TEMPERATURE_PREFIXES` and have
+the parameter dropped, so swapping `dedup_model` or `--model` can neither break
+the call nor silently restore default-temperature sampling.
+
+**Adjudication logging.** Each adjudication emits one structured
+`dedup_adjudication` JSON line at INFO: the event's title/date/chat, the
+candidate identities, the **source layer** that proposed them (`near`, `far`,
+or `far_exact`), the verdict tuple, the model's self-reported confidence, and
+whether the call had to be retried. A wrong merge can be traced back to the
+layer that proposed the candidate without re-running the case. The adjudicator
+retries exactly once on a transport error or unparseable response before giving
+up — without it, one malformed body falls through to `dedup_fail_open` and
+creates a duplicate event.
+
+**Request timeout.** Both Anthropic clients are constructed with an explicit
+`timeout` (`dedup.REQUEST_TIMEOUT_SECONDS`, 120s). The poll loop is
+single-threaded, so a hung request stalls the whole agent — observed in
+practice as an eval run sitting in a blocked socket read for 33 minutes with no
+data arriving and no recovery. Every call the agent makes is small
+(`max_tokens` 300 for dedup, 2048 for detection), so a request still open after
+two minutes is hung rather than slow, and failing it lets the retry (or the
+watermark-retry path) do its job.
 
 Upgrading from v0.4: `tentative_confidence_threshold` was removed (a stale key in an existing
 config.json is ignored). The state file migrates automatically to schema v4; previously created
@@ -332,7 +387,11 @@ reschedules and cancellations, and repeated no-op polls ("lol", an unrelated
 message) that must not re-create an already-existing event. Some scenarios are
 marked `known_failure` in `evals/golden.jsonl` — encoding target behavior for
 a fix not yet implemented, tracked separately from the pass/fail gate so the
-suite stays green while the work is in progress. This calls the real model, so
+suite stays green while the work is in progress. Detector, pipeline, and dedup
+accuracy all exclude flagged cases (a dedup pair counts as flagged if *either*
+half is, since a flagged detection on the reference side makes the pair's
+verdict meaningless); the ungated `pipeline_failed_all` / `dedup_failed_all`
+lists in `report.json` still record them so `--diff` can see one flip. This calls the real model, so
 it needs `ANTHROPIC_API_KEY` and costs real money — every call (detector,
 dedup adjudicator, and `--judge`) is metered by `scheduling_agent/usage_tracker.py`
 and the run's total/average cost is printed at the end and written to
@@ -356,8 +415,59 @@ python -m evals.run                     # baseline on the default model
 python -m evals.run --model claude-sonnet-4-6   # compare another model
 python -m evals.run --judge             # add an LLM title-quality score
 python -m evals.run --today 2026-07-16  # reproduce a specific day's eval clock
+python -m evals.run --repeat 3          # 3 runs; splits always-failed from flaky
+python -m evals.run --diff RUN_A RUN_B  # failure-set diff of two finished runs
 pytest -m eval                          # run it as a pass/fail gate
 ```
+
+**Run-to-run variance (`--repeat` / `--diff`).** The suite calls a real model,
+so single-run accuracy is noisy — the same case can pass in one run and fail in
+the next. Compare failure *sets* across runs, never one run's accuracy number.
+
+`--repeat N` runs the whole suite N times into `run1/`…`runN/` under one
+timestamped folder and writes `repeat_summary.json` beside them, splitting
+failures per suite into **`always_failed`** (failed in every run — a real
+defect) and **`flaky`** (failed in some but not all — sampling variance). Use
+`--repeat 3` when the result gates a decision: with only 2 runs, a case that
+fails one time in three is misread as always-passing often enough to make flag
+hygiene unsafe. Cost scales linearly (a full run is roughly $0.75).
+
+`--diff RUN_A RUN_B` compares two finished runs (pass either the run directory
+or its `report.json`) and prints, per suite, what is newly failing, newly
+passing, and still failing. It exits nonzero when B has a newly-failing case
+that is **not** marked `known_failure`, so it works as a regression gate between
+two versions of the code. It tolerates reports written before `--diff` existed.
+Known-failure cases are included in the diff's failure sets on purpose — that
+is how you notice one has started passing and can drop its flag.
+
+**Run budget.** `dedup.REQUEST_TIMEOUT_SECONDS` bounds a single request, but not
+a run — the SDK retries each call twice by default, so one bad call can consume
+three times that, and ~200 calls had no collective bound at all. A degraded API
+therefore produced an open-ended wait rather than a bounded failure (observed:
+a run at 0.2s of CPU per 90s of wall clock for 1.5 hours, every individual
+request nominally fine). `--run-budget-minutes` (default 60, `0` disables) caps
+one pass of the suite. The check happens at case boundaries, so a case in flight
+always finishes and results are never half-written; the run then stops, is
+marked invalid with the count of cases skipped, and is excluded from `--repeat`
+aggregation and `--diff` like any other invalid run. Under `--repeat`, the first
+invalid run aborts the remaining repeats — an outage or a degraded API will not
+fix itself by run 3, and continuing just spends money on unusable reports.
+
+**Invalid runs.** A run whose API calls fail measures nothing, but it still
+produces a low accuracy number that reads exactly like a catastrophic
+regression. `usage_tracker` counts failed calls alongside successful ones, and a
+run with no successful calls — or more than 10% failures — is marked
+`run_valid: false` in `report.json` with an `invalid_reason`, and prints a loud
+`*** INVALID RUN` banner. `--repeat` excludes invalid runs from the
+always-failed/flaky split and says how many it dropped; `--diff` refuses to
+compare against one at all rather than reporting every case as a regression.
+This exists because it actually happened: a `--repeat 3` run exhausted the
+account's API credit partway through, and its third run reported "28% accuracy"
+off **zero** successful calls.
+
+**Flag hygiene.** A change that makes a `known_failure` case pass should remove
+its flag in the same commit, on evidence of at least two passes within a
+`--repeat 3` run — one lucky pass is not evidence.
 
 It prints per-case detection results plus a separate dedup-adjudication report
 (same/different verdicts against the golden dedup pairs), aggregate accuracy,

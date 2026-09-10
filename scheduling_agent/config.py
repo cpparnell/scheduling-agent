@@ -23,7 +23,18 @@ DEFAULTS = {
     # LLM-adjudicated dedup: the last reconciliation layer (see reconcile.py)
     # for detections the deterministic layers couldn't match.
     "dedup_enabled": True,
-    "dedup_model": "claude-haiku-4-5",
+    # Sonnet 4.6 rather than Haiku: adjudication is the one genuinely hard
+    # judgement in the pipeline, and it is rare (~23 calls per full eval run vs
+    # ~173 detector calls), so the upgrade costs ~$0.09 per run — about 11% —
+    # while fixing two failures Haiku could not: recognizing a reschedule
+    # settled over several polls, and a far-apart re-mention of the same plan.
+    # Detection stays on Haiku, where it is already at 100%.
+    # Adjudications are sampled at temperature 0 (dedup.sampling_kwargs) — this
+    # is a classification, and default-temperature sampling measurably flapped
+    # borderline pairs between runs. Some models reject an explicit
+    # temperature with a 400; dedup._NO_TEMPERATURE_PREFIXES lists them and the
+    # parameter is dropped for those, so any model is safe to set here.
+    "dedup_model": "claude-sonnet-4-6",
     # Hard same-slot cutoff for the deterministic exact/fuzzy layers — no LLM
     # call backs these up, so they stay narrow. dedup_candidate_day_window
     # (below) is the wider window the LLM adjudicator sees.

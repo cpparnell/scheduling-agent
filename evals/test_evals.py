@@ -9,7 +9,7 @@ from scheduling_agent import config, detector
 
 pytestmark = pytest.mark.eval
 
-DEDUP_MODEL = "claude-haiku-4-5"
+DEDUP_MODEL = config.DEFAULTS["dedup_model"]
 
 
 @pytest.fixture(scope="module")
@@ -64,14 +64,9 @@ def test_dedup_adjudicator_verdicts(golden_cases, detector_results):
         golden_cases, results_by_id, model=DEDUP_MODEL,
         day_window=config.DEFAULTS["dedup_candidate_day_window"],
     )
-    cases_by_id = {c["id"]: c for c in golden_cases}
-
-    def _is_known_failure(dedup_result: dict) -> bool:
-        case = cases_by_id[dedup_result["id"]]
-        ref = cases_by_id.get(dedup_result["dedup_with"], {})
-        return bool(case.get("known_failure") or ref.get("known_failure"))
-
-    gated = [r for r in dedup_results if not _is_known_failure(r)]
+    # score_dedup_pairs stamps a pair-aware known_failure on every result, so
+    # this gate and summarize()'s dedup_accuracy can no longer drift apart.
+    gated = [r for r in dedup_results if not r["known_failure"]]
     assert gated, "no gated dedup pairs found"
     missed = [r["id"] for r in gated if r["expected_verdict"] == "same" and not r["passed"]]
     merged = [r["id"] for r in gated if r["expected_verdict"] == "different" and not r["passed"]]

@@ -8,6 +8,8 @@ import anthropic
 
 from scheduling_agent.datepatterns import ANCHOR_PATTERN, EXPLICIT_DATE_RE
 from scheduling_agent import usage_tracker
+from scheduling_agent import dedup as dedup_module
+from scheduling_agent.dedup import sampling_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +23,9 @@ def _get_client() -> "anthropic.Anthropic":
     require ANTHROPIC_API_KEY (and so tests can swap in a fake)."""
     global _client
     if _client is None:
-        _client = anthropic.Anthropic()
+        # Same hung-request ceiling as the adjudicator — see
+        # dedup.REQUEST_TIMEOUT_SECONDS.
+        _client = anthropic.Anthropic(timeout=dedup_module.REQUEST_TIMEOUT_SECONDS)
     return _client
 
 
@@ -339,9 +343,20 @@ _QUOTE_TRANSLATION = str.maketrans({
 # "+15551234567: ". Tightly anchored (bounded prefix length, requires a
 # trailing colon) so real message content like "dinner at 7: ok?" is never
 # mistaken for a label.
+#
+# The second alternative covers senders that are neither "me" nor a phone
+# number — an email address or a contact name, which is what `_format_thread`
+# emits for any contact not stored as a bare number. It must tolerate the real
+# timestamp format, `"%a %m/%d/%Y %I:%M%p"` — i.e. a WEEKDAY before the date
+# ("(Wed 09/09/2026 06:00AM)"). Requiring the parenthesis to be followed
+# immediately by digits missed every such line, so a correctly detected plan
+# whose evidence the model quoted with its sender label was dropped by the
+# evidence gate as unverifiable. The lookahead still demands a date somewhere
+# inside the parentheses, so an ordinary message like
+# "Lunch (with Sam): sounds good" is not mistaken for a label.
 _SENDER_PREFIX = re.compile(
     r"^\s*(?:me|\+?\d[\d\-() ]{5,14})\s*(?:\([^)\n]{0,60}\))?\s*:\s*"
-    r"|^\s*[^:\n()]{1,30}\(\d{1,2}/\d{1,2}[^)]*\)\s*:\s*",
+    r"|^\s*[^:\n()]{1,40}\((?=[^)\n]*\d{1,2}/\d{1,2})[^)\n]{0,80}\)\s*:\s*",
     re.IGNORECASE,
 )
 
@@ -623,6 +638,7 @@ def _second_pass_date_resolution(
             system=system_prompt,
             messages=[{"role": "user", "content": f"Thread:\n\n{formatted}"}],
             output_config={"format": {"type": "json_schema", "schema": _DATE_RESOLVER_SCHEMA}},
+            **sampling_kwargs(model, 0.0),
         )
         usage_tracker.record(model, getattr(response, "usage", None))
         text = next((b.text for b in response.content if b.type == "text"), None)
@@ -630,6 +646,7 @@ def _second_pass_date_resolution(
             return
         result = json.loads(text)
     except Exception as e:
+        usage_tracker.record_failure(repr(e))
         logger.warning("Second-pass date resolution failed for %r: %s", event.get("title"), e)
         return
 
@@ -764,7 +781,8 @@ def detect_plans(
                     "role": "user",
                     "content": f"Analyze this iMessage thread for plans:\n\n{formatted}"
                 }],
-                output_config={"format": {"type": "json_schema", "schema": RESPONSE_SCHEMA}}
+                output_config={"format": {"type": "json_schema", "schema": RESPONSE_SCHEMA}},
+                **sampling_kwargs(model, 0.0),
             )
             usage_tracker.record(model, getattr(response, "usage", None))
 
@@ -839,6 +857,7 @@ def detect_plans(
         except Exception as e:
             # One malformed response, API error, or unexpected payload must not
             # abort the whole batch — log, remember the failure, and move on.
+            usage_tracker.record_failure(repr(e))
             logger.warning("Error detecting plans in thread %s: %s", thread.get("chat_id"), e)
             failed_chat_ids.add(thread.get("chat_id"))
 

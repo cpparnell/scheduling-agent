@@ -170,16 +170,18 @@ def _disposition(
       future instance — never merged into the matched record; create.
     """
     if relationship == "new_occurrence":
-        return Decision("create", reasoning=reasoning)
+        return Decision("create", reasoning=reasoning, relationship=relationship)
 
     if matched.get("source") == "calendar" or "canonical_id" not in matched:
-        return Decision("skip_duplicate", matched=matched, source=source, reasoning=reasoning)
+        return Decision("skip_duplicate", matched=matched, source=source, reasoning=reasoning,
+                        relationship=relationship)
 
     # A clearly weaker detection never overwrites a stronger record.
     stored_confidence = matched.get("confidence") or 0
     new_confidence = event.get("confidence") or 0
     if new_confidence + UPDATE_CONFIDENCE_TOLERANCE < stored_confidence:
-        return Decision("skip_duplicate", matched=matched, source=source, reasoning=reasoning)
+        return Decision("skip_duplicate", matched=matched, source=source, reasoning=reasoning,
+                        relationship=relationship)
 
     try:
         delta_days = abs(
@@ -192,9 +194,11 @@ def _disposition(
         cfg = cfg or {}
         max_days = cfg.get("reschedule_max_days", 30)
         if delta_days is None or delta_days > max_days:
-            return Decision("skip_duplicate", matched=matched, source=source, reasoning=reasoning)
+            return Decision("skip_duplicate", matched=matched, source=source, reasoning=reasoning,
+                        relationship=relationship)
         if delta_days > 1 and event.get("status") != "confirmed":
-            return Decision("skip_duplicate", matched=matched, source=source, reasoning=reasoning)
+            return Decision("skip_duplicate", matched=matched, source=source, reasoning=reasoning,
+                        relationship=relationship)
         if delta_days > 1:
             logger.warning(
                 "Reschedule moving %r by %d day(s): %s -> %s (%s)",
@@ -209,7 +213,8 @@ def _disposition(
         # the stored date stands.
         near_days = (cfg or {}).get("dedup_day_window", 1)
         if delta_days is None or delta_days > near_days:
-            return Decision("skip_duplicate", matched=matched, source=source, reasoning=reasoning)
+            return Decision("skip_duplicate", matched=matched, source=source, reasoning=reasoning,
+                        relationship=relationship)
         changes = {}
         if event["date"] != matched.get("date"):
             changes["date"] = event["date"]
@@ -223,8 +228,10 @@ def _disposition(
         changes["status"] = "confirmed"
 
     if changes:
-        return Decision("update", matched=matched, changes=changes, source=source, reasoning=reasoning)
-    return Decision("skip_duplicate", matched=matched, source=source, reasoning=reasoning)
+        return Decision("update", matched=matched, changes=changes, source=source,
+                    reasoning=reasoning, relationship=relationship)
+    return Decision("skip_duplicate", matched=matched, source=source, reasoning=reasoning,
+                        relationship=relationship)
 
 
 def reconcile(event: dict, cfg: dict) -> Decision:
@@ -280,14 +287,16 @@ def reconcile(event: dict, cfg: dict) -> Decision:
         candidates,
         day_window=cfg["dedup_candidate_day_window"],
     )
+    source = "near"
     if not llm_candidates:
         # Nothing near the detected date — check for a record with a similar
         # title far away (a mis-resolved bare weekday lands here).
         llm_candidates = far_candidates(event, cfg)
+        source = "far"
     if not llm_candidates:
         return Decision("create")
 
-    return _adjudicate(event, llm_candidates, cfg)
+    return _adjudicate(event, llm_candidates, cfg, source=source)
 
 
 def _reconcile_far_exact_match(event: dict, matched: dict, cfg: dict) -> Decision:
@@ -300,11 +309,18 @@ def _reconcile_far_exact_match(event: dict, matched: dict, cfg: dict) -> Decisio
             "skip_duplicate", matched=matched, source="exact",
             reasoning="far title-window match (dedup disabled; treated as duplicate)",
         )
-    return _adjudicate(event, [matched], cfg)
+    return _adjudicate(event, [matched], cfg, source="far_exact")
 
 
-def _adjudicate(event: dict, llm_candidates: list[dict], cfg: dict) -> Decision:
-    verdict = dedup.adjudicate(event, llm_candidates, model=cfg["dedup_model"])
+def _adjudicate(
+    event: dict, llm_candidates: list[dict], cfg: dict, source: str = "near"
+) -> Decision:
+    """`source` records which layer produced the candidates ("near", "far",
+    "far_exact") — logged with the verdict so a wrong merge can be traced back
+    to the layer that proposed it without re-running the case."""
+    verdict = dedup.adjudicate(
+        event, llm_candidates, model=cfg["dedup_model"], source=source
+    )
     if verdict is None:
         if cfg["dedup_fail_open"]:
             return Decision("create", reasoning="adjudicator failed; fail-open")
