@@ -684,11 +684,12 @@ def _second_pass_date_resolution(
             output_config={"format": {"type": "json_schema", "schema": _DATE_RESOLVER_SCHEMA}},
             **sampling_kwargs(model, 0.0),
         )
-        usage_tracker.record(model, getattr(response, "usage", None))
         text = next((b.text for b in response.content if b.type == "text"), None)
         if not text:
+            usage_tracker.record_failure("empty response")
             return
         result = json.loads(text)
+        usage_tracker.record(model, getattr(response, "usage", None))
     except Exception as e:
         usage_tracker.record_failure(repr(e))
         logger.warning("Second-pass date resolution failed for %r: %s", event.get("title"), e)
@@ -828,16 +829,16 @@ def detect_plans(
                 output_config={"format": {"type": "json_schema", "schema": RESPONSE_SCHEMA}},
                 **sampling_kwargs(model, 0.0),
             )
-            usage_tracker.record(model, getattr(response, "usage", None))
-
             text = next(
                 (b.text for b in response.content if b.type == "text"),
                 None
             )
             if not text:
+                usage_tracker.record_failure("empty response")
                 continue
 
             payload = json.loads(text)
+            usage_tracker.record(model, getattr(response, "usage", None))
 
             # Legacy single-object shape (has_event/date at the top level)
             # from an older cached payload or an off-spec model response.

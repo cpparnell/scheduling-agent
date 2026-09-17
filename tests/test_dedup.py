@@ -156,6 +156,23 @@ def test_adjudicate_malformed_json_returns_none(fake_dedup_anthropic):
     assert dedup.adjudicate(_new_event(), [_record()], model="claude-haiku-4-5") is None
 
 
+def test_adjudicate_malformed_json_does_not_double_count_usage(fake_dedup_anthropic):
+    # Each malformed-JSON attempt is one API call that failed to parse, not
+    # one call recorded as a success (usage_tracker.record) *and* a second
+    # failure (usage_tracker.record_failure) — that would double-count it in
+    # summary()'s total_calls/failed_calls (PR #15 review comment #3).
+    from scheduling_agent import usage_tracker
+    usage_tracker.reset()
+
+    fake_dedup_anthropic(["not json"])  # reused for both the initial attempt and the retry
+    dedup.adjudicate(_new_event(), [_record()], model="claude-haiku-4-5")
+
+    summary = usage_tracker.summary()
+    assert summary["total_calls"] == 0
+    assert summary["failed_calls"] == 2  # initial attempt + one retry
+    assert summary["call_failure_rate"] == 1.0
+
+
 def test_adjudicate_api_error_returns_none(fake_dedup_anthropic):
     err = anthropic.APIConnectionError(
         message="boom", request=httpx.Request("POST", "https://api.anthropic.com/v1/messages")

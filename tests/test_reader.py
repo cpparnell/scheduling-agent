@@ -407,6 +407,51 @@ def test_date_context_lookback_measured_from_now_not_cutoff(fake_chat_db):
     assert "the trip is October 10!" in msgs_wide
 
 
+def test_end_apple_ts_anchors_date_lookback_for_backfill(fake_chat_db):
+    # backfill() replays windows anchored months in the past. Without
+    # end_apple_ts, the date-anchor lookback bound is measured from the real
+    # wall clock, so an anchor from deep history (well within lookback of the
+    # window being replayed) is silently never harvested — this is the bug
+    # PR review comment #15 flagged. Simulate a window ending 200 days ago,
+    # with an anchor 250 days ago (50 days before that window's end, i.e.
+    # within a 90-day lookback of the window, but ~250 days before the real
+    # present).
+    window_end_hours_ago = 24 * 200
+    anchor_hours_ago = 24 * 250
+    cutoff_hours_ago = 24 * 201
+
+    messages = [{"text": "the trip is October 10!", "from_me": False, "unix_ts": _recent(anchor_hours_ago)}]
+    for i in range(31):  # push the anchor out of the 30-message context window
+        messages.append({
+            "text": f"filler {i}", "from_me": False,
+            "unix_ts": _recent(cutoff_hours_ago + 40 - i * 0.5),
+        })
+    messages.append({"text": "on friday we leave", "from_me": False, "unix_ts": _recent(window_end_hours_ago + 1)})
+    fake_chat_db([{"participants": ["+15551234567"], "messages": messages}])
+
+    cutoff = reader.unix_to_apple(_recent(cutoff_hours_ago))
+    window_end_apple_ts = reader.unix_to_apple(_recent(window_end_hours_ago))
+
+    # Without end_apple_ts, "now" is the real wall clock — the anchor is ~250
+    # real days old, well past a 90-day-from-now lookback, so it's dropped.
+    threads_live = reader.get_threads_since(
+        cutoff, lookback_days=7, blocked=[], date_context_lookback_days=90,
+    )
+    msgs_live = [m["text"] for m in threads_live[0]["messages"]]
+    assert "the trip is October 10!" not in msgs_live
+
+    # With end_apple_ts set to the window's own end (as main.py's backfill()
+    # does), "now" for the lookback bound is the window's end, not the real
+    # present — the anchor (50 days before that window end) is within a
+    # 90-day lookback of it, so it IS harvested.
+    threads_backfill = reader.get_threads_since(
+        cutoff, lookback_days=7, blocked=[], date_context_lookback_days=90,
+        end_apple_ts=window_end_apple_ts,
+    )
+    msgs_backfill = [m["text"] for m in threads_backfill[0]["messages"]]
+    assert "the trip is October 10!" in msgs_backfill
+
+
 # --- F1: is_context tagging -------------------------------------------------
 
 
