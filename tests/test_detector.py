@@ -811,6 +811,75 @@ def test_reconcile_weekday_skips_when_explicit_month_date_in_evidence():
     assert event["date"] == "2026-06-13"
 
 
+# --- end_date guard against exclusive-end-date convention (_validate_end_date) --
+
+
+def test_validate_end_date_clears_unsupported_end_date():
+    # Single-day plan ("casino after dinner") where the model nonetheless
+    # emitted end_date = date + 1, applying the Google Calendar exclusive-end
+    # convention itself — nothing in evidence signals a multi-day span.
+    event = _event(
+        date="2026-09-03", end_date="2026-09-04",
+        evidence="casino after dinner tomorrow", date_evidence="casino after dinner tomorrow",
+    )
+    detector._validate_end_date(event, chat_id=1)
+    assert event["end_date"] is None
+
+
+def test_validate_end_date_keeps_end_date_with_weekend_evidence():
+    event = _event(
+        date="2026-09-05", end_date="2026-09-06",
+        evidence="beach house this weekend", date_evidence="beach house this weekend",
+    )
+    detector._validate_end_date(event, chat_id=1)
+    assert event["end_date"] == "2026-09-06"
+
+
+def test_validate_end_date_keeps_end_date_with_trip_evidence():
+    event = _event(
+        date="2026-09-03", end_date="2026-09-08",
+        evidence="Chicago trip Sept 3rd through the 8th", date_evidence="Chicago trip Sept 3rd through the 8th",
+    )
+    detector._validate_end_date(event, chat_id=1)
+    assert event["end_date"] == "2026-09-08"
+
+
+def test_validate_end_date_keeps_end_date_with_weekday_range():
+    event = _event(
+        date="2026-09-04", end_date="2026-09-06",
+        evidence="visiting Friday-Sunday", date_evidence="visiting Friday-Sunday",
+    )
+    detector._validate_end_date(event, chat_id=1)
+    assert event["end_date"] == "2026-09-06"
+
+
+def test_validate_end_date_noop_when_already_null():
+    event = _event(date="2026-09-03", end_date=None, evidence="dinner tonight")
+    detector._validate_end_date(event, chat_id=1)
+    assert event["end_date"] is None
+
+
+def test_validate_end_date_noop_when_equal_to_date():
+    # Redundant but harmless — still resolves to a correct one-day event
+    # downstream, so it's not worth flagging.
+    event = _event(date="2026-09-03", end_date="2026-09-03", evidence="dinner tonight")
+    detector._validate_end_date(event, chat_id=1)
+    assert event["end_date"] == "2026-09-03"
+
+
+def test_validate_end_date_wired_into_detect_plans(fake_anthropic):
+    thread = _thread(messages=[
+        {"sender": "+15551234567", "text": "casino after dinner tomorrow?", "from_me": False, "unix_ts": 1700000000.0},
+        {"sender": "me", "text": "in!", "from_me": True, "unix_ts": 1700000100.0},
+    ])
+    fake_anthropic([_response(_event(
+        date="2026-09-03", end_date="2026-09-04",
+        evidence="casino after dinner tomorrow?", date_evidence="casino after dinner tomorrow?",
+    ))])
+    results, _ = detector.detect_plans([thread])
+    assert results[0]["end_date"] is None
+
+
 # --- Evidence gate: empty/missing evidence (F5a) ----------------------------
 
 

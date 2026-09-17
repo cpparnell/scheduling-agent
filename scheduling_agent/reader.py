@@ -78,7 +78,13 @@ def get_threads_since(
     blocked: list[str],
     date_context_lookback_days: int = DATE_CONTEXT_LOOKBACK_DAYS,
     date_context_max: int = DATE_CONTEXT_WINDOW,
+    end_apple_ts: int | None = None,
 ) -> list[dict]:
+    """`end_apple_ts`, when given, caps the fetch at that timestamp (inclusive)
+    instead of the live present. Production polling never sets it; it exists
+    for main.py's backfill mode, which walks history in bounded windows so
+    each window sees only the messages that existed by its own end, not ones
+    from later windows."""
     if last_apple_ts is None:
         cutoff = unix_to_apple(time.time() - lookback_days * 86400)
     else:
@@ -93,7 +99,8 @@ def get_threads_since(
         cursor = conn.cursor()
 
         # Get all messages newer than cutoff, with participant info
-        cursor.execute("""
+        cursor.execute(
+            """
             SELECT
                 c.ROWID AS chat_id,
                 m.ROWID AS msg_id,
@@ -108,13 +115,16 @@ def get_threads_since(
             JOIN chat c ON cmj.chat_id = c.ROWID
             LEFT JOIN handle h ON m.handle_id = h.ROWID
             WHERE m.date > ?
+              """ + ("AND m.date <= ? " if end_apple_ts is not None else "") + """
               AND (
                 (m.text IS NOT NULL AND m.text != '')
                 OR m.attributedBody IS NOT NULL
                 OR COALESCE(m.associated_message_type, 0) BETWEEN 2000 AND 2005
               )
             ORDER BY c.ROWID, m.date ASC
-        """, (cutoff,))
+            """,
+            (cutoff, end_apple_ts) if end_apple_ts is not None else (cutoff,),
+        )
 
         rows = cursor.fetchall()
 

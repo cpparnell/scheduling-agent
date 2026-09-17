@@ -137,6 +137,18 @@ explicit-date anchor nearby *and* the thread contains some other date-like conte
 plausibly change the answer (skipping the extra call otherwise), re-examines the whole thread
 for a competing anchor, and overrides the default only at confidence ≥ 0.8.
 
+**end_date guard against the exclusive-end-date convention.** `end_date` should be null for
+any single-day plan and the ISO 8601 *inclusive* last day for a genuine multi-day one
+(`calendar.py` adds the exclusive +1 day itself when writing to Calendar — see
+`_compute_span`). Models trained on the Google Calendar API's own exclusive-end-date
+convention sometimes apply it themselves, emitting `end_date = date + 1` for a plan that's
+really just one day — which then gets a second +1 applied downstream, turning a one-day plan
+into a two-day all-day event on the calendar. A deterministic post-check
+(`_validate_end_date`) requires actual multi-day language in the model's own
+`evidence`/`date_evidence` (a range joiner between two date-like tokens, "weekend", "trip",
+a night count, etc.) before trusting a non-null `end_date` at all, clearing it back to null
+otherwise.
+
 **Verbatim evidence matching.** The hallucination guard requires `evidence`/`date_evidence`
 to appear in the thread — empty or missing evidence fails the gate outright rather than
 bypassing it. The model doesn't always quote a real match byte-for-byte, though: it prepends
@@ -265,6 +277,46 @@ quoted message evidence), everything under `logs/`, and, if present,
 `~/Library/Logs/scheduling-agent/` (the launchd supervisor log — see "Running
 in the background" above), then exits. It does not touch Calendar or Messages
 — events already created stay on your calendar.
+
+### Backfill / dry-run testing
+
+`evals/golden.jsonl` is a fixed, curated set, and any one person's live
+message volume only produces so many real test cases per day. `--backfill`
+replays your *actual* historical messages through the real detector and
+reconciliation pipeline — across every conversation and contact in your
+`chat.db`, not just today's — so you can sanity-check behavior against far
+more real-world diversity than either source gives you alone:
+
+```bash
+scheduling-agent --backfill --since 90        # last 90 days
+scheduling-agent --backfill --since 2025-01-01 --until 2025-06-01
+```
+
+It is always a dry run: `--backfill` never writes to Calendar.app or to your
+real `~/.scheduling-agent/state.json` — calendar writes are replaced with
+logging no-ops and state is redirected to a scratch directory deleted when
+the run finishes, so nothing it does can create duplicate events later or
+otherwise interfere with normal operation. History is walked in
+`--window-days`-sized windows (default 1), each anchored to its own end as
+"today" — a message from three months ago proposing "next Tuesday" is judged
+as it would have been at the time, not against today's real date.
+
+Output is a JSONL decision log, one line per detected event (title, date,
+confidence, and what the agent would have done — created/updated/skipped and
+why), written to `logs/backfill/<timestamp>.jsonl` by default (override with
+`--out`). Skim it for real detections that should have fired but didn't (or
+vice versa) and fold the genuine misses into `evals/golden.jsonl` per the
+usual bug-fix workflow.
+
+Each Claude call is a real, billed API request — cost scales with how many
+active conversations and days you cover, not a fixed per-run number like the
+eval suite. If a detection call fails partway through (a bad API key, an
+exhausted credit balance, a transport error), that failure is never silently
+read as "no plan found": it's logged as its own `"result": "detection_failed"`
+line, and the CLI prints a `WARNING` naming the first failed window and the
+`--since` date to resume from. A `--backfill` run with no such warning had
+full coverage of the requested range; one that prints it is incomplete from
+that window onward until you fix the underlying issue and re-run.
 
 ## Configuration
 
@@ -507,9 +559,10 @@ brand-new snapshot not yet added to the rate table) is still counted in
 `unpriced_calls` flags that the total is a floor rather than exact — add the
 model's price to `_PRICING_PER_MTOK` in `usage_tracker.py` to fix it.
 
-**Log directories** — three separate locations, one per entry point: `logs/stdout/`
-(the live agent, `scheduling-agent`), `logs/evals/` (`python -m evals.run`), and
-`logs/tests/` (`pytest`). The live agent's log file rotates at 10MB (5 backups
+**Log directories** — four separate locations, one per entry point: `logs/stdout/`
+(the live agent, `scheduling-agent`), `logs/evals/` (`python -m evals.run`),
+`logs/tests/` (`pytest`), and `logs/backfill/` (`--backfill`, see "Backfill /
+dry-run testing" above). The live agent's log file rotates at 10MB (5 backups
 kept) so a long-running background process (see "Running in the background")
 doesn't grow it unbounded.
 
@@ -521,7 +574,7 @@ main.py                # Thin entry point (python main.py); scheduling-agent con
 scheduling_agent/
 ├── __main__.py        # Enables `python -m scheduling_agent`
 ├── main.py            # process_new_messages(), per-event gates (process_event), journal
-                        # recovery, poll-fallback timer, --purge flag
+                        # recovery, poll-fallback timer, --purge and --backfill flags
 ├── config.py          # Loads ~/.scheduling-agent/config.json
 ├── state.py           # Canonical event store, write-ahead journal, checkpoint, dedup hashes
 ├── reader.py          # Reads iMessage threads from chat.db
