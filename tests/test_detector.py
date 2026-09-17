@@ -134,6 +134,25 @@ def test_malformed_json_skips_thread_but_continues(fake_anthropic):
     assert failed == {1}
 
 
+def test_malformed_json_records_exactly_one_failed_call_not_two(fake_anthropic):
+    # A response that comes back over the wire successfully but fails to
+    # parse as JSON is one API call, not two. usage_tracker.record() used to
+    # fire unconditionally right after the HTTP call, then the enclosing
+    # except also called record_failure() for the same call — double
+    # counting it into both total_calls and failed_calls, and inflating
+    # summary()'s call_failure_rate (PR #15 review comment #3).
+    from scheduling_agent import usage_tracker
+    usage_tracker.reset()
+
+    fake_anthropic(["this is not json"])
+    detector.detect_plans([_thread(chat_id=1)])
+
+    summary = usage_tracker.summary()
+    assert summary["total_calls"] == 0
+    assert summary["failed_calls"] == 1
+    assert summary["call_failure_rate"] == 1.0
+
+
 def test_api_error_skips_thread_but_continues(fake_anthropic):
     err = anthropic.APIConnectionError(
         message="boom", request=httpx.Request("POST", "https://api.anthropic.com/v1/messages")

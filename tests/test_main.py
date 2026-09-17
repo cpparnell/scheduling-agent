@@ -860,6 +860,27 @@ class TestRunGate:
             assert order[i + 1] == "exit"
 
 
+class TestParseBackfillSince:
+    """--since accepts a non-negative integer number of days ago, or an ISO
+    date. A negative integer must be rejected, not silently interpreted as a
+    future date (see PR #15 review comment #2)."""
+
+    def test_integer_days_ago(self):
+        now = datetime(2026, 6, 15)
+        assert main.parse_backfill_since("10", now=now) == now - timedelta(days=10)
+
+    def test_iso_date(self):
+        assert main.parse_backfill_since("2026-01-01") == datetime(2026, 1, 1)
+
+    def test_negative_integer_is_rejected(self):
+        with pytest.raises(ValueError):
+            main.parse_backfill_since("-5")
+
+    def test_garbage_is_rejected(self):
+        with pytest.raises(ValueError):
+            main.parse_backfill_since("not-a-date")
+
+
 class TestBackfill:
     """main.backfill() replays history through the real detector/reconcile
     pipeline in dry-run mode — no calendar or state.json writes."""

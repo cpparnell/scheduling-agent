@@ -84,7 +84,13 @@ def get_threads_since(
     instead of the live present. Production polling never sets it; it exists
     for main.py's backfill mode, which walks history in bounded windows so
     each window sees only the messages that existed by its own end, not ones
-    from later windows."""
+    from later windows.
+
+    `end_apple_ts` also stands in for "now" when harvesting far-back
+    date-anchor context (see _prepend_context) — during backfill, "how far
+    back counts as recent" must be relative to the window being replayed, not
+    the real wall clock, or anchors from more than date_context_lookback_days
+    before *today* are silently never harvested for old windows."""
     if last_apple_ts is None:
         cutoff = unix_to_apple(time.time() - lookback_days * 86400)
     else:
@@ -188,6 +194,7 @@ def get_threads_since(
             threads, cutoff, blocked_set, participants_by_chat,
             date_context_lookback_days, date_context_max,
             context_window=CONTEXT_WINDOW if last_apple_ts is not None else 0,
+            now_apple_ts=end_apple_ts,
         )
 
     return list(threads.values())
@@ -201,6 +208,7 @@ def _prepend_context(
     date_context_lookback_days: int = DATE_CONTEXT_LOOKBACK_DAYS,
     date_context_max: int = DATE_CONTEXT_WINDOW,
     context_window: int = CONTEXT_WINDOW,
+    now_apple_ts: int | None = None,
 ) -> None:
     """Prepend up to context_window prior messages per thread, plus up to
     date_context_max older date-bearing messages (within
@@ -212,7 +220,15 @@ def _prepend_context(
     tagged is_context=True, distinguishing it from the is_context=False
     "new" messages already in threads[chat_id]["messages"] — the detector
     uses this to avoid re-emitting a plan whose only trace is old context
-    (see detector._format_thread)."""
+    (see detector._format_thread).
+
+    `now_apple_ts` overrides what "NOW" means for the lookback bound above.
+    Production polling leaves it None (the real wall clock). main.py's
+    backfill mode passes each window's own end, since during backfill
+    `cutoff` can be months before the real present — anchoring "recent" to
+    the live clock there would mean the lookback bound is already older than
+    every candidate row, so the branch below would silently never fire for
+    old windows."""
     try:
         conn = sqlite3.connect(f"file:{CHAT_DB}?mode=ro", uri=True, timeout=5)
     except sqlite3.OperationalError:
@@ -253,7 +269,8 @@ def _prepend_context(
     # separately, up to date_context_max per chat and no older than
     # date_context_lookback_days before now; they end up prepended before the
     # regular window.
-    date_lookback_bound = unix_to_apple(time.time() - date_context_lookback_days * 86400)
+    now_ts = apple_to_unix(now_apple_ts) if now_apple_ts is not None else time.time()
+    date_lookback_bound = unix_to_apple(now_ts - date_context_lookback_days * 86400)
     counts: dict[int, int] = {}
     date_counts: dict[int, int] = {}
     context_by_chat: dict[int, list[dict]] = {}

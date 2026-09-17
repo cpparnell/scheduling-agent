@@ -461,6 +461,22 @@ class BackfillResult(NamedTuple):
     first_failed_window: date | None
 
 
+def parse_backfill_since(value: str, now: datetime | None = None) -> datetime:
+    """Parses --backfill's --since value: either a non-negative integer
+    number of days ago, or an ISO date (YYYY-MM-DD). Raises ValueError on
+    anything else, including a negative integer — `"-5".lstrip("-").isdigit()`
+    is true, so without this check `int("-5")` silently computed a start
+    date 5 days in the *future*, and since `until` defaults to now, the
+    backfill loop's `while window_start < until` never ran, producing an
+    empty log with no error explaining why."""
+    now = now or datetime.now()
+    if value.startswith("-"):
+        raise ValueError(f"--since must be non-negative, got {value!r}")
+    if value.isdigit():
+        return now - timedelta(days=int(value))
+    return datetime.strptime(value, "%Y-%m-%d")
+
+
 def backfill(
     cfg: dict,
     since: datetime,
@@ -732,13 +748,9 @@ def main() -> None:
         setup_logging()
         cfg = config.load()
         try:
-            since_dt = (
-                datetime.now() - timedelta(days=int(args.since))
-                if args.since.lstrip("-").isdigit()
-                else datetime.strptime(args.since, "%Y-%m-%d")
-            )
+            since_dt = parse_backfill_since(args.since)
         except ValueError:
-            parser.error(f"--since must be an integer number of days or an ISO date, got {args.since!r}")
+            parser.error(f"--since must be a non-negative integer number of days or an ISO date, got {args.since!r}")
             return
         until_dt = None
         if args.until:
