@@ -1,23 +1,17 @@
 import argparse
-import contextlib
-import hashlib
-import json
 import logging
 import logging.handlers
 import shutil
 import signal
 import sys
-import tempfile
 import threading
 import time
-from datetime import date, datetime, timedelta
+from datetime import datetime
 from pathlib import Path
-from typing import NamedTuple
 
 from . import calendar, config, detector, reader, reconcile, state, watcher
 
 LOGS_DIR = Path(__file__).parent.parent / "logs" / "stdout"
-BACKFILL_LOG_DIR = Path(__file__).parent.parent / "logs" / "backfill"
 
 logger = logging.getLogger(__name__)
 
@@ -49,20 +43,12 @@ def setup_logging() -> None:
     logger.info("Logging to %s", log_file)
 
 
-def process_event(event: dict, cfg: dict, reference_date: date | None = None) -> str:
+def process_event(event: dict, cfg: dict) -> str:
     """Run one detected event through the gate sequence and reconciliation.
 
     Returns "created", "updated", or "skipped:<reason>". Shared by the polling
-    loop, the eval harness, and backfill() so all three exercise the exact
-    production gates.
-
-    `reference_date` is what "today" means for the past-event gate below.
-    Production and the eval harness leave it None (the live wall clock);
-    backfill() pins it to each window's own end, since a message from last
-    March describing a plan for "next week" must not be skipped as if that
-    week were already in the past.
+    loop and the eval harness so both exercise the exact production gates.
     """
-    today = reference_date or datetime.now().date()
     chat_id = event["chat_id"]
     title = event["title"]
     date = event["date"]
@@ -80,7 +66,7 @@ def process_event(event: dict, cfg: dict, reference_date: date | None = None) ->
         logger.warning("Skipping event with unparseable date %r: %s", date, title)
         return "skipped:unparseable-date"
 
-    if event_date < today:
+    if event_date < datetime.now().date():
         logger.info("Skipping past event: %s on %s", title, date)
         return "skipped:past"
 
@@ -382,220 +368,6 @@ def process_new_messages(cfg: dict) -> None:
                 state.set_watermark_hold(last_ts, count)
 
 
-@contextlib.contextmanager
-def _dry_run_environment():
-    """Redirects state.py's persistence to a scratch temp directory (deleted
-    on exit) and replaces calendar.py's AppleScript writes with logging
-    no-ops, for the duration of the `with` block. Lets backfill() run the
-    exact production code path (process_event / reconcile / state) against
-    real historical messages with zero chance of touching the user's real
-    state.json or Calendar.app.
-
-    Reads (calendar.get_events_near) are stubbed to return nothing rather
-    than routed to the real calendar — callers should also set
-    cfg["calendar_query_enabled"] = False so this is belt-and-suspenders, not
-    the only thing standing between backfill and a live calendar query.
-    """
-    scratch_dir = Path(tempfile.mkdtemp(prefix="scheduling-agent-backfill-"))
-    real_state_dir = state.STATE_DIR
-    real_state_file = state.STATE_FILE
-    real_create = calendar.create_event
-    real_update = calendar.update_event
-    real_delete = calendar.delete_event
-    real_get_near = calendar.get_events_near
-
-    def fake_create(title, date_str, time_start, duration_minutes, location,
-                     calendar_name="Calendar", tentative=False, recurrence=None, end_date=None):
-        logger.info(
-            "[DRY RUN] would create %s event: %s on %s%s%s",
-            "tentative" if tentative else "confirmed", title, date_str,
-            f" at {time_start}" if time_start else "",
-            f" @ {location}" if location else "",
-        )
-        return f"dryrun-{_stable_id(title, date_str)}"
-
-    def fake_update(uid, title, date_str, time_start, duration_minutes, location,
-                     calendar_name="Calendar", tentative=False, end_date=None):
-        logger.info("[DRY RUN] would update event %s: %s on %s", uid, title, date_str)
-        return True
-
-    def fake_delete(uid, calendar_name="Calendar"):
-        logger.info("[DRY RUN] would delete event %s", uid)
-        return True
-
-    def fake_get_near(date_str, window_days=1, calendar_name="Calendar"):
-        return []
-
-    state.STATE_DIR = scratch_dir
-    state.STATE_FILE = scratch_dir / "state.json"
-    calendar.create_event = fake_create
-    calendar.update_event = fake_update
-    calendar.delete_event = fake_delete
-    calendar.get_events_near = fake_get_near
-    try:
-        yield
-    finally:
-        state.STATE_DIR = real_state_dir
-        state.STATE_FILE = real_state_file
-        calendar.create_event = real_create
-        calendar.update_event = real_update
-        calendar.delete_event = real_delete
-        calendar.get_events_near = real_get_near
-        shutil.rmtree(scratch_dir, ignore_errors=True)
-
-
-def _stable_id(*parts: str) -> str:
-    """Deterministic fake calendar UID for dry-run creates, so the same event
-    replayed across a re-run of the same backfill window gets the same id
-    (harmless; nothing ever looks it up on a real calendar)."""
-    return hashlib.sha1("|".join(parts).encode()).hexdigest()[:12]
-
-
-class BackfillResult(NamedTuple):
-    """Return value of backfill(): out_path is the JSONL decision log;
-    n_failed/first_failed_window flag whether coverage is incomplete (see
-    backfill()'s docstring)."""
-    out_path: Path
-    n_events: int
-    n_failed: int
-    first_failed_window: date | None
-
-
-def backfill(
-    cfg: dict,
-    since: datetime,
-    until: datetime | None = None,
-    window_days: float = 1.0,
-    out_path: Path | None = None,
-) -> BackfillResult:
-    """Replay historical messages through the real detection + reconciliation
-    pipeline in read-only dry-run mode, to sanity-check the agent's real-world
-    behavior against message volume and diversity far beyond what shows up
-    live in one person's inbox in a day.
-
-    Walks [since, until) in `window_days`-sized windows, each anchored to its
-    own end as "today" (both for the detector's relative-date resolution and
-    process_event's past-event gate) so a message from months ago describing
-    "next Tuesday" is judged as it would have been judged at the time, not
-    against the real live wall clock. No calendar or state.json is touched —
-    see _dry_run_environment.
-
-    Returns a BackfillResult: out_path is the JSONL decision log written (one
-    line per detected event, across all windows, plus one line per thread
-    whose detection call itself failed); n_failed/first_failed_window flag
-    whether coverage is incomplete.
-
-    A detection call failing (a transport error, a bad API key, an exhausted
-    credit balance) is NOT the same as "no plan in this thread," but
-    detect_plans() can't tell the difference from inside a single window —
-    it just returns fewer events. Left unchecked, a billing failure silently
-    produces a normal-looking summary with a gap of zero events where a real
-    stretch of history was in fact never analyzed. So every failed chat_id is
-    logged, written to the JSONL as its own line (`"result": "detection_failed"`),
-    and counted into `failed_threads` in the final summary — a nonzero count
-    there means coverage is INCOMPLETE and the run should be repeated (e.g.
-    `--since <the first failed window's date>`) once the underlying problem
-    is fixed.
-    """
-    until = until or datetime.now()
-    out_path = out_path or (
-        BACKFILL_LOG_DIR / f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.jsonl"
-    )
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    backfill_cfg = {**cfg, "calendar_query_enabled": False}
-
-    counts: dict[str, int] = {}
-    n_events = 0
-    n_failed = 0
-    first_failed_window: date | None = None
-    window_start = since
-
-    with _dry_run_environment():
-        with open(out_path, "w") as f:
-            while window_start < until:
-                window_end = min(window_start + timedelta(days=window_days), until)
-                start_ts = reader.unix_to_apple(window_start.timestamp())
-                end_ts = reader.unix_to_apple(window_end.timestamp())
-
-                try:
-                    threads = reader.get_threads_since(
-                        last_apple_ts=start_ts,
-                        lookback_days=cfg["lookback_days"],
-                        blocked=cfg["blocked_contacts"],
-                        date_context_lookback_days=cfg["date_context_lookback_days"],
-                        date_context_max=cfg["date_context_max_messages"],
-                        end_apple_ts=end_ts,
-                    )
-                except RuntimeError as e:
-                    logger.error("%s", e)
-                    return BackfillResult(out_path, n_events, n_failed, first_failed_window)
-
-                if threads:
-                    logger.info(
-                        "Backfill window %s..%s: %d thread(s)",
-                        window_start.date(), window_end.date(), len(threads),
-                    )
-                    events, failed_chat_ids = detector.detect_plans(
-                        threads,
-                        today=window_end,
-                        evidence_gate=cfg["evidence_gate_enabled"],
-                        context_marking_enabled=cfg["context_marking_enabled"],
-                        date_resolver_enabled=cfg["date_resolver_enabled"],
-                    )
-                    for event in events:
-                        result = process_event(
-                            event, backfill_cfg, reference_date=window_end.date()
-                        )
-                        counts[result] = counts.get(result, 0) + 1
-                        n_events += 1
-                        f.write(json.dumps({
-                            "window_end": window_end.isoformat(),
-                            "chat_id": event.get("chat_id"),
-                            "title": event.get("title"),
-                            "date": event.get("date"),
-                            "end_date": event.get("end_date"),
-                            "status": event.get("status"),
-                            "confidence": event.get("confidence"),
-                            "evidence": event.get("evidence"),
-                            "result": result,
-                        }) + "\n")
-
-                    if failed_chat_ids:
-                        if first_failed_window is None:
-                            first_failed_window = window_start.date()
-                        logger.warning(
-                            "Backfill window %s..%s: detection call FAILED for %d "
-                            "thread(s) (%s) — coverage for this window is incomplete, "
-                            "not \"no plan found\"",
-                            window_start.date(), window_end.date(),
-                            len(failed_chat_ids), sorted(failed_chat_ids),
-                        )
-                        for chat_id in failed_chat_ids:
-                            n_failed += 1
-                            f.write(json.dumps({
-                                "window_end": window_end.isoformat(),
-                                "chat_id": chat_id,
-                                "result": "detection_failed",
-                            }) + "\n")
-
-                window_start = window_end
-
-    logger.info(
-        "Backfill done — %d event(s), %d failed detection call(s) across %s: %s",
-        n_events, n_failed, out_path, counts,
-    )
-    if n_failed:
-        logger.warning(
-            "%d detection call(s) failed starting at window %s — coverage from "
-            "there onward is INCOMPLETE (a billing/API problem looks identical to "
-            "\"no plans found\" unless you check this). Fix the underlying issue and "
-            "re-run, e.g. --since %s",
-            n_failed, first_failed_window, first_failed_window,
-        )
-    return BackfillResult(out_path, n_events, n_failed, first_failed_window)
-
-
 LAUNCHD_LOG_DIR = Path.home() / "Library" / "Logs" / "scheduling-agent"
 
 
@@ -691,80 +463,10 @@ def main() -> None:
         "--purge", action="store_true",
         help="Delete local state and logs (~/.scheduling-agent/state.json and ./logs), then exit.",
     )
-    parser.add_argument(
-        "--backfill", action="store_true",
-        help=(
-            "Replay historical messages through the real detector in "
-            "read-only dry-run mode (no calendar or state.json writes) — for "
-            "sanity-checking behavior against real message volume beyond "
-            "what shows up live in one day. Requires --since."
-        ),
-    )
-    parser.add_argument(
-        "--since",
-        help="Backfill start: an integer number of days ago, or an ISO date (YYYY-MM-DD).",
-    )
-    parser.add_argument(
-        "--until",
-        help="Backfill end: an ISO date (YYYY-MM-DD). Default: now.",
-    )
-    parser.add_argument(
-        "--window-days", type=float, default=1.0,
-        help=(
-            "Size of each backfill window in days (default 1). Each window is "
-            "anchored to its own end as \"today\" for relative-date resolution "
-            "and the past-event gate — smaller windows judge old messages "
-            "more like they'd have been judged at the time they were sent."
-        ),
-    )
-    parser.add_argument(
-        "--out",
-        help="Path to write the backfill JSONL decision log (default logs/backfill/<timestamp>.jsonl).",
-    )
     args = parser.parse_args()
 
     if args.purge:
         purge()
-        return
-
-    if args.backfill:
-        if not args.since:
-            parser.error("--backfill requires --since (an integer number of days, or an ISO date)")
-        setup_logging()
-        cfg = config.load()
-        try:
-            since_dt = (
-                datetime.now() - timedelta(days=int(args.since))
-                if args.since.lstrip("-").isdigit()
-                else datetime.strptime(args.since, "%Y-%m-%d")
-            )
-        except ValueError:
-            parser.error(f"--since must be an integer number of days or an ISO date, got {args.since!r}")
-            return
-        until_dt = None
-        if args.until:
-            try:
-                until_dt = datetime.strptime(args.until, "%Y-%m-%d")
-            except ValueError:
-                parser.error(f"--until must be an ISO date (YYYY-MM-DD), got {args.until!r}")
-                return
-        out_path = Path(args.out) if args.out else None
-        logger.info(
-            "Backfilling from %s to %s in %s-day windows (dry run — no calendar/state writes)",
-            since_dt.date(), (until_dt or datetime.now()).date(), args.window_days,
-        )
-        result = backfill(
-            cfg, since=since_dt, until=until_dt, window_days=args.window_days, out_path=out_path,
-        )
-        print(f"Backfill decision log written to {result.out_path} ({result.n_events} event(s))")
-        if result.n_failed:
-            print(
-                f"WARNING: {result.n_failed} detection call(s) failed starting at "
-                f"{result.first_failed_window} — coverage from there onward is "
-                f"INCOMPLETE (see 'detection_failed' lines in the log and the "
-                f"WARNING lines above). Fix the underlying issue (e.g. an exhausted "
-                f"API credit balance) and re-run with --since {result.first_failed_window}."
-            )
         return
 
     setup_logging()
