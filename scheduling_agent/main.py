@@ -157,8 +157,8 @@ def process_event(event: dict, cfg: dict) -> str:
     if decision.action == "skip_duplicate":
         matched_uid = decision.matched.get("calendar_uid") if decision.matched else None
         logger.info(
-            "Reconcile (%s): '%s' on %s duplicates existing event %r (uid=%s) — %s",
-            decision.source, title, date,
+            "Reconcile (%s/%s): '%s' on %s duplicates existing event %r (uid=%s) — %s",
+            decision.source, decision.relationship, title, date,
             decision.matched.get("title") if decision.matched else None,
             matched_uid, decision.reasoning,
         )
@@ -215,8 +215,9 @@ def process_event(event: dict, cfg: dict) -> str:
         )
         state.journal_commit(jid)
         logger.info(
-            "Updated event %r (uid=%s): %s — %s",
-            merged["title"], matched.get("calendar_uid"), decision.changes, decision.reasoning,
+            "Updated event %r (uid=%s, %s): %s — %s",
+            merged["title"], matched.get("calendar_uid"), decision.relationship,
+            decision.changes, decision.reasoning,
         )
         return "updated"
 

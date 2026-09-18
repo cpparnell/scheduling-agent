@@ -276,7 +276,15 @@ def find_record(chat_id: int, date: str, time_start: str | None, title: str) -> 
         if record.get("hash") == h:
             return record
 
+    # Among title-window matches, return the one NEAREST the new date rather
+    # than whichever happens to be first in the list. With a single match the
+    # two are identical; once a recurring plan has several live occurrences,
+    # first-in-list is arbitrary and can hand the reconciler the wrong instance
+    # to update (e.g. resolving "book club moved to Thursday" against last
+    # month's occurrence instead of this month's).
     key = _title_key(chat_id, title)
+    best = None
+    best_delta = None
     for record in events:
         if record.get("chat_id") != chat_id or _title_key(chat_id, record.get("title", "")) != key:
             continue
@@ -285,9 +293,10 @@ def find_record(chat_id: int, date: str, time_start: str | None, title: str) -> 
             new = date_type.fromisoformat(date)
         except (KeyError, TypeError, ValueError):
             continue
-        if abs((new - existing).days) < TITLE_DEDUP_WINDOW_DAYS:
-            return record
-    return None
+        delta = abs((new - existing).days)
+        if delta < TITLE_DEDUP_WINDOW_DAYS and (best_delta is None or delta < best_delta):
+            best, best_delta = record, delta
+    return best
 
 
 def make_record(

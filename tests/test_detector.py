@@ -1,6 +1,7 @@
 from datetime import datetime
 
 import httpx
+import pytest
 
 import anthropic
 from scheduling_agent import detector
@@ -622,6 +623,39 @@ def test_date_resolver_overrides_with_high_confidence_alternative(fake_anthropic
     assert event["date"] == "2026-09-19"
 
 
+def test_date_resolver_sends_temperature_zero(fake_anthropic):
+    # The F6c resolver decides the event's date outright, so leaving it at the
+    # default temperature keeps a date-flake source live even once detect_plans
+    # is pinned.
+    client = fake_anthropic([{"chosen_date": "2026-09-19", "confidence": 0.9}])
+    event = _event(date="2026-06-13", evidence="dinner this Saturday?", date_evidence="dinner this Saturday?")
+    thread = _thread(messages=[
+        {"sender": "+15551234567", "text": "the reunion is Sept 19", "from_me": False, "unix_ts": 1600000000.0},
+        {"sender": "+15551234567", "text": "dinner this Saturday?", "from_me": False, "unix_ts": 1700000000.0},
+        {"sender": "me", "text": "yes!", "from_me": True, "unix_ts": 1700000100.0},
+    ])
+
+    detector._second_pass_date_resolution(event, thread, model="claude-haiku-4-5")
+
+    assert client.messages.calls[0]["temperature"] == 0.0
+
+
+def test_detect_plans_sends_temperature_zero(fake_anthropic):
+    client = fake_anthropic([{"events": []}])
+
+    detector.detect_plans([_thread()], model="claude-haiku-4-5")
+
+    assert client.messages.calls[0]["temperature"] == 0.0
+
+
+def test_detect_plans_omits_temperature_for_five_family_model(fake_anthropic):
+    client = fake_anthropic([{"events": []}])
+
+    detector.detect_plans([_thread()], model="claude-opus-5")
+
+    assert "temperature" not in client.messages.calls[0]
+
+
 def test_date_resolver_ignores_low_confidence_alternative(fake_anthropic):
     fake_anthropic([{"chosen_date": "2026-09-19", "confidence": 0.5}])
     event = _event(date="2026-06-13", evidence="dinner this Saturday?", date_evidence="dinner this Saturday?")
@@ -805,6 +839,63 @@ def test_missing_date_evidence_is_dropped_not_bypassed(fake_anthropic, caplog):
 def test_evidence_found_rejects_empty_string_directly():
     assert detector._evidence_found("", _thread()) is False
     assert detector._evidence_found("   ", _thread()) is False
+
+
+# --- sender-label stripping in the evidence gate -----------------------------
+#
+# Regression: the model quotes evidence with the sender label the prompt showed
+# it. For a sender that is neither "me" nor a bare phone number (an email
+# address or a contact name), the label pattern required "(" to be followed
+# immediately by digits — but _format_thread emits "%a %m/%d/%Y %I:%M%p", so
+# the parenthetical starts with a WEEKDAY. Every such quote failed the verbatim
+# check and the correctly detected plan was silently dropped.
+
+
+@pytest.mark.parametrize("labelled,expected", [
+    # Email sender, real timestamp format (the observed failure).
+    ("coworker@example.com (Wed 09/09/2026 06:00AM): can we sync at 3pm?",
+     "can we sync at 3pm?"),
+    # Contact name with a space, plus the "sent N days ago" suffix.
+    ("Sarah Chen (Fri 07/11/2026 06:46PM, sent 3 days ago): dinner at 7?",
+     "dinner at 7?"),
+    # Previously-working forms must keep working.
+    ("Me (07/11 06:46PM, sent 3 days ago): works for me", "works for me"),
+    ("+15551234567: dinner at 7?", "dinner at 7?"),
+])
+def test_strip_quote_wrappers_removes_sender_labels(labelled, expected):
+    assert detector._strip_quote_wrappers(labelled) == expected
+
+
+@pytest.mark.parametrize("content", [
+    "Lunch (with Sam): sounds good",   # parenthetical with no date
+    "dinner at 7: ok?",                # bare colon in real content
+    "Plan B (backup): skip it",
+])
+def test_strip_quote_wrappers_leaves_real_content_alone(content):
+    # The label pattern must not eat message text that merely contains a colon
+    # — that would let fabricated evidence past the hallucination guard.
+    assert detector._strip_quote_wrappers(content) == content
+
+
+def test_evidence_gate_accepts_quote_carrying_an_email_sender_label():
+    thread = _thread(messages=[
+        {"sender": "coworker@example.com", "text": "can we sync Thursday at 3pm?",
+         "from_me": False, "unix_ts": 1700000000.0},
+        {"sender": "me", "text": "works for me", "from_me": True, "unix_ts": 1700000100.0},
+    ])
+    evidence = "coworker@example.com (Wed 09/09/2026 06:00AM): can we sync Thursday at 3pm?"
+
+    assert detector._evidence_found(evidence, thread) is True
+
+
+def test_evidence_gate_still_rejects_fabricated_quote_with_a_sender_label():
+    thread = _thread(messages=[
+        {"sender": "coworker@example.com", "text": "can we sync Thursday at 3pm?",
+         "from_me": False, "unix_ts": 1700000000.0},
+    ])
+    evidence = "coworker@example.com (Wed 09/09/2026 06:00AM): let's book the yacht for June"
+
+    assert detector._evidence_found(evidence, thread) is False
 
 
 # --- Fuzzy evidence: ordered subsequence + negation guard (F5b) ------------

@@ -624,3 +624,55 @@ def test_update_record_truncates_long_evidence():
     updated = state._load()["events"][0]
     assert len(updated["evidence"]) == state.EVIDENCE_MAX_CHARS + 1
     assert updated["evidence"].endswith("…")
+
+
+# --- find_record nearest-date tie-break ---------------------------------------
+#
+# Two same-title records in one chat can only coexist when they are more than
+# TITLE_DEDUP_WINDOW_DAYS apart — closer than that and record_event merges them
+# into one. A query date landing between two such occurrences matches BOTH via
+# the title window, which is when returning first-in-list becomes arbitrary.
+
+
+def _two_far_apart_occurrences():
+    state.record_event(1, "2099-06-01", "19:00", "Book Club")
+    state.record_event(1, "2099-07-05", "19:00", "Book Club")  # 34 days later
+    dates = sorted(r["date"] for r in state._load()["events"])
+    assert dates == ["2099-06-01", "2099-07-05"], dates  # both really are live
+
+
+def test_find_record_returns_nearest_date_among_title_window_matches():
+    _two_far_apart_occurrences()
+
+    # 17 days from the first, 12 from the second — both inside the 28-day
+    # window, so the nearest one must win regardless of insertion order.
+    match = state.find_record(1, "2099-06-23", "19:00", "Book Club")
+
+    assert match["date"] == "2099-07-05"
+
+
+def test_find_record_nearest_date_prefers_the_earlier_record_when_it_is_closer():
+    _two_far_apart_occurrences()
+
+    match = state.find_record(1, "2099-06-10", "19:00", "Book Club")
+
+    assert match["date"] == "2099-06-01"
+
+
+def test_find_record_nearest_date_ignores_records_outside_the_window():
+    state.record_event(1, "2099-06-01", "19:00", "Book Club")
+
+    # Well beyond TITLE_DEDUP_WINDOW_DAYS from the only record.
+    assert state.find_record(1, "2099-09-01", "19:00", "Book Club") is None
+
+
+def test_find_record_still_prefers_an_exact_hash_match():
+    """An exact hash match wins outright, even when the other record's date is
+    nearer to the requested one."""
+    _two_far_apart_occurrences()
+
+    # Ask for the EARLIER record's exact identity from a date where the later
+    # record would be the nearest title-window match.
+    match = state.find_record(1, "2099-06-01", "19:00", "Book Club")
+
+    assert match["date"] == "2099-06-01"

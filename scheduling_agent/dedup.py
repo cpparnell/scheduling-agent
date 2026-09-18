@@ -10,13 +10,21 @@ logger = logging.getLogger(__name__)
 
 _client = None
 
+# Wall-clock ceiling on a single request. Observed failure: an eval run sat
+# blocked in a socket read for 33 minutes on one adjudication with no data
+# arriving and never recovered — a hung request otherwise stalls the whole
+# agent (or eval suite) indefinitely, since the poll loop is single-threaded.
+# Every call here is small (max_tokens 300 for dedup, 2048 for detection), so
+# a request still running after this long is hung, not slow.
+REQUEST_TIMEOUT_SECONDS = 120.0
+
 
 def _get_client() -> "anthropic.Anthropic":
     """Lazily construct the Anthropic client so importing this module does not
     require ANTHROPIC_API_KEY (and so tests can swap in a fake)."""
     global _client
     if _client is None:
-        _client = anthropic.Anthropic()
+        _client = anthropic.Anthropic(timeout=REQUEST_TIMEOUT_SECONDS)
     return _client
 
 
@@ -56,10 +64,19 @@ between "duplicate" and "different", answer is_duplicate=true — a plan that re
 you was already detected once, and a missed duplicate spams the calendar and erodes
 trust, while a wrong "same" verdict merely merges the mention into the existing
 event. Only answer is_duplicate=false when the plans are clearly distinct activities
-(different purpose, different people, or explicitly separate arrangements). When
-uncertain between "reschedule" and "new_occurrence" for a recurring-sounding plan,
-prefer "new_occurrence" — merging two genuinely separate occurrences into one is a
-worse error than leaving both on the calendar.
+(different purpose, different people, or explicitly separate arrangements).
+
+Answer the relationship question SECOND, and only once you have decided the plans
+are the same. Choose "reschedule" when the conversation moves this plan to a new
+date or time — the move may have been agreed earlier in the thread and only settled
+now, so a plan whose date shifts while the title, time and participants stay the
+same is a reschedule, not a fresh event. Choose "new_occurrence" only when the
+messages explicitly describe a further instance of something recurring ("next
+month's book club"). In every other case, including when you are unsure between
+the three, choose "duplicate" — it is the safe answer because it does not change
+when the event happens.
+
+Report your confidence in the overall verdict as a number from 0 to 1.
 
 Respond with JSON only.
 """
@@ -79,13 +96,34 @@ ADJUDICATOR_SCHEMA = {
             "description": "how the new plan relates to duplicate_of when is_duplicate=true; "
                             "placeholder value when is_duplicate=false",
         },
+        "confidence": {
+            "type": "number",
+            "description": "0-1 confidence in the verdict; observability only, never gates a decision",
+        },
         "reasoning": {"type": "string"},
     },
-    "required": ["is_duplicate", "duplicate_of", "relationship", "reasoning"],
+    "required": ["is_duplicate", "duplicate_of", "relationship", "confidence", "reasoning"],
 }
 
 # Never adjudicate against more than this many candidates in one call.
 MAX_CANDIDATES = 5
+
+# Models that reject an explicit `temperature` with a 400. The 5-family and
+# Opus 4.7/4.8 only sample at their own default; Haiku 4.5 and Sonnet 4.6 (the
+# adjudicator models we actually run) accept it. Keep this in sync with the
+# `dedup_model` note in config.py — setting dedup_model to a listed model
+# without this guard turns every adjudication into a hard API error.
+_NO_TEMPERATURE_PREFIXES = (
+    "claude-sonnet-5", "claude-opus-5", "claude-opus-4-7",
+    "claude-opus-4-8", "claude-fable", "claude-mythos",
+)
+
+
+def sampling_kwargs(model: str, temperature: float) -> dict:
+    """`temperature` kwargs for `messages.create`, dropped for models that
+    reject the parameter. Every LLM call in the agent goes through this so a
+    model swap can't silently reintroduce default-temperature sampling."""
+    return {} if model.startswith(_NO_TEMPERATURE_PREFIXES) else {"temperature": temperature}
 
 
 def find_candidates(event: dict, existing: list[dict], day_window: int = 1) -> list[dict]:
@@ -133,10 +171,46 @@ def _format_new_plan(event: dict) -> str:
     )
 
 
-def adjudicate(event: dict, candidates: list[dict], model: str) -> dict | None:
+def _call_adjudicator(prompt: str, model: str, temperature: float) -> dict | None:
+    """One adjudication request + parse. Returns the verdict dict, or None on
+    any failure (transport error, empty response, unparseable JSON)."""
+    response = _get_client().messages.create(
+        model=model,
+        max_tokens=300,
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": prompt}],
+        output_config={"format": {"type": "json_schema", "schema": ADJUDICATOR_SCHEMA}},
+        **sampling_kwargs(model, temperature),
+    )
+    usage_tracker.record(model, getattr(response, "usage", None))
+    text = next((b.text for b in response.content if b.type == "text"), None)
+    if not text:
+        return None
+    return json.loads(text)
+
+
+def _candidate_identity(candidate: dict) -> str | None:
+    """Stable id for a candidate across differently-ordered adjudication calls."""
+    for key in ("canonical_id", "hash", "calendar_uid"):
+        value = candidate.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def adjudicate(
+    event: dict, candidates: list[dict], model: str,
+    temperature: float = 0.0, source: str | None = None,
+) -> dict | None:
     """One structured-output call deciding whether `event` duplicates one of
     `candidates`. Returns the parsed verdict dict, or None on any error (the
-    caller applies its own fail-open/fail-closed policy)."""
+    caller applies its own fail-open/fail-closed policy).
+
+    Sampled at temperature 0 by default: this call is a classification, and
+    default-temperature sampling was a measured source of run-to-run flapping
+    on borderline pairs. Retried exactly once on any failure — a transient
+    error or one malformed JSON body otherwise falls straight through to the
+    caller's fail-open policy and creates a duplicate event."""
     if not candidates:
         return None
 
@@ -145,19 +219,45 @@ def adjudicate(event: dict, candidates: list[dict], model: str) -> dict | None:
         f"EXISTING CALENDAR EVENTS:\n{_format_candidates(candidates)}"
     )
 
-    try:
-        response = _get_client().messages.create(
-            model=model,
-            max_tokens=300,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": prompt}],
-            output_config={"format": {"type": "json_schema", "schema": ADJUDICATOR_SCHEMA}},
-        )
-        usage_tracker.record(model, getattr(response, "usage", None))
-        text = next((b.text for b in response.content if b.type == "text"), None)
-        if not text:
-            return None
-        return json.loads(text)
-    except Exception as e:
-        logger.warning("Dedup adjudication failed for %r: %s", event.get("title"), e)
-        return None
+    verdict = None
+    retried = False
+    for attempt in (1, 2):
+        try:
+            verdict = _call_adjudicator(prompt, model, temperature)
+            if verdict is not None:
+                break
+            reason = "empty response"
+        except Exception as e:
+            reason = repr(e)
+        usage_tracker.record_failure(reason)
+        if attempt == 1:
+            retried = True
+            logger.warning(
+                "Dedup adjudication attempt 1 failed for %r (%s); retrying",
+                event.get("title"), reason,
+            )
+        else:
+            logger.warning(
+                "Dedup adjudication failed for %r after retry (%s)",
+                event.get("title"), reason,
+            )
+
+    logger.info(
+        "dedup_adjudication %s",
+        json.dumps({
+            "title": event.get("title"),
+            "date": event.get("date"),
+            "chat_id": event.get("chat_id"),
+            "source": source,
+            "model": model,
+            "temperature": temperature,
+            "retried": retried,
+            "candidates": [_candidate_identity(c) for c in candidates],
+            "is_duplicate": (verdict or {}).get("is_duplicate"),
+            "duplicate_of": (verdict or {}).get("duplicate_of"),
+            "relationship": (verdict or {}).get("relationship"),
+            "confidence": (verdict or {}).get("confidence"),
+            "failed": verdict is None,
+        }, default=str),
+    )
+    return verdict
