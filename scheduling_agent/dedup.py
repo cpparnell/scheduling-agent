@@ -173,7 +173,13 @@ def _format_new_plan(event: dict) -> str:
 
 def _call_adjudicator(prompt: str, model: str, temperature: float) -> dict | None:
     """One adjudication request + parse. Returns the verdict dict, or None on
-    any failure (transport error, empty response, unparseable JSON)."""
+    any failure (transport error, empty response, unparseable JSON).
+
+    usage_tracker.record() is only called once the response has actually
+    parsed into a usable verdict — recording it right after the HTTP call
+    and then also calling record_failure() on a later parse failure would
+    double-count that single call into both total_calls and failed_calls,
+    inflating usage_tracker.summary()'s call_failure_rate."""
     response = _get_client().messages.create(
         model=model,
         max_tokens=300,
@@ -182,11 +188,12 @@ def _call_adjudicator(prompt: str, model: str, temperature: float) -> dict | Non
         output_config={"format": {"type": "json_schema", "schema": ADJUDICATOR_SCHEMA}},
         **sampling_kwargs(model, temperature),
     )
-    usage_tracker.record(model, getattr(response, "usage", None))
     text = next((b.text for b in response.content if b.type == "text"), None)
     if not text:
         return None
-    return json.loads(text)
+    verdict = json.loads(text)
+    usage_tracker.record(model, getattr(response, "usage", None))
+    return verdict
 
 
 def _candidate_identity(candidate: dict) -> str | None:

@@ -5,6 +5,17 @@ from datetime import date as date_type, timedelta
 from scheduling_agent import state
 
 
+def _d(offset_days: int = 0) -> str:
+    """ISO date offset_days from today. Tests that persist a record through
+    record_event/record_observation/journal_commit/update_record must anchor
+    dates to "today" rather than hardcoding a calendar date: _prune_state's
+    90-day retention window compares stored dates against the real wall
+    clock, so a fixed date silently starts getting pruned — and the test
+    failing — once enough real time passes (as happened with the old
+    hardcoded "2026-06-13" fixtures here)."""
+    return (date_type.today() + timedelta(days=offset_days)).isoformat()
+
+
 def test_event_hash_normalizes_case_and_whitespace():
     a = state.event_hash(1, "2026-06-13", None, "Dinner With Sam")
     b = state.event_hash(1, "2026-06-13", None, "  dinner with sam  ")
@@ -43,25 +54,25 @@ def test_event_hash_distinct_titles_same_time_do_not_collapse():
 
 
 def test_record_event_then_is_duplicate():
-    assert state.is_duplicate(1, "2026-06-13", None, "Dinner") is False
-    state.record_event(1, "2026-06-13", None, "Dinner")
-    assert state.is_duplicate(1, "2026-06-13", None, "Dinner") is True
+    assert state.is_duplicate(1, _d(), None, "Dinner") is False
+    state.record_event(1, _d(), None, "Dinner")
+    assert state.is_duplicate(1, _d(), None, "Dinner") is True
     # Normalized variant is also a duplicate.
-    assert state.is_duplicate(1, "2026-06-13", None, "  DINNER ") is True
+    assert state.is_duplicate(1, _d(), None, "  DINNER ") is True
 
 
 def test_record_event_reworded_title_same_slot_is_duplicate():
-    state.record_event(1, "2026-06-14", "17:30", "Pizza at Dicey's")
-    assert state.is_duplicate(1, "2026-06-14", "17:30", "At Dicey's Pizza") is True
+    state.record_event(1, _d(1), "17:30", "Pizza at Dicey's")
+    assert state.is_duplicate(1, _d(1), "17:30", "At Dicey's Pizza") is True
     # A different time no longer changes the hash (F2b) — same plan either way.
-    assert state.is_duplicate(1, "2026-06-14", "20:00", "At Dicey's Pizza") is True
+    assert state.is_duplicate(1, _d(1), "20:00", "At Dicey's Pizza") is True
     # A genuinely different title at the same slot is not a duplicate.
-    assert state.is_duplicate(1, "2026-06-14", "17:30", "Drinks") is False
+    assert state.is_duplicate(1, _d(1), "17:30", "Drinks") is False
 
 
 def test_record_event_does_not_touch_timestamp():
     state.update_timestamp(500)
-    state.record_event(1, "2026-06-13", None, "Dinner")
+    state.record_event(1, _d(), None, "Dinner")
     assert state.get_last_timestamp() == 500
 
 
@@ -76,7 +87,7 @@ def test_update_timestamp_is_monotonic():
 
 def test_fresh_state_defaults():
     assert state.get_last_timestamp() is None
-    assert state.is_duplicate(1, "2026-06-13", None, "Anything") is False
+    assert state.is_duplicate(1, _d(), None, "Anything") is False
 
 
 def test_fresh_state_file_is_stamped_with_current_version():
@@ -113,27 +124,27 @@ def test_normalize_title_strips_month_names():
 
 
 def test_title_dedup_blocks_same_title_within_window():
-    state.record_event(300, "2026-07-09", "14:00", "July Munch at Sinha")
+    state.record_event(300, _d(26), "14:00", "July Munch at Sinha")
     # Different date but within 28 days, title normalizes to the same key → duplicate
-    assert state.is_duplicate(300, "2026-07-16", "14:00", "Munch at Sinha") is True
+    assert state.is_duplicate(300, _d(33), "14:00", "Munch at Sinha") is True
 
 
 def test_title_dedup_allows_same_title_outside_window():
-    state.record_event(300, "2026-07-09", "14:00", "July Munch at Sinha")
+    state.record_event(300, _d(26), "14:00", "July Munch at Sinha")
     # 35 days later → outside the 28-day window → new occurrence allowed
-    assert state.is_duplicate(300, "2026-08-13", "14:00", "August Munch at Sinha") is False
+    assert state.is_duplicate(300, _d(61), "14:00", "August Munch at Sinha") is False
 
 
 def test_title_dedup_isolated_by_chat():
-    state.record_event(300, "2026-07-09", "14:00", "Munch at Sinha")
+    state.record_event(300, _d(26), "14:00", "Munch at Sinha")
     # Same title and date range but different chat → not a duplicate
-    assert state.is_duplicate(999, "2026-07-16", "14:00", "Munch at Sinha") is False
+    assert state.is_duplicate(999, _d(33), "14:00", "Munch at Sinha") is False
 
 
 def test_title_dedup_matches_across_month_prefix_variants():
-    state.record_event(300, "2026-07-09", "14:00", "July Munch at Sinha")
+    state.record_event(300, _d(26), "14:00", "July Munch at Sinha")
     # "August Munch" strips to same key as "July Munch"; close date → blocked
-    assert state.is_duplicate(300, "2026-07-16", "14:00", "August Munch at Sinha") is True
+    assert state.is_duplicate(300, _d(33), "14:00", "August Munch at Sinha") is True
 
 
 def test_migrate_is_noop_for_current_version():
@@ -178,7 +189,7 @@ def test_v0_to_v3_migration_chain():
 
 def test_record_event_stores_descriptive_record():
     state.record_event(
-        1, "2026-06-13", "19:00", "Dinner with Sam",
+        1, _d(), "19:00", "Dinner with Sam",
         location="Dicey's", status="confirmed",
         evidence="dinner at 7?", calendar_uid="ABC-123",
     )
@@ -186,7 +197,7 @@ def test_record_event_stores_descriptive_record():
     assert len(events) == 1
     record = events[0]
     assert record["chat_id"] == 1
-    assert record["date"] == "2026-06-13"
+    assert record["date"] == _d()
     assert record["time_start"] == "19:00"
     assert record["title"] == "Dinner with Sam"
     assert record["location"] == "Dicey's"
@@ -198,35 +209,35 @@ def test_record_event_stores_descriptive_record():
 
 
 def test_get_events_near_same_day():
-    state.record_event(1, "2026-06-13", "19:00", "Dinner")
-    matches = state.get_events_near("2026-06-13", window_days=1)
+    state.record_event(1, _d(), "19:00", "Dinner")
+    matches = state.get_events_near(_d(), window_days=1)
     assert len(matches) == 1
     assert matches[0]["title"] == "Dinner"
 
 
 def test_get_events_near_within_window():
-    state.record_event(1, "2026-06-12", "19:00", "Dinner")
-    state.record_event(1, "2026-06-14", "19:00", "Lunch")
-    matches = state.get_events_near("2026-06-13", window_days=1)
+    state.record_event(1, _d(-1), "19:00", "Dinner")
+    state.record_event(1, _d(1), "19:00", "Lunch")
+    matches = state.get_events_near(_d(), window_days=1)
     titles = {m["title"] for m in matches}
     assert titles == {"Dinner", "Lunch"}
 
 
 def test_get_events_near_outside_window_excluded():
-    state.record_event(1, "2026-06-01", "19:00", "Dinner")
-    matches = state.get_events_near("2026-06-13", window_days=1)
+    state.record_event(1, _d(-12), "19:00", "Dinner")
+    matches = state.get_events_near(_d(), window_days=1)
     assert matches == []
 
 
 def test_get_events_near_excludes_suppressed():
-    state.record_event(1, "2026-06-13", "19:00", "Dinner", suppressed=True)
-    matches = state.get_events_near("2026-06-13", window_days=1)
+    state.record_event(1, _d(), "19:00", "Dinner", suppressed=True)
+    matches = state.get_events_near(_d(), window_days=1)
     assert matches == []
 
 
 def test_suppressed_record_still_trips_is_duplicate():
-    state.record_event(1, "2026-06-13", "19:00", "Dinner", suppressed=True)
-    assert state.is_duplicate(1, "2026-06-13", "19:00", "Dinner") is True
+    state.record_event(1, _d(), "19:00", "Dinner", suppressed=True)
+    assert state.is_duplicate(1, _d(), "19:00", "Dinner") is True
 
 
 def test_watermark_hold_default_and_round_trip():
@@ -330,7 +341,7 @@ def test_prune_state_drops_created_events_and_title_events_with_stale_records():
 def test_prune_state_keeps_recent_event_hash_and_title_key_in_sync():
     # A record just inside the retention window keeps its hash and title key
     # alive together, so is_duplicate()=True and find_record() never disagree.
-    state.record_event(1, "2026-06-13", "19:00", "Dinner with Sam")
+    state.record_event(1, _d(), "19:00", "Dinner with Sam")
     data = state._load()
     record = data["events"][0]
     assert record["hash"] in data["created_events"]
@@ -363,24 +374,24 @@ def test_v0_to_v6_migration_chain_adds_observations():
 
 
 def test_record_observation_round_trips():
-    state.record_observation(1, "2026-06-13", "19:00", "Dinner", "unanswered")
+    state.record_observation(1, _d(), "19:00", "Dinner", "unanswered")
 
-    obs = state.get_observation(1, "2026-06-13", "19:00", "Dinner")
+    obs = state.get_observation(1, _d(), "19:00", "Dinner")
     assert obs is not None
     assert obs["last_status"] == "unanswered"
-    assert obs["date"] == "2026-06-13"
+    assert obs["date"] == _d()
     assert obs["count"] == 1
 
 
 def test_get_observation_returns_none_when_never_recorded():
-    assert state.get_observation(1, "2026-06-13", "19:00", "Dinner") is None
+    assert state.get_observation(1, _d(), "19:00", "Dinner") is None
 
 
 def test_record_observation_increments_count_and_updates_status():
-    state.record_observation(1, "2026-06-13", "19:00", "Dinner", "unanswered")
-    state.record_observation(1, "2026-06-13", "19:00", "Dinner", "low-confidence")
+    state.record_observation(1, _d(), "19:00", "Dinner", "unanswered")
+    state.record_observation(1, _d(), "19:00", "Dinner", "low-confidence")
 
-    obs = state.get_observation(1, "2026-06-13", "19:00", "Dinner")
+    obs = state.get_observation(1, _d(), "19:00", "Dinner")
     assert obs["count"] == 2
     assert obs["last_status"] == "low-confidence"
 
@@ -467,25 +478,25 @@ def test_prune_state_keeps_malformed_observation_date_rather_than_dropping():
 
 
 def test_pending_journal_entry_trips_is_duplicate():
-    record = state.make_record(1, "2026-06-13", "19:00", "Dinner")
+    record = state.make_record(1, _d(), "19:00", "Dinner")
     state.journal_intent(record)
     # Exact hash match against the pending record.
-    assert state.is_duplicate(1, "2026-06-13", "19:00", "Dinner") is True
+    assert state.is_duplicate(1, _d(), "19:00", "Dinner") is True
     # Title-window match against the pending record.
-    assert state.is_duplicate(1, "2026-06-20", None, "Dinner") is True
+    assert state.is_duplicate(1, _d(7), None, "Dinner") is True
     # Unrelated event is not blocked.
-    assert state.is_duplicate(2, "2026-06-13", "19:00", "Dinner") is False
+    assert state.is_duplicate(2, _d(), "19:00", "Dinner") is False
 
 
 def test_pending_journal_entry_appears_in_get_events_near():
-    record = state.make_record(1, "2026-06-13", "19:00", "Dinner")
+    record = state.make_record(1, _d(), "19:00", "Dinner")
     state.journal_intent(record)
-    matches = state.get_events_near("2026-06-13", window_days=1)
+    matches = state.get_events_near(_d(), window_days=1)
     assert [m["title"] for m in matches] == ["Dinner"]
 
 
 def test_journal_commit_lands_record_and_clears_journal():
-    record = state.make_record(1, "2026-06-13", "19:00", "Dinner")
+    record = state.make_record(1, _d(), "19:00", "Dinner")
     jid = state.journal_intent(record)
     state.journal_commit(jid, calendar_uid="UID-1")
 
@@ -494,17 +505,17 @@ def test_journal_commit_lands_record_and_clears_journal():
     assert len(data["events"]) == 1
     assert data["events"][0]["calendar_uid"] == "UID-1"
     assert record["hash"] in data["created_events"]
-    assert state.is_duplicate(1, "2026-06-13", "19:00", "Dinner") is True
+    assert state.is_duplicate(1, _d(), "19:00", "Dinner") is True
 
 
 def test_journal_drop_removes_entry_without_committing():
-    record = state.make_record(1, "2026-06-13", "19:00", "Dinner")
+    record = state.make_record(1, _d(), "19:00", "Dinner")
     jid = state.journal_intent(record)
     state.journal_drop(jid)
 
     assert state.get_pending_journal() == []
     assert state._load()["events"] == []
-    assert state.is_duplicate(1, "2026-06-13", "19:00", "Dinner") is False
+    assert state.is_duplicate(1, _d(), "19:00", "Dinner") is False
 
 
 def test_journal_commit_unknown_id_is_noop():
@@ -513,7 +524,7 @@ def test_journal_commit_unknown_id_is_noop():
 
 
 def test_update_record_applies_changes_and_keeps_old_hash():
-    state.record_event(1, "2026-06-13", "19:00", "Dinner", calendar_uid="UID-1")
+    state.record_event(1, _d(), "19:00", "Dinner", calendar_uid="UID-1")
     record = state._load()["events"][0]
 
     ok = state.update_record(
@@ -531,12 +542,12 @@ def test_update_record_applies_changes_and_keeps_old_hash():
     assert updated["revisions"][0]["changed"] == {"time_start": ["19:00", "20:00"]}
     assert updated["revisions"][0]["reason"] == "rescheduled in chat"
     # Both the old and new wording/time stay deduplicated.
-    assert state.is_duplicate(1, "2026-06-13", "19:00", "Dinner") is True
-    assert state.is_duplicate(1, "2026-06-13", "20:00", "Dinner") is True
+    assert state.is_duplicate(1, _d(), "19:00", "Dinner") is True
+    assert state.is_duplicate(1, _d(), "20:00", "Dinner") is True
 
 
 def test_update_record_no_material_change_records_no_revision():
-    state.record_event(1, "2026-06-13", "19:00", "Dinner")
+    state.record_event(1, _d(), "19:00", "Dinner")
     record = state._load()["events"][0]
     state.update_record(record["canonical_id"], {"time_start": "19:00"})
     assert state._load()["events"][0]["revisions"] == []
@@ -547,9 +558,9 @@ def test_update_record_unknown_id_returns_false():
 
 
 def test_get_active_events_excludes_suppressed_includes_pending():
-    state.record_event(1, "2026-06-13", "19:00", "Dinner")
-    state.record_event(1, "2026-07-01", None, "Trip", suppressed=True)
-    state.journal_intent(state.make_record(2, "2026-08-01", None, "Concert"))
+    state.record_event(1, _d(), "19:00", "Dinner")
+    state.record_event(1, _d(18), None, "Trip", suppressed=True)
+    state.journal_intent(state.make_record(2, _d(49), None, "Concert"))
 
     titles = {r["title"] for r in state.get_active_events()}
 
@@ -560,7 +571,7 @@ def test_get_active_events_excludes_suppressed_includes_pending():
 
 
 def test_save_leaves_no_leftover_temp_files():
-    state.record_event(1, "2026-06-13", "19:00", "Dinner")
+    state.record_event(1, _d(), "19:00", "Dinner")
     leftovers = list(state.STATE_DIR.glob(".state-*.json.tmp"))
     assert leftovers == []
     assert state.STATE_FILE.exists()
@@ -573,7 +584,7 @@ def test_save_is_atomic_via_rename(monkeypatch):
     # content, never a half-written mix. Simulate that boundary by failing
     # deliberately right before the rename and confirming the real file (if
     # it exists at all) still parses cleanly with its prior content intact.
-    state.record_event(1, "2026-06-13", "19:00", "Dinner")
+    state.record_event(1, _d(), "19:00", "Dinner")
     before = state.STATE_FILE.read_text()
 
     real_replace = os.replace
@@ -583,7 +594,7 @@ def test_save_is_atomic_via_rename(monkeypatch):
 
     monkeypatch.setattr(state.os, "replace", boom)
     try:
-        state.record_event(2, "2026-06-14", "19:00", "Lunch")
+        state.record_event(2, _d(1), "19:00", "Lunch")
     except RuntimeError:
         pass
     monkeypatch.setattr(state.os, "replace", real_replace)
@@ -615,7 +626,7 @@ def test_make_record_handles_none_evidence():
 
 
 def test_update_record_truncates_long_evidence():
-    state.record_event(1, "2026-06-13", "19:00", "Dinner")
+    state.record_event(1, _d(), "19:00", "Dinner")
     record = state._load()["events"][0]
     long_evidence = "y" * (state.EVIDENCE_MAX_CHARS + 50)
 

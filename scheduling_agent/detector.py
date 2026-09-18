@@ -157,7 +157,7 @@ message as `evidence`.
 - "every month", "monthly" → "monthly"
 - One-time event → null
 
-**Multi-day events**: If the plan spans multiple days (trips, conferences, festivals), set `end_date` to the ISO 8601 last day of the event. For single-day events, set `end_date` to null.
+**Multi-day events**: If the plan spans multiple days (trips, conferences, festivals), set `end_date` to the ISO 8601 last day of the event — INCLUSIVE, the actual last calendar day it happens, not one day past it (do not apply the Google Calendar API convention of an exclusive end date; that conversion happens downstream). For single-day events — the overwhelming majority, including anything with only one date mentioned — set `end_date` to null. When in doubt, use null.
 
 Respond with a JSON object only. No prose.
 """
@@ -567,6 +567,50 @@ def _reconcile_weekday(event: dict, chat_id) -> None:
             pass
 
 
+# Language that plausibly justifies a plan actually spanning multiple days:
+# an explicit multi-day noun ("trip", "weekend"), a range joiner between two
+# date-like tokens ("Friday-Sunday", "the 3rd through the 5th"), or a night
+# count ("2 nights"). Deliberately narrower than ANCHOR_PATTERN/EXPLICIT_DATE_RE
+# — those flag *any* date-like content, not specifically a *range* of days.
+_MULTI_DAY_SIGNAL_RE = re.compile(
+    r"(?i:\bweekend\b|\btrip\b|\bvacation\b|\bgetaway\b|\bfestival\b|"
+    r"\bconference\b|\btour\b|\bovernight\b|\bnights?\b|\b\d+[\s-]*days?\b|"
+    r"\b(?:mon|tues?|wed(?:nes)?|thu(?:rs)?|fri|sat(?:ur)?|sun)[a-z]*\s*"
+    r"(?:-|–|—|to|through|thru|until)\s*"
+    r"(?:mon|tues?|wed(?:nes)?|thu(?:rs)?|fri|sat(?:ur)?|sun)[a-z]*\b|"
+    r"\d{1,2}(?:st|nd|rd|th)?\s*(?:-|–|—|to|through|thru|until)\s*\d{1,2}(?:st|nd|rd|th)?\b)"
+)
+
+
+def _validate_end_date(event: dict, chat_id) -> None:
+    """Clear an end_date the model's own evidence doesn't support.
+
+    Models trained on the Google Calendar API convention (all-day end dates
+    are exclusive) sometimes apply that convention themselves and emit
+    end_date = date + 1 for a plan that is really just one day — but
+    calendar._compute_span already treats end_date as the *inclusive* last
+    day and adds the exclusive +1 itself, so an untrue end_date silently
+    turns a one-day plan into a two-day all-day event. Require actual
+    multi-day language in the evidence before trusting end_date at all.
+    """
+    end_date_str = event.get("end_date")
+    date_str = event.get("date")
+    if not end_date_str or not date_str or end_date_str == date_str:
+        return
+
+    evidence_text = event.get("evidence") or ""
+    date_evidence_text = event.get("date_evidence") or ""
+    if _MULTI_DAY_SIGNAL_RE.search(evidence_text) or _MULTI_DAY_SIGNAL_RE.search(date_evidence_text):
+        return
+
+    logger.warning(
+        "  -> Dropping unsupported end_date in thread %s: %s (%s -> %s) has no "
+        "multi-day evidence",
+        chat_id, event.get("title"), date_str, end_date_str,
+    )
+    event["end_date"] = None
+
+
 _DATE_RESOLVER_MODEL_MAX_TOKENS = 200
 
 _DATE_RESOLVER_SCHEMA = {
@@ -640,11 +684,12 @@ def _second_pass_date_resolution(
             output_config={"format": {"type": "json_schema", "schema": _DATE_RESOLVER_SCHEMA}},
             **sampling_kwargs(model, 0.0),
         )
-        usage_tracker.record(model, getattr(response, "usage", None))
         text = next((b.text for b in response.content if b.type == "text"), None)
         if not text:
+            usage_tracker.record_failure("empty response")
             return
         result = json.loads(text)
+        usage_tracker.record(model, getattr(response, "usage", None))
     except Exception as e:
         usage_tracker.record_failure(repr(e))
         logger.warning("Second-pass date resolution failed for %r: %s", event.get("title"), e)
@@ -784,16 +829,16 @@ def detect_plans(
                 output_config={"format": {"type": "json_schema", "schema": RESPONSE_SCHEMA}},
                 **sampling_kwargs(model, 0.0),
             )
-            usage_tracker.record(model, getattr(response, "usage", None))
-
             text = next(
                 (b.text for b in response.content if b.type == "text"),
                 None
             )
             if not text:
+                usage_tracker.record_failure("empty response")
                 continue
 
             payload = json.loads(text)
+            usage_tracker.record(model, getattr(response, "usage", None))
 
             # Legacy single-object shape (has_event/date at the top level)
             # from an older cached payload or an off-spec model response.
@@ -837,6 +882,7 @@ def detect_plans(
                         continue
 
                 _reconcile_weekday(event, thread["chat_id"])
+                _validate_end_date(event, thread["chat_id"])
                 if date_resolver_enabled:
                     _second_pass_date_resolution(event, thread, model=model, today=today)
                 _demote_if_user_silent(event, thread)

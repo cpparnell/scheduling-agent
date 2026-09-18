@@ -1,5 +1,7 @@
+import json
 import threading
 import time
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -856,3 +858,147 @@ class TestRunGate:
         for i in range(0, len(order), 2):
             assert order[i] == "enter"
             assert order[i + 1] == "exit"
+
+
+class TestParseBackfillSince:
+    """--since accepts a non-negative integer number of days ago, or an ISO
+    date. A negative integer must be rejected, not silently interpreted as a
+    future date (see PR #15 review comment #2)."""
+
+    def test_integer_days_ago(self):
+        now = datetime(2026, 6, 15)
+        assert main.parse_backfill_since("10", now=now) == now - timedelta(days=10)
+
+    def test_iso_date(self):
+        assert main.parse_backfill_since("2026-01-01") == datetime(2026, 1, 1)
+
+    def test_negative_integer_is_rejected(self):
+        with pytest.raises(ValueError):
+            main.parse_backfill_since("-5")
+
+    def test_garbage_is_rejected(self):
+        with pytest.raises(ValueError):
+            main.parse_backfill_since("not-a-date")
+
+
+class TestBackfill:
+    """main.backfill() replays history through the real detector/reconcile
+    pipeline in dry-run mode — no calendar or state.json writes."""
+
+    def test_creates_decision_log_without_touching_calendar_or_state(
+        self, fake_chat_db, fake_anthropic, spy_create_event, tmp_path
+    ):
+        send_time = time.time() - 10 * 86400
+        fake_chat_db([
+            {
+                "participants": ["+15551234567"],
+                "messages": [
+                    {"text": "dinner friday?", "from_me": False, "unix_ts": send_time - 3600},
+                    {"text": "yes 7pm", "from_me": True, "unix_ts": send_time},
+                ],
+            }
+        ])
+        fake_anthropic([_response(_event())])
+        out_path = tmp_path / "backfill.jsonl"
+
+        result = main.backfill(
+            _cfg(),
+            since=datetime.now() - timedelta(days=15),
+            until=datetime.now(),
+            window_days=30,  # one window covers the whole range
+            out_path=out_path,
+        )
+
+        # The real calendar.create_event (spied on) was never called — only
+        # backfill's own dry-run stub ran.
+        assert spy_create_event["calls"] == []
+        # Nothing was written to the real (isolated-by-fixture) state file.
+        assert not state.STATE_FILE.exists()
+
+        assert result.out_path == out_path
+        assert result.n_events == 1
+        assert result.n_failed == 0
+        lines = [json.loads(l) for l in out_path.read_text().splitlines()]
+        assert len(lines) == 1
+        assert lines[0]["title"] == "Dinner"
+        assert lines[0]["result"] == "created"
+
+    def test_window_end_is_used_as_today_not_the_live_clock(
+        self, fake_chat_db, fake_anthropic, spy_create_event, tmp_path
+    ):
+        # A message from 10 days ago proposing a plan for "that same day" —
+        # in the past relative to the live clock, but not relative to the
+        # window it was sent in.
+        send_dt = datetime.now() - timedelta(days=10)
+        fake_chat_db([
+            {
+                "participants": ["+15551234567"],
+                "messages": [
+                    {"text": "dinner today?", "from_me": False, "unix_ts": send_dt.timestamp() - 3600},
+                    {"text": "yes 7pm", "from_me": True, "unix_ts": send_dt.timestamp()},
+                ],
+            }
+        ])
+        fake_anthropic([_response(_event(date=send_dt.strftime("%Y-%m-%d")))])
+
+        main.backfill(
+            _cfg(),
+            since=send_dt - timedelta(hours=2),
+            until=send_dt + timedelta(days=1),
+            window_days=1,
+            out_path=tmp_path / "backfill.jsonl",
+        )
+
+        assert spy_create_event["calls"] == []  # backfill never calls the real one
+        assert len(spy_create_event["calls"]) == 0
+
+    def test_empty_history_writes_an_empty_log(self, fake_chat_db, fake_anthropic, tmp_path):
+        fake_chat_db([])
+        out_path = tmp_path / "backfill.jsonl"
+
+        result = main.backfill(
+            _cfg(),
+            since=datetime.now() - timedelta(days=5),
+            until=datetime.now(),
+            out_path=out_path,
+        )
+
+        assert result.out_path == out_path
+        assert result.n_events == 0
+        assert result.n_failed == 0
+        assert out_path.read_text() == ""
+
+    def test_failed_detection_call_is_surfaced_not_swallowed(
+        self, fake_chat_db, fake_anthropic, tmp_path
+    ):
+        """A detection call failing (bad API key, exhausted credits, transport
+        error) must never look identical to "no plan in this thread" — the
+        caller needs to know coverage for that window is incomplete."""
+        send_time = time.time() - 10 * 86400
+        fake_chat_db([
+            {
+                "participants": ["+15551234567"],
+                "messages": [
+                    {"text": "dinner friday?", "from_me": False, "unix_ts": send_time - 3600},
+                    {"text": "yes 7pm", "from_me": True, "unix_ts": send_time},
+                ],
+            }
+        ])
+        fake_anthropic([RuntimeError("simulated API failure")])
+        out_path = tmp_path / "backfill.jsonl"
+
+        result = main.backfill(
+            _cfg(),
+            since=datetime.now() - timedelta(days=15),
+            until=datetime.now(),
+            window_days=30,
+            out_path=out_path,
+        )
+
+        assert result.n_events == 0
+        assert result.n_failed == 1
+        assert result.first_failed_window is not None
+        lines = [json.loads(l) for l in out_path.read_text().splitlines()]
+        assert len(lines) == 1
+        assert lines[0]["result"] == "detection_failed"
+        assert lines[0]["chat_id"] == 1
