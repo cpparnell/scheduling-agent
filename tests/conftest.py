@@ -19,6 +19,21 @@ def isolated_state(monkeypatch, tmp_path):
     return home
 
 
+@pytest.fixture(autouse=True)
+def no_real_jev(monkeypatch):
+    """Jev is the default detector backend and .env supplies a real key, so
+    any test that reaches jev_client without faking it would make a live,
+    billed API call. Make that fail loudly instead; tests that exercise Jev
+    monkeypatch jev_client.ask themselves."""
+    from scheduling_agent import jev_client
+
+    def _blocked():
+        raise RuntimeError("real TypeSafe API call attempted in a test; fake jev_client.ask")
+
+    monkeypatch.setattr(jev_client, "_client", None)
+    monkeypatch.setattr(jev_client, "_get_client", _blocked)
+
+
 @pytest.fixture
 def fake_chat_db(monkeypatch, tmp_path):
     """Return a builder that writes a fixture chat.db and points reader.CHAT_DB

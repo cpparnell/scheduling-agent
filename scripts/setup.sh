@@ -27,6 +27,15 @@ if [ ! -f .env ]; then
     else
         echo "Skipped — edit .env and set ANTHROPIC_API_KEY before running."
     fi
+    # The default detector backend is Jev (see README "Backends"). Without
+    # this key every thread falls back to Claude Haiku: it still works, it
+    # just costs more.
+    read -r -p "Enter your TypeSafe API key (for the Jev detector; blank to skip): " ts_key
+    if [ -n "$ts_key" ]; then
+        sed -i '' "s/^TYPESAFE_API_KEY=.*/TYPESAFE_API_KEY=${ts_key}/" .env
+    else
+        echo "Skipped — without TYPESAFE_API_KEY, detection falls back to Claude for every thread."
+    fi
 else
     echo ".env already exists, leaving it as-is."
 fi

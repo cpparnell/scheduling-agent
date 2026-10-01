@@ -25,6 +25,9 @@ _PRICING_PER_MTOK: dict[str, tuple[float, float]] = {
     "claude-opus-4-6": (5.00, 25.00),
     "claude-fable-5": (10.00, 50.00),
     "claude-mythos-5": (10.00, 50.00),
+    # TypeSafe Jev (System One): input-only billing, output is free. The API
+    # reports a versioned name ("jev-1.13.0"), so key on the family prefix.
+    "jev-": (0.042, 0.00),
 }
 
 

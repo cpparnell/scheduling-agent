@@ -34,6 +34,9 @@ def _cfg(**overrides):
         "target_calendar": "Work",
         "dedup_enabled": False,
         "calendar_query_enabled": False,
+        # These tests script the Claude detector via fake_anthropic; the Jev
+        # path has its own tests (test_jev_detector.py).
+        "detector_backend": "claude",
     }
     cfg.update(overrides)
     return cfg
@@ -98,3 +101,53 @@ def test_full_pipeline_creates_event_then_is_idempotent(
 
     # No second osascript call — the event was not created twice.
     assert len(spy_osascript) == 1
+
+
+def test_default_jev_backend_creates_event_without_calling_claude(
+    fake_chat_db, spy_osascript, monkeypatch
+):
+    """The default config (detector_backend="jev") end to end: a confident
+    Jev answer creates the event on the fast path with no Claude call."""
+    from datetime import date, timedelta
+    from types import SimpleNamespace
+
+    from scheduling_agent import detector, jev_client
+
+    day = date.today() + timedelta(days=10)
+    fake_chat_db([
+        {
+            "participants": ["+15551234567"],
+            "messages": [
+                {"text": f"dinner {day:%B} {day.day} at 7pm?", "from_me": False,
+                 "unix_ts": time.time() - 7200},
+                {"text": "yes!", "from_me": True, "unix_ts": time.time() - 3600},
+            ],
+        }
+    ])
+
+    def confident(state, questions):
+        # Every choice picks its first offered option (status lists
+        # "confirmed" first); every yes/no is decisive in the plan's favor.
+        nouls = {"has_plan": 0.97, "multiple_plans": 0.02, "participant": 0.98, "new_info": 0.9}
+        return SimpleNamespace(
+            nouls={k: SimpleNamespace(noul=v) for k, v in nouls.items() if k in questions},
+            choices={
+                k: SimpleNamespace(choice=next(iter(q.criteria)), confidence=0.95)
+                for k, q in questions.items() if hasattr(q, "criteria") and q.type == "choice"
+            },
+        )
+
+    def no_claude(*args, **kwargs):
+        raise AssertionError("fast path should not call the Claude detector")
+
+    monkeypatch.setattr(jev_client, "ask", confident)
+    monkeypatch.setattr(detector, "_detect_plans_claude", no_claude)
+
+    cfg = {**_cfg(), "detector_backend": config.DEFAULTS["detector_backend"]}
+    assert cfg["detector_backend"] == "jev"
+    main.process_new_messages(cfg)
+
+    assert len(spy_osascript) == 1
+    script = spy_osascript[0][2]
+    assert "Dinner" in script
+    assert state.is_duplicate(1, day.isoformat(), "19:00", "Dinner") is True

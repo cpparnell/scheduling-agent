@@ -98,6 +98,19 @@ DEFAULTS = {
     # independent of the filesystem watcher, in case a chat.db change event is
     # ever missed. Set to 0 to disable.
     "poll_interval_minutes": 15,
+    # Which engine detects plans: "jev" (TypeSafe's Jev answers the
+    # judgements and Haiku only extracts threads Jev can't settle — see
+    # jev_detector.py) or "claude" (Haiku reads every thread). Jev matched
+    # Claude's detector accuracy on the golden suite at ~1/3 the cost and
+    # ~2.5x the speed. Needs TYPESAFE_API_KEY; without it every thread
+    # degrades to Haiku.
+    "detector_backend": "jev",
+    # Which engine adjudicates dedup: "claude" (dedup_model) or "jev". Stays
+    # on Claude: the Jev adjudicator scored 78% vs Sonnet's 100% on the golden
+    # dedup pairs and dragged pipeline accuracy from ~98% to ~80%.
+    "dedup_backend": "claude",
+    # Overrides for jev_detector.DEFAULT_THRESHOLDS (any subset of keys).
+    "jev_thresholds": {},
 }
 
 

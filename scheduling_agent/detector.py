@@ -770,9 +770,44 @@ def detect_plans(
     today: datetime | None = None,
     context_marking_enabled: bool = True,
     date_resolver_enabled: bool = True,
+    backend: str = "claude",
+    jev_thresholds: dict | None = None,
 ) -> tuple[list[dict], set]:
     """
     Analyze a list of conversation threads for plans.
+
+    `backend` (mirrors config.DEFAULTS["detector_backend"]) picks the
+    implementation: "claude" runs every thread through Haiku; "jev" runs
+    jev_detector, which answers the judgements with TypeSafe's Jev and only
+    calls Haiku (with `model`) for threads it can't settle itself. Both
+    return the same shape.
+    """
+    if backend == "jev":
+        from scheduling_agent import jev_detector
+        return jev_detector.detect_plans(
+            threads, model=model, evidence_gate=evidence_gate, today=today,
+            context_marking_enabled=context_marking_enabled,
+            date_resolver_enabled=date_resolver_enabled, thresholds=jev_thresholds,
+        )
+    if backend != "claude":
+        raise ValueError(f"unknown detector backend {backend!r}")
+    return _detect_plans_claude(
+        threads, model=model, evidence_gate=evidence_gate, today=today,
+        context_marking_enabled=context_marking_enabled,
+        date_resolver_enabled=date_resolver_enabled,
+    )
+
+
+def _detect_plans_claude(
+    threads: list[dict],
+    model: str = MODEL,
+    evidence_gate: bool = True,
+    today: datetime | None = None,
+    context_marking_enabled: bool = True,
+    date_resolver_enabled: bool = True,
+) -> tuple[list[dict], set]:
+    """
+    The Claude (Haiku) detector.
 
     Returns (events, failed_chat_ids): events is a list of event dicts across
     all threads (a single thread may contribute zero, one, or several), and

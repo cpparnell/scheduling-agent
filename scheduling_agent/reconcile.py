@@ -319,7 +319,8 @@ def _adjudicate(
     "far_exact") — logged with the verdict so a wrong merge can be traced back
     to the layer that proposed it without re-running the case."""
     verdict = dedup.adjudicate(
-        event, llm_candidates, model=cfg["dedup_model"], source=source
+        event, llm_candidates, model=cfg["dedup_model"], source=source,
+        backend=cfg.get("dedup_backend", "claude"),
     )
     if verdict is None:
         if cfg["dedup_fail_open"]:

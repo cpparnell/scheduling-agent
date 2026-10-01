@@ -14,6 +14,9 @@ def _cfg(**overrides):
         "target_calendar": "Work",
         "dedup_enabled": False,
         "calendar_query_enabled": False,
+        # These tests script the Claude detector via fake_anthropic; the Jev
+        # path has its own tests (test_jev_detector.py).
+        "detector_backend": "claude",
     }
     cfg.update(overrides)
     return cfg

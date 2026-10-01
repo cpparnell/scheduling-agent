@@ -339,6 +339,8 @@ def process_new_messages(cfg: dict) -> None:
         evidence_gate=cfg["evidence_gate_enabled"],
         context_marking_enabled=cfg["context_marking_enabled"],
         date_resolver_enabled=cfg["date_resolver_enabled"],
+        backend=cfg["detector_backend"],
+        jev_thresholds=cfg["jev_thresholds"],
     )
 
     counts = {"created": 0, "updated": 0, "cancelled": 0, "skipped": 0}
@@ -690,6 +692,8 @@ def backfill(
                         evidence_gate=cfg["evidence_gate_enabled"],
                         context_marking_enabled=cfg["context_marking_enabled"],
                         date_resolver_enabled=cfg["date_resolver_enabled"],
+                        backend=cfg["detector_backend"],
+                        jev_thresholds=cfg["jev_thresholds"],
                     )
                     for event in events:
                         result = process_event(

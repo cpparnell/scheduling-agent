@@ -56,3 +56,12 @@ def test_non_object_json_falls_back_to_defaults():
     config.CONFIG_FILE.write_text(json.dumps(["a", "list"]))
     cfg = config.load()
     assert cfg == config.DEFAULTS
+
+
+def test_default_backends_are_jev_detection_claude_dedup():
+    # Chosen from the v0.13 eval comparison: Jev matches Claude on detection
+    # at ~1/3 the cost, but its dedup adjudicator lost ~20 points.
+    cfg = config.load()
+    assert cfg["detector_backend"] == "jev"
+    assert cfg["dedup_backend"] == "claude"
+    assert cfg["jev_thresholds"] == {}
