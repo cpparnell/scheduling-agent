@@ -551,3 +551,10 @@ def test_score_case_sends_pinned_wednesday_header_to_the_model(fake_anthropic):
 
     sent = client.messages.calls[0]["messages"][0]["content"]
     assert "[Today is Wednesday" in sent
+
+
+def test_jev_path_summary_reports_fallback_rate():
+    from evals import run as run_mod
+    paths = run_mod.jev_path_summary({"threads": 10, "skip": 5, "fast": 3, "fallback": 1, "jev_errors": 1})
+    assert paths["fallback_rate"] == 0.2  # errors also fell back to Haiku
+    assert run_mod.jev_path_summary({})["fallback_rate"] is None

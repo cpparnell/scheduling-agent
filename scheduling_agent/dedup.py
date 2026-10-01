@@ -207,7 +207,7 @@ def _candidate_identity(candidate: dict) -> str | None:
 
 def adjudicate(
     event: dict, candidates: list[dict], model: str,
-    temperature: float = 0.0, source: str | None = None,
+    temperature: float = 0.0, source: str | None = None, backend: str = "claude",
 ) -> dict | None:
     """One structured-output call deciding whether `event` duplicates one of
     `candidates`. Returns the parsed verdict dict, or None on any error (the
@@ -217,9 +217,21 @@ def adjudicate(
     default-temperature sampling was a measured source of run-to-run flapping
     on borderline pairs. Retried exactly once on any failure — a transient
     error or one malformed JSON body otherwise falls straight through to the
-    caller's fail-open policy and creates a duplicate event."""
+    caller's fail-open policy and creates a duplicate event.
+
+    `backend` (mirrors config.DEFAULTS["dedup_backend"]) is "claude" (the
+    `model` call) or "jev" (jev_dedup, TypeSafe's Jev); both return the same
+    verdict shape and share this retry and logging."""
     if not candidates:
         return None
+    if backend == "jev":
+        from scheduling_agent import jev_client, jev_dedup
+        model = jev_client.MODEL
+        call = lambda: jev_dedup.adjudicate_once(event, candidates)
+    elif backend == "claude":
+        call = None
+    else:
+        raise ValueError(f"unknown dedup backend {backend!r}")
 
     prompt = (
         f"NEW PLAN:\n{_format_new_plan(event)}\n\n"
@@ -230,13 +242,14 @@ def adjudicate(
     retried = False
     for attempt in (1, 2):
         try:
-            verdict = _call_adjudicator(prompt, model, temperature)
+            verdict = call() if call else _call_adjudicator(prompt, model, temperature)
             if verdict is not None:
                 break
             reason = "empty response"
         except Exception as e:
             reason = repr(e)
-        usage_tracker.record_failure(reason)
+        if not call:  # jev_client.ask records its own failures
+            usage_tracker.record_failure(reason)
         if attempt == 1:
             retried = True
             logger.warning(

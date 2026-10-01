@@ -29,7 +29,7 @@ from pathlib import Path
 from time import monotonic  # `time` itself is datetime.time here
 
 from evals import loader
-from scheduling_agent import config, dedup, detector, usage_tracker
+from scheduling_agent import config, dedup, detector, jev_detector, usage_tracker
 
 LOGS_DIR = Path(__file__).parent.parent / "logs"
 REPORTS_DIR = LOGS_DIR / "evals"
@@ -149,11 +149,13 @@ def _would_reach_calendar(event: dict) -> bool:
     )
 
 
-def score_case(case: dict, model: str, today: date | None = None) -> dict:
+def score_case(
+    case: dict, model: str, today: date | None = None, backend: str = "claude"
+) -> dict:
     today, now = _eval_clock(today)
     thread, expected = loader.materialize_case(case, today=today, now=now)
     events, failed = detector.detect_plans(
-        [thread], model=model, today=datetime.combine(today, time(12, 0))
+        [thread], model=model, today=datetime.combine(today, time(12, 0)), backend=backend
     )
 
     failures: list[str] = []
@@ -232,7 +234,7 @@ def score_case(case: dict, model: str, today: date | None = None) -> dict:
 
 def score_dedup_pairs(
     cases: list[dict], results_by_id: dict, model: str, day_window: int = 1,
-    deadline: "Deadline | None" = None,
+    deadline: "Deadline | None" = None, backend: str = "claude",
 ) -> list[dict]:
     """For golden cases annotated with dedup_with/dedup_verdict, treat the
     referenced case's detected event as an "existing calendar event" and run
@@ -294,7 +296,7 @@ def score_dedup_pairs(
             if not candidates:
                 continue
             called_llm = True
-            verdict = dedup.adjudicate(b, candidates, model=model)
+            verdict = dedup.adjudicate(b, candidates, model=model, backend=backend)
             if verdict and verdict.get("is_duplicate"):
                 any_duplicate = True
                 reasoning = verdict.get("reasoning")
@@ -370,7 +372,8 @@ class _FakeCalendar:
 
 
 def score_pipeline_case(
-    case: dict, model: str, dedup_model: str, today: date | None = None
+    case: dict, model: str, dedup_model: str, today: date | None = None,
+    backend: str = "claude", dedup_backend: str = "claude",
 ) -> dict:
     """Run a multi-poll golden case through the REAL pipeline gates: detection
     (real LLM) -> main.process_event -> reconcile (real adjudicator), against
@@ -406,7 +409,7 @@ def score_pipeline_case(
     calendar_mod.get_events_near = fake_calendar.get_events_near
     calendar_mod.delete_event = fake_calendar.delete_event
 
-    cfg = {**config.DEFAULTS, "dedup_model": dedup_model}
+    cfg = {**config.DEFAULTS, "dedup_model": dedup_model, "dedup_backend": dedup_backend}
     outcomes: list[str] = []
     try:
         for thread in threads:
@@ -414,7 +417,7 @@ def score_pipeline_case(
                 [thread], model=model, evidence_gate=cfg["evidence_gate_enabled"],
                 today=datetime.combine(today, time(12, 0)),
                 context_marking_enabled=cfg["context_marking_enabled"],
-                date_resolver_enabled=cfg["date_resolver_enabled"],
+                date_resolver_enabled=cfg["date_resolver_enabled"], backend=backend,
             )
             for event in events:
                 outcomes.append(main.process_event(event, cfg))
@@ -456,7 +459,7 @@ def score_pipeline_case(
 
 def run(
     cases: list[dict], model: str = detector.MODEL, judge: bool = False,
-    today: date | None = None, deadline: "Deadline | None" = None,
+    today: date | None = None, deadline: "Deadline | None" = None, backend: str = "claude",
 ) -> list[dict]:
     today, now = _eval_clock(today)
     cases = [c for c in cases if "polls" not in c]  # pipeline cases score separately
@@ -466,7 +469,7 @@ def run(
             deadline.skip(len(cases) - i)
             print(f"  !! run budget exceeded — skipping {len(cases) - i} detector case(s)")
             break
-        results.append(score_case(case, model, today=today))
+        results.append(score_case(case, model, today=today, backend=backend))
     cases = cases[:len(results)]  # keep judge's zip() aligned with what ran
     if judge:
         from evals import judge as judge_mod
@@ -479,7 +482,7 @@ def run(
 
 def run_pipeline(
     cases: list[dict], model: str, dedup_model: str, today: date | None = None,
-    deadline: "Deadline | None" = None,
+    deadline: "Deadline | None" = None, backend: str = "claude", dedup_backend: str = "claude",
 ) -> list[dict]:
     today, _ = _eval_clock(today)
     poll_cases = [c for c in cases if "polls" in c]
@@ -489,7 +492,9 @@ def run_pipeline(
             deadline.skip(len(poll_cases) - i)
             print(f"  !! run budget exceeded — skipping {len(poll_cases) - i} pipeline case(s)")
             break
-        results.append(score_pipeline_case(case, model, dedup_model, today=today))
+        results.append(score_pipeline_case(
+            case, model, dedup_model, today=today, backend=backend, dedup_backend=dedup_backend,
+        ))
     return results
 
 
@@ -624,6 +629,29 @@ class Deadline:
             f"wall-clock budget exceeded ({self._fmt(self.elapsed)} > "
             f"{self._fmt(self.limit_seconds)}); {self.skipped} case(s) not run"
         )
+
+
+def jev_path_summary(stats: dict) -> dict:
+    """How the Jev backend settled each thread. `fallback_rate` is the share
+    of threads that still needed Haiku — a high value means the candidate
+    generator or the thresholds, not Jev, are the bottleneck."""
+    threads = stats.get("threads", 0)
+    return {
+        **{k: stats.get(k, 0) for k in ("threads", "skip", "fast", "fallback", "jev_errors")},
+        "fallback_rate": round((stats.get("fallback", 0) + stats.get("jev_errors", 0)) / threads, 3)
+        if threads else None,
+    }
+
+
+def print_jev_paths(paths: dict) -> None:
+    print("\n=== Jev paths ===")
+    print(
+        f"  threads: {paths['threads']}  skip (no LLM): {paths['skip']}  "
+        f"fast (no LLM): {paths['fast']}  Haiku fallback: {paths['fallback']}  "
+        f"Jev errors: {paths['jev_errors']}"
+    )
+    if paths["fallback_rate"] is not None:
+        print(f"  fallback rate: {paths['fallback_rate']:.0%}")
 
 
 def run_validity(cost: dict, deadline: "Deadline | None" = None) -> dict:
@@ -948,23 +976,33 @@ def execute_run(args, cases: list[dict], eval_today: date, run_dir: Path) -> dic
     run_dir.mkdir(parents=True, exist_ok=True)
     stdout_path = run_dir / "stdout.log"
 
+    backend = getattr(args, "backend", "claude")
+    dedup_backend = getattr(args, "dedup_backend", None) or "claude"
     usage_tracker.reset()  # so the run's cost totals don't include prior calls
+    jev_detector.reset_stats()
     with stdout_path.open("w") as log_file, _Tee(log_file):
         print(f"  eval clock pinned to: {eval_today.isoformat()} ({eval_today.strftime('%A')})")
+        print(f"  backends: detector={backend} dedup={dedup_backend}")
         results = run(cases, model=args.model, judge=args.judge, today=eval_today,
-                      deadline=deadline)
+                      deadline=deadline, backend=backend)
         results_by_id = {r["id"]: r for r in results}
         dedup_results = score_dedup_pairs(
             cases, results_by_id, model=args.dedup_model, day_window=args.dedup_day_window,
-            deadline=deadline,
+            deadline=deadline, backend=dedup_backend,
         )
         pipeline_results = run_pipeline(
             cases, model=args.model, dedup_model=args.dedup_model, today=eval_today,
-            deadline=deadline,
+            deadline=deadline, backend=backend, dedup_backend=dedup_backend,
         )
         summary = summarize(results, dedup_results, pipeline_results)
         summary["eval_today"] = eval_today.isoformat()
+        summary["detector_backend"] = backend
+        summary["dedup_backend"] = dedup_backend
+        if backend == "jev":
+            summary["jev_paths"] = jev_path_summary(dict(jev_detector.STATS))
         print_report(results, summary, args.model, dedup_results, pipeline_results)
+        if "jev_paths" in summary:
+            print_jev_paths(summary["jev_paths"])
         cost = cost_summary(len(cases))
         print_cost_summary(cost)
         validity = run_validity(cost, deadline)
@@ -997,6 +1035,15 @@ def main() -> None:
         "--dedup-day-window", type=int, default=config.DEFAULTS["dedup_candidate_day_window"],
         help="candidate window (days) for dedup-pair scoring; matches production's "
              "dedup_candidate_day_window by default",
+    )
+    ap.add_argument(
+        "--backend", choices=("claude", "jev"), default=config.DEFAULTS["detector_backend"],
+        help="detector backend; defaults to production's detector_backend. "
+             "claude = Haiku reads every thread; jev = TypeSafe Jev with Haiku fallback",
+    )
+    ap.add_argument(
+        "--dedup-backend", choices=("claude", "jev"), default=config.DEFAULTS["dedup_backend"],
+        help="dedup adjudicator backend; defaults to production's dedup_backend",
     )
     ap.add_argument("--judge", action="store_true", help="add LLM title-quality scoring")
     ap.add_argument("-k", "--filter", default=None, help="only run cases whose id contains this")
@@ -1036,6 +1083,15 @@ def main() -> None:
 
     if args.repeat < 1:
         ap.error("--repeat must be >= 1")
+    if "jev" in (args.backend, args.dedup_backend):
+        from scheduling_agent import jev_client
+        if not jev_client.has_api_key():
+            # Fail fast rather than letting every Jev call fail and fall back:
+            # the run would be measuring Claude while labeled Jev.
+            ap.error(
+                "the jev backend needs TYPESAFE_API_KEY (set it in .env); "
+                "or pass --backend claude --dedup-backend claude"
+            )
 
     eval_today, _ = _eval_clock(date.fromisoformat(args.today) if args.today else None)
 
@@ -1048,6 +1104,8 @@ def main() -> None:
 
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     base_dir = REPORTS_DIR / f"{ts}_{args.model.replace('/', '_')}"
+    if (args.backend, args.dedup_backend) != ("claude", "claude"):
+        base_dir = base_dir.with_name(f"{base_dir.name}_{args.backend}-{args.dedup_backend}")
 
     if args.repeat == 1:
         execute_run(args, cases, eval_today, base_dir)

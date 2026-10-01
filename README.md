@@ -199,11 +199,85 @@ detection fails (API error, malformed response), the watermark is held back and 
 is retried on the next poll, up to a bounded number of retries, so a transient failure
 doesn't silently drop a plan.
 
+## Backends: Claude or Jev
+
+Detection and dedup adjudication each run on one of two backends, chosen by
+`detector_backend` and `dedup_backend` in the config. **The default setup is Jev for
+detection and Claude for dedup** (see the measurements below for why).
+
+- **`claude`**: everything described above. Haiku reads every thread and Sonnet
+  adjudicates dedup.
+- **`jev`**: [TypeSafe's Jev](https://docs.typesafe.ai/concepts/system-one), a "System One"
+  model. It doesn't generate text. It answers typed questions about JSON state with
+  calibrated probabilities (`noul` = P(yes), `choice` = a distribution over labels we
+  define), many questions in one parallel request, in about 100 ms. Jev can't invent a
+  value it wasn't offered, so the design is **code proposes candidates, Jev picks among
+  them**:
+
+```
+thread
+  → candidates.py   deterministic: every date/time a phrase could mean (resolved against
+                    each message's send time; ambiguous phrases like "Friday" said on a
+                    Friday offer both readings), venues, activity phrases, recurrence
+  → Jev, one request per thread:
+      has_plan · multiple_plans · participant · new_info   (noul)
+      status (confirmed/tentative/unanswered/declined/cancelled/no_plan)
+      date / time / location / activity                    (choice over candidates + "none")
+  → skip      confident there's no new plan: no event, no LLM call
+    fast      every judgement clears its threshold: event assembled in code, no LLM call
+    fallback  anything uncertain or out of scope (several plans, multi-day spans,
+              cancellations, a date no candidate covers): the Claude detector handles
+              that one thread
+```
+
+**Cancellations and changes always get a second look.** A skip is the one path with no
+recovery, so before any skip, and again before the fast path, a regex checks the NEW
+messages for cancel or change language ("can't make it", "nvm", "bail", "rain check",
+"instead", "push it"). A match sends the thread to the Claude detector, whatever Jev
+answered. This was motivated by Jev calling a cancellation buried in unrelated chat
+"confirmed" (golden `pipe_cancel_buried_in_chatter`).
+
+Fast-path events have exactly the shape the Claude detector emits. Their `evidence` is the
+verbatim message the chosen date came from, so `main.py`'s gates treat both backends the
+same. The group-silence demotion (`_demote_if_user_silent`) runs on both paths. Thresholds
+live in `jev_detector.DEFAULT_THRESHOLDS` and can be overridden per key through
+`jev_thresholds`. Skipping is deliberately conservative (P(plan) < 0.2): a wrong skip loses
+a real plan, while a wrong pass only costs one Haiku call. Each thread logs one
+`jev_decision` JSON line with its path, the reason, and every answer.
+
+The **Jev dedup adjudicator** (`jev_dedup.py`) asks `same_as` (a choice over the
+candidates plus `new`) and `relationship` (duplicate/reschedule/new_occurrence), and
+returns the same verdict dict as the Sonnet call. It runs through `dedup.adjudicate`, so
+retries, `dedup_fail_open`, and `dedup_adjudication` logging are shared. It keeps the
+Claude prompt's bias: a new event is created only when P(new) ≥ 0.6, and a reschedule or
+new occurrence needs ≥ 0.6 confidence, otherwise the verdict is `duplicate`, the answer
+that never moves an event.
+
+**Measured (golden suite, `--repeat 3`, 2026-09-30).** Claude/Claude scored detector
+99–100%, pipeline 96–100%, dedup 100%, at about $0.89 and 7.3 min per run. Jev/Jev scored
+detector 98%, pipeline 77–81%, dedup 78%, at about $0.32 and 2.9 min per run, with 40% of
+threads falling back to Haiku. The Jev *adjudicator* caused most of the gap: with the Jev
+detector and the Claude adjudicator, dedup was 100% and pipeline 92% in a single run. The
+two remaining pipeline failures were fixed since (a reschedule's new time was never offered
+as a candidate). That split, `detector_backend: "jev"` with `dedup_backend: "claude"`, is the default.
+Adjudication is rare (~23 calls per run) and is the hard judgement, so it stays on Sonnet.
+Without `TYPESAFE_API_KEY` the agent still runs: `config.resolve_backends` switches any
+`jev` backend to `claude` when the config is loaded and logs one warning per process (not per
+thread or per poll). Set `"detector_backend": "claude"` to opt out of Jev explicitly. The
+eval harness fails fast instead (`--backend jev` without a key is an error), since quietly
+running Claude under a Jev label would mismeasure.
+
+If a Jev request fails, the thread degrades to the Claude detector, and the failure is
+recorded so an eval run that silently ran on Haiku is flagged invalid. Jev is billed at
+$0.042 per million input tokens, and output is free.
+
 ## Requirements
 
 - macOS with iMessage and Apple Calendar
 - Python 3
 - An Anthropic API key
+- A TypeSafe API key for the default Jev detector (optional: without one, detection falls
+  back to Claude for every thread)
 
 ## Setup
 
@@ -213,7 +287,7 @@ doesn't silently drop a plan.
 ./scripts/setup.sh
 ```
 
-Creates the venv, installs the package, walks you through the API key, checks
+Creates the venv, installs the package, walks you through the API keys, checks
 whether Full Disk Access looks granted, and optionally installs a launchd
 agent (see "Running in the background" below) so you don't have to leave a
 terminal open. It's a thin wrapper around the manual steps below — read on if
@@ -236,6 +310,8 @@ you'd rather do it by hand or understand what it does.
    ```
 
    `.env` is gitignored. Alternatively, export `ANTHROPIC_API_KEY` in your shell.
+   For the `jev` backend, also set `TYPESAFE_API_KEY` there (the TypeSafe SDK reads
+   it directly).
 
 ## Usage
 
@@ -402,6 +478,9 @@ The config file lives at `~/.scheduling-agent/config.json` and is created with d
 | `max_watermark_retries` | `3` | How many consecutive polls to retry a thread whose detection failed before giving up and advancing past it |
 | `context_marking_enabled` | `true` | Mark replayed context vs. newly-arrived messages in the prompt and instruct the model not to re-emit a plan whose only trace is old context — disable to fall back to the unmarked prompt |
 | `date_resolver_enabled` | `true` | Run a second-pass haiku call to re-check a bare-weekday date with no nearby explicit-date anchor, when the thread has other date-like content that could override the "next occurrence" default |
+| `detector_backend` | `"jev"` | `"jev"` (Jev answers the judgements; Haiku only handles threads Jev can't settle) or `"claude"` (Haiku reads every thread). See *Backends* above |
+| `dedup_backend` | `"claude"` | `"claude"` (`dedup_model`) or `"jev"` for the dedup adjudicator. Jev scored 78% vs Sonnet's 100% on the golden dedup pairs, so it isn't the default |
+| `jev_thresholds` | `{}` | Per-key overrides for `jev_detector.DEFAULT_THRESHOLDS` (skip, fast-path, and location bars) |
 | `poll_interval_minutes` | `15` | Backstop poll interval, independent of the filesystem watcher, in case a `chat.db` change event is ever missed. `0` disables it |
 
 **Sampling determinism.** Every LLM call the agent makes — `detect_plans`, the
@@ -524,8 +603,20 @@ python -m evals.run --judge             # add an LLM title-quality score
 python -m evals.run --today 2026-07-16  # reproduce a specific day's eval clock
 python -m evals.run --repeat 3          # 3 runs; splits always-failed from flaky
 python -m evals.run --diff RUN_A RUN_B  # failure-set diff of two finished runs
+python -m evals.run --backend claude    # all-Claude detection (default: production's backends)
+python -m evals.run --dedup-backend jev # try the Jev adjudicator
 pytest -m eval                          # run it as a pass/fail gate
 ```
+
+A Jev-detector run (the default) also prints and records `summary.jev_paths`: how many threads Jev
+skipped, settled on the fast path, or handed to Haiku, plus the `fallback_rate`. A high
+fallback rate means the candidate generator or the thresholds are the bottleneck, not Jev.
+`--backend` and `--dedup-backend` default to production's `detector_backend` and
+`dedup_backend`, so a bare run measures what the agent actually runs. A run on any
+setup other than all-Claude gets a report directory suffixed `_<detector>-<dedup>`
+(e.g. `_jev-claude`), and `summary.detector_backend` and
+`summary.dedup_backend` record which backends produced it, so `--diff` can compare a Claude
+run against a Jev run directly.
 
 **Run-to-run variance (`--repeat` / `--diff`).** The suite calls a real model,
 so single-run accuracy is noisy — the same case can pass in one run and fail in
@@ -634,14 +725,19 @@ scheduling_agent/
 ├── state.py           # Canonical event store, write-ahead journal, checkpoint, dedup hashes
 ├── reader.py          # Reads iMessage threads from chat.db
 ├── datepatterns.py    # Shared date/holiday-anchor regexes (reader anchor harvesting + detector weekday-reconciliation gate)
-├── detector.py        # Claude Haiku plan detection (participation, status, evidence gate)
+├── detector.py        # Claude Haiku plan detection (participation, status, evidence gate);
+                        # detect_plans() dispatches on backend
+├── candidates.py      # Deterministic date/time/venue/activity candidates for the Jev backend
+├── jev_client.py      # TypeSafe SDK wrapper (lazy client, usage + failure accounting)
+├── jev_detector.py    # Jev backend: one request per thread → skip / fast / Haiku fallback
+├── jev_dedup.py       # Jev dedup adjudicator (same verdict shape as dedup.py's)
 ├── reconcile.py       # Matches detections against known events: exact → fuzzy → LLM
 ├── dedup.py           # LLM adjudicator: is a new detection the same plan as an existing event?
 ├── calendar.py        # Apple Calendar create/update/delete/query via osascript (timed + all-day)
 ├── usage_tracker.py   # Per-call token/cost accounting for detector/dedup/judge API calls
 └── watcher.py         # Filesystem watcher with debounce
 scripts/
-├── setup.sh                    # venv + install + API key + launchd prompt
+├── setup.sh                    # venv + install + API keys (Anthropic, TypeSafe) + launchd prompt
 ├── install-launchagent.sh      # Installs/reloads the launchd agent
 └── com.scheduling-agent.plist  # launchd agent template (RunAtLoad, KeepAlive)
 tests/                 # Offline unit/integration tests (pytest)
@@ -658,6 +754,10 @@ evals/                 # Paid detection eval (golden dataset + runner)
 - Message text from new threads is sent to the Anthropic API for plan detection, including
   the phone numbers/emails of everyone in the thread as participant context — not just the
   device owner's. Use `blocked_contacts` to exclude conversations you don't want processed.
+- With the `jev` backend, the same message text and participant handles are also sent to
+  TypeSafe's API for every processed thread (and to Anthropic only for threads Jev hands to
+  the fallback). Dedup adjudication with `dedup_backend: "jev"` sends the stored event
+  fields, including the truncated evidence, to TypeSafe.
 - Quoted message evidence stored in `~/.scheduling-agent/state.json` (and written to logs) is
   truncated, not stored/logged in full — see "Configuration" above. Run `scheduling-agent
   --purge` at any time to delete all local state and logs.
