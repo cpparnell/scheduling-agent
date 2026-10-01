@@ -230,6 +230,13 @@ thread
               that one thread
 ```
 
+**Cancellations and changes always get a second look.** A skip is the one path with no
+recovery, so before any skip, and again before the fast path, a regex checks the NEW
+messages for cancel or change language ("can't make it", "nvm", "bail", "rain check",
+"instead", "push it"). A match sends the thread to the Claude detector, whatever Jev
+answered. This was motivated by Jev calling a cancellation buried in unrelated chat
+"confirmed" (golden `pipe_cancel_buried_in_chatter`).
+
 Fast-path events have exactly the shape the Claude detector emits. Their `evidence` is the
 verbatim message the chosen date came from, so `main.py`'s gates treat both backends the
 same. The group-silence demotion (`_demote_if_user_silent`) runs on both paths. Thresholds
@@ -254,8 +261,11 @@ detector and the Claude adjudicator, dedup was 100% and pipeline 92% in a single
 two remaining pipeline failures were fixed since (a reschedule's new time was never offered
 as a candidate). That split, `detector_backend: "jev"` with `dedup_backend: "claude"`, is the default.
 Adjudication is rare (~23 calls per run) and is the hard judgement, so it stays on Sonnet.
-Without `TYPESAFE_API_KEY` the agent still runs: every thread degrades to the Claude
-detector, logging a warning each time. Set `"detector_backend": "claude"` to opt out of Jev.
+Without `TYPESAFE_API_KEY` the agent still runs: `config.resolve_backends` switches any
+`jev` backend to `claude` when the config is loaded and logs one warning per process (not per
+thread or per poll). Set `"detector_backend": "claude"` to opt out of Jev explicitly. The
+eval harness fails fast instead (`--backend jev` without a key is an error), since quietly
+running Claude under a Jev label would mismeasure.
 
 If a Jev request fails, the thread degrades to the Claude detector, and the failure is
 recorded so an eval run that silently ran on Haiku is flagged invalid. Jev is billed at

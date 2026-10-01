@@ -1083,6 +1083,15 @@ def main() -> None:
 
     if args.repeat < 1:
         ap.error("--repeat must be >= 1")
+    if "jev" in (args.backend, args.dedup_backend):
+        from scheduling_agent import jev_client
+        if not jev_client.has_api_key():
+            # Fail fast rather than letting every Jev call fail and fall back:
+            # the run would be measuring Claude while labeled Jev.
+            ap.error(
+                "the jev backend needs TYPESAFE_API_KEY (set it in .env); "
+                "or pass --backend claude --dedup-backend claude"
+            )
 
     eval_today, _ = _eval_clock(date.fromisoformat(args.today) if args.today else None)
 

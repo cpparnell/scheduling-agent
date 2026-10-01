@@ -13,6 +13,7 @@ import logging
 import os
 
 from typesafe_sdk import RetryPolicy, SystemOneResponse, TypeSafeClient
+from typesafe_sdk.constants import API_KEY_ENV
 
 from scheduling_agent import usage_tracker
 
@@ -25,6 +26,12 @@ MODEL = os.environ.get("TYPESAFE_DEFAULT_MODEL") or "jev-latest"
 REQUEST_TIMEOUT_SECONDS = 15.0
 
 _client = None
+
+
+def has_api_key() -> bool:
+    """Whether a TypeSafe key is configured. The SDK strips whitespace and
+    rejects an empty key, so a blank or whitespace-only value counts as none."""
+    return bool(os.environ.get(API_KEY_ENV, "").strip())
 
 
 def _get_client() -> TypeSafeClient:

@@ -214,14 +214,24 @@ def _noul(resp, name: str, default: float = 0.0) -> float:
     return answer.noul if answer else default
 
 
-# Change-of-plan language in a NEW message. A reschedule changes an existing
-# event, the most expensive thing to get wrong, so it always goes to Haiku,
-# like cancellations do.
+# Cancel or change-of-plan language in a NEW message. Either one alters an
+# existing event, the most expensive thing to get wrong, so Jev never settles
+# such a thread alone, neither by skipping it nor on the fast path. Skipping
+# is the one unrecoverable path (no second look), and Jev has been seen
+# calling a cancellation buried in chatter "confirmed" (0.48-0.65).
+# Over-inclusive on purpose: a false match costs one Haiku call.
 _CHANGE_RE = re.compile(
     r"\b(?:instead|reschedule|push(?:ed)? (?:it|back|to)|move(?:d)? (?:it|to)|change of plans|"
-    r"switch(?:ed)? to|different (?:day|time))\b",
+    r"switch(?:ed)? to|different (?:day|time)|"
+    r"cancel(?:led|ing|ling)?|call(?:ing)? it off|(?:can['’]?t|cannot|won['’]?t|not gonna|not going to) "
+    r"(?:make it|do|go|come)|can no longer|never ?mind|nvm|bail(?:ing)?|rain ?check|"
+    r"something came up|(?:it['’]?s|is) off|not happening|have to skip|gonna skip)\b",
     re.IGNORECASE,
 )
+
+
+def _new_message_changes_plan(thread: dict) -> bool:
+    return any(_CHANGE_RE.search(m.get("text") or "") for m in detector._new_messages(thread))
 
 _NAME_RE = re.compile(r"^[A-Za-z][A-Za-z .'-]{0,40}$")
 
@@ -245,6 +255,12 @@ def _find(cands: list[dict], value: str) -> dict | None:
 def decide(resp, cands: dict, thread: dict, th: dict) -> tuple[str, dict | None, str]:
     """Map Jev's answers to (path, event, reason). `path` is "skip", "fast",
     or "fallback"; `event` is set only for "fast"."""
+    # Before any skip: a new message that cancels or changes a plan set in
+    # earlier context always gets a Haiku look (see _CHANGE_RE).
+    has_context = any(m.get("is_context") for m in thread.get("messages", []))
+    if has_context and _new_message_changes_plan(thread):
+        return "fallback", None, "cancel/change language in a new message"
+
     has_plan = _noul(resp, "has_plan")
     if has_plan < th["skip_plan_below"]:
         return "skip", None, f"has_plan={has_plan:.2f}"
@@ -279,8 +295,8 @@ def decide(resp, cands: dict, thread: dict, th: dict) -> tuple[str, dict | None,
     if any(detector._MULTI_DAY_SIGNAL_RE.search(m.get("text") or "") for m in messages):
         return "fallback", None, "multi-day language"
 
-    if any(_CHANGE_RE.search(m.get("text") or "") for m in detector._new_messages(thread)):
-        return "fallback", None, "change-of-plan language"
+    if _new_message_changes_plan(thread):
+        return "fallback", None, "cancel/change language"
 
     location, location_conf = _choice(resp, "location")
     if location == "none" or location_conf < th["location_min"]:

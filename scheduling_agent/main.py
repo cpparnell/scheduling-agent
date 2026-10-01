@@ -914,7 +914,7 @@ def main() -> None:
         if not args.since:
             parser.error("--backfill requires --since (an integer number of days, or an ISO date)")
         setup_logging()
-        cfg = config.load()
+        cfg = config.load_runtime()
         try:
             since_dt = parse_backfill_since(args.since)
         except ValueError:
@@ -957,7 +957,7 @@ def main() -> None:
         return
 
     setup_logging()
-    cfg = config.load()
+    cfg = config.load_runtime()
     logger.info("Scheduling agent starting (calendar=%s)", cfg["target_calendar"])
 
     # Resolve any calendar writes interrupted by a crash, then run once.
@@ -965,7 +965,7 @@ def main() -> None:
     process_new_messages(cfg)
 
     def run() -> None:
-        cfg_fresh = config.load()
+        cfg_fresh = config.load_runtime()
         process_new_messages(cfg_fresh)
 
     gate = _RunGate(run)

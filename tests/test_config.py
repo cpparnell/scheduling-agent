@@ -65,3 +65,42 @@ def test_default_backends_are_jev_detection_claude_dedup():
     assert cfg["detector_backend"] == "jev"
     assert cfg["dedup_backend"] == "claude"
     assert cfg["jev_thresholds"] == {}
+
+
+def _jev_cfg():
+    return {**config.DEFAULTS, "detector_backend": "jev", "dedup_backend": "jev"}
+
+
+def test_resolve_backends_downgrades_jev_without_key_and_warns_once(monkeypatch, caplog):
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    monkeypatch.setattr(config, "_warned_no_jev_key", False)
+    cfg = _jev_cfg()
+    with caplog.at_level("WARNING"):
+        first = config.resolve_backends(cfg)
+        second = config.resolve_backends(cfg)
+    assert first["detector_backend"] == second["detector_backend"] == "claude"
+    assert first["dedup_backend"] == "claude"
+    assert cfg["detector_backend"] == "jev"  # input not mutated
+    # Config reloads every poll; the warning must not repeat every poll.
+    assert sum("TYPESAFE_API_KEY is not set" in r.message for r in caplog.records) == 1
+
+
+def test_resolve_backends_treats_blank_key_as_missing(monkeypatch):
+    monkeypatch.setenv("TYPESAFE_API_KEY", "   ")
+    monkeypatch.setattr(config, "_warned_no_jev_key", False)
+    assert config.resolve_backends(_jev_cfg())["detector_backend"] == "claude"
+
+
+def test_resolve_backends_keeps_jev_with_key(monkeypatch):
+    monkeypatch.setenv("TYPESAFE_API_KEY", "ts-test")
+    cfg = _jev_cfg()
+    assert config.resolve_backends(cfg) == cfg
+
+
+def test_resolve_backends_is_a_noop_for_claude(monkeypatch, caplog):
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    monkeypatch.setattr(config, "_warned_no_jev_key", False)
+    cfg = {**config.DEFAULTS, "detector_backend": "claude", "dedup_backend": "claude"}
+    with caplog.at_level("WARNING"):
+        assert config.resolve_backends(cfg) == cfg
+    assert not caplog.records

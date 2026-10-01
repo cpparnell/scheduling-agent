@@ -114,6 +114,36 @@ DEFAULTS = {
 }
 
 
+_warned_no_jev_key = False
+
+
+def resolve_backends(cfg: dict) -> dict:
+    """Downgrade any "jev" backend to "claude" when no TypeSafe key is
+    configured, warning once per process. Without this, every thread would
+    fail its Jev request, warn, and fall back individually, and each failure
+    would count against eval run validity. Returns a new dict."""
+    global _warned_no_jev_key
+    from scheduling_agent import jev_client
+
+    keys = [k for k in ("detector_backend", "dedup_backend") if cfg.get(k) == "jev"]
+    if not keys or jev_client.has_api_key():
+        return cfg
+    if not _warned_no_jev_key:
+        logger.warning(
+            "TYPESAFE_API_KEY is not set; using the Claude backend for %s. "
+            "Set the key in .env to use Jev, or set these to \"claude\" in %s "
+            "to silence this.", ", ".join(keys), CONFIG_FILE,
+        )
+        _warned_no_jev_key = True
+    return {**cfg, **{k: "claude" for k in keys}}
+
+
+def load_runtime() -> dict:
+    """load(), with backends resolved against the environment (see
+    resolve_backends). What the running agent uses."""
+    return resolve_backends(load())
+
+
 def load() -> dict:
     CONFIG_DIR.mkdir(exist_ok=True)
     if not CONFIG_FILE.exists():

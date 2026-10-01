@@ -329,3 +329,48 @@ def test_change_language_only_in_context_does_not_force_fallback(fake_jev, fake_
     haiku = fake_haiku()
     jev_detector.detect_plans([thread])
     assert haiku == []
+
+
+def _context_thread(new_text, from_me=False):
+    return _thread(messages=[
+        {"sender": "x", "text": "dinner saturday at 7pm?", "from_me": False, "unix_ts": WED, "is_context": True},
+        {"sender": "me", "text": "yes!", "from_me": True, "unix_ts": WED, "is_context": True},
+        {"sender": "me" if from_me else "x", "text": new_text, "from_me": from_me, "unix_ts": WED + 60},
+    ])
+
+
+@pytest.mark.parametrize("text", [
+    "ugh actually can't make it, sorry",
+    "can’t do sat 😕",                       # curly apostrophe, as iMessage sends it
+    "nvm, it's off",
+    "something came up, gonna have to bail",
+    "rain check?",
+])
+def test_cancel_language_in_new_message_is_never_skipped(fake_jev, fake_haiku, text):
+    # Even when Jev says there's no plan here: a skip is the one path with no
+    # second look, so a possible cancellation always reaches Haiku.
+    fake_jev(_resp(has_plan=0.05, new_info=0.05))
+    haiku = fake_haiku()
+    jev_detector.detect_plans([_context_thread(text)])
+    assert len(haiku) == 1
+    assert jev_detector.STATS["fallback"] == 1
+
+
+def test_cancel_language_overrides_a_confident_confirmed_answer(fake_jev, fake_haiku):
+    # Observed: Jev called a cancellation buried in chatter "confirmed".
+    fake_jev(_resp(new_info=0.9, status=_choice("confirmed", 0.95)))
+    haiku = fake_haiku()
+    jev_detector.detect_plans([_context_thread("oh also can't do tmrw")])
+    assert len(haiku) == 1
+
+
+def test_ordinary_new_message_can_still_be_skipped(fake_jev, fake_haiku):
+    fake_jev(_resp(has_plan=0.9, new_info=0.05))
+    haiku = fake_haiku()
+    jev_detector.detect_plans([_context_thread("so excited!!")])
+    assert haiku == []
+    assert jev_detector.STATS["skip"] == 1
+
+
+def test_cant_wait_is_not_cancel_language():
+    assert not jev_detector._CHANGE_RE.search("can't wait!!")
