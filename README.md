@@ -292,7 +292,8 @@ scheduling-agent --backfill --since 90        # last 90 days
 scheduling-agent --backfill --since 2025-01-01 --until 2025-06-01
 ```
 
-It is always a dry run: `--backfill` never writes to Calendar.app or to your
+By default it is a dry run: `--backfill` never writes to Calendar.app (unless
+you opt into a mock calendar — see below) or to your
 real `~/.scheduling-agent/state.json` — calendar writes are replaced with
 logging no-ops and state is redirected to a scratch directory deleted when
 the run finishes, so nothing it does can create duplicate events later or
@@ -317,6 +318,60 @@ line, and the CLI prints a `WARNING` naming the first failed window and the
 `--since` date to resume from. A `--backfill` run with no such warning had
 full coverage of the requested range; one that prints it is incomplete from
 that window onward until you fix the underlying issue and re-run.
+
+#### Backfilling into a mock calendar
+
+A JSONL log is hard to check against your memory of what actually happened;
+a calendar is easy. `--calendar NAME` makes backfill really write its events
+— into a separate, throwaway calendar and nowhere else — so you can browse
+the result in Calendar.app and judge it against your own life:
+
+```bash
+git checkout main
+scheduling-agent --backfill --since 30 --calendar "SA test: main"
+git checkout feature/v0.12
+scheduling-agent --backfill --since 30 --calendar "SA test: v0.12"
+# In Calendar.app, give each its own color and toggle them on and off.
+scheduling-agent --delete-calendar "SA test: main"   # clean up afterwards
+```
+
+Everything else about backfill stays the same: your real `state.json` is
+never touched (state still lives in a scratch directory), and each window is
+judged as of its own end date. The one behavioral difference from a dry run
+is that reconciliation reads the mock calendar back as candidates, the same
+way production reads the real one with `calendar_query_enabled`.
+
+Safety rails, all checked before any API call is made:
+
+- The calendar is created if missing and tagged in its description as a
+  scheduling-agent mock. Writes, `--clear-calendar` and `--delete-calendar`
+  refuse any calendar without that tag, so a typo can't touch a real one.
+- The name can never be your configured `target_calendar`.
+- A mock that still has events from an earlier run is refused unless you pass
+  `--clear-calendar`, so every run starts empty and two runs never mix.
+- While the run is going, every calendar call is checked against the mock's
+  name and refused if it names any other calendar.
+
+To declutter Calendar.app afterwards there's also a standalone script — the
+agent never calls it, and it always makes you type the calendar's name to
+confirm:
+
+```bash
+python scripts/delete_calendar.py                   # list calendars, mocks marked
+python scripts/delete_calendar.py "SA test: main"   # delete a mock calendar
+python scripts/delete_calendar.py "Old stuff" --any # delete any other calendar
+```
+
+Without `--any` it only deletes calendars tagged as scheduling-agent mocks.
+Deleting a calendar permanently removes all of its events, on every synced
+device.
+
+New calendars land in Calendar's default account — if that's iCloud, the
+test events sync to your other devices too. Detection is sampled from the
+real model, so two runs of the same code can differ slightly (see
+"Evaluating a change" in `CLAUDE.md`); rerun the same branch before blaming a
+one-event difference on the change. Cost is the same as a dry-run backfill
+over the same range.
 
 ## Configuration
 

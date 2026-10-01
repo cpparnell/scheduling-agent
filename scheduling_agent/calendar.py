@@ -51,13 +51,13 @@ def _compute_span(
     return start_dt, end_dt, is_allday
 
 
-def _run_osascript(script: str) -> str | None:
+def _run_osascript(script: str, timeout: float = 15) -> str | None:
     """Run an AppleScript, returning stdout on success or None on any failure."""
     result = subprocess.run(
         ["osascript", "-e", script],
         capture_output=True,
         text=True,
-        timeout=15,
+        timeout=timeout,
     )
     if result.returncode != 0:
         logger.error("osascript error: %s", result.stderr.strip())
@@ -164,8 +164,17 @@ tell application "Calendar"
     set targetCalendar to first calendar whose name is "{safe_calendar}"
     set theEvent to first event of targetCalendar whose uid is "{safe_uid}"
     set summary of theEvent to "{safe_title}"
-    set start date of theEvent to date "{_applescript_date(start_dt)}"
-    set end date of theEvent to date "{_applescript_date(end_dt)}"
+    set newStart to date "{_applescript_date(start_dt)}"
+    set newEnd to date "{_applescript_date(end_dt)}"
+    -- Calendar saves after each property set and rejects start >= end, so
+    -- moving an event past its old end must set the end first.
+    if newStart is greater than or equal to (end date of theEvent) then
+        set end date of theEvent to newEnd
+        set start date of theEvent to newStart
+    else
+        set start date of theEvent to newStart
+        set end date of theEvent to newEnd
+    end if
     set allday event of theEvent to {"true" if is_allday else "false"}{location_line}
     return uid of theEvent
 end tell
@@ -306,3 +315,172 @@ def _parse_event_rows(out: str) -> list[dict]:
             "source": "calendar",
         })
     return events
+
+
+# --- Mock calendars ----------------------------------------------------------
+#
+# Backfill can write into a throwaway calendar instead of no-op'ing its writes
+# (see main.prepare_mock_calendar). Every calendar created that way carries
+# this exact description, and clear/delete/write are refused on any calendar
+# without it — so a typo'd name can never empty or delete a real calendar.
+
+MOCK_CALENDAR_MARKER = "scheduling-agent mock calendar (safe to delete)"
+
+# Clearing or deleting a calendar with months of backfilled events is far
+# slower than a single-event write.
+_BULK_TIMEOUT = 120
+
+
+def get_calendar_info(calendar_name: str) -> dict | None:
+    """Look up a calendar by name. Returns {"count": <calendars with that
+    name>, "description": <first match's description, "" if none>}, with
+    count == 0 when no such calendar exists, or None if Calendar couldn't be
+    queried at all."""
+    try:
+        safe_calendar = _escape_as_string(calendar_name)
+        script = f"""
+tell application "Calendar"
+    set matched to (every calendar whose name is "{safe_calendar}")
+    set n to count of matched
+    if n is 0 then return "0" & character id 31
+    set d to description of item 1 of matched
+    if d is missing value then set d to ""
+    return (n as text) & character id 31 & d
+end tell
+"""
+        out = _run_osascript(script)
+        if out is None:
+            return None
+        count, _, description = out.rstrip("\n").partition(_FIELD_SEP)
+        return {"count": int(count), "description": description}
+    except subprocess.TimeoutExpired:
+        logger.error("Calendar lookup timed out for %s", calendar_name)
+        return None
+    except Exception as e:
+        logger.error("Failed to look up calendar %s: %s", calendar_name, e)
+        return None
+
+
+def list_calendars() -> list[dict] | None:
+    """Every calendar as {"name", "description"} ("" if none), or None if
+    Calendar couldn't be queried."""
+    try:
+        script = """
+tell application "Calendar"
+    set fs to character id 31
+    set rs to character id 30
+    set out to ""
+    repeat with theCalendar in calendars
+        set d to description of theCalendar
+        if d is missing value then set d to ""
+        set out to out & (name of theCalendar) & fs & d & rs
+    end repeat
+    return out
+end tell
+"""
+        out = _run_osascript(script)
+        if out is None:
+            return None
+        calendars = []
+        for row in out.split(_ROW_SEP):
+            if not row.strip():
+                continue
+            name, _, description = row.partition(_FIELD_SEP)
+            calendars.append({"name": name.lstrip("\n"), "description": description.rstrip("\n")})
+        return calendars
+    except subprocess.TimeoutExpired:
+        logger.error("Listing calendars timed out")
+        return None
+    except Exception as e:
+        logger.error("Failed to list calendars: %s", e)
+        return None
+
+
+def create_mock_calendar(calendar_name: str) -> bool:
+    """Create a new calendar tagged with MOCK_CALENDAR_MARKER. It lands in
+    Calendar's default account (iCloud, if you use it). Returns True on
+    success."""
+    try:
+        safe_calendar = _escape_as_string(calendar_name)
+        safe_marker = _escape_as_string(MOCK_CALENDAR_MARKER)
+        script = f"""
+tell application "Calendar"
+    set newCalendar to make new calendar with properties {{name:"{safe_calendar}"}}
+    set description of newCalendar to "{safe_marker}"
+end tell
+"""
+        if _run_osascript(script) is None:
+            return False
+        logger.info("Created mock calendar %s", calendar_name)
+        return True
+    except subprocess.TimeoutExpired:
+        logger.error("Calendar creation timed out for %s", calendar_name)
+        return False
+    except Exception as e:
+        logger.error("Failed to create calendar %s: %s", calendar_name, e)
+        return False
+
+
+def count_events(calendar_name: str) -> int | None:
+    """Number of events on a calendar, or None on failure."""
+    try:
+        safe_calendar = _escape_as_string(calendar_name)
+        script = f"""
+tell application "Calendar"
+    return count of events of (first calendar whose name is "{safe_calendar}")
+end tell
+"""
+        out = _run_osascript(script, timeout=_BULK_TIMEOUT)
+        if out is None:
+            return None
+        return int(out.strip())
+    except subprocess.TimeoutExpired:
+        logger.error("Event count timed out for %s", calendar_name)
+        return None
+    except Exception as e:
+        logger.error("Failed to count events on %s: %s", calendar_name, e)
+        return None
+
+
+def clear_calendar(calendar_name: str) -> bool:
+    """Delete every event on a calendar. Callers must have verified it's a
+    mock calendar first (main.prepare_mock_calendar)."""
+    try:
+        safe_calendar = _escape_as_string(calendar_name)
+        script = f"""
+tell application "Calendar"
+    delete every event of (first calendar whose name is "{safe_calendar}")
+end tell
+"""
+        if _run_osascript(script, timeout=_BULK_TIMEOUT) is None:
+            return False
+        logger.info("Cleared all events from %s", calendar_name)
+        return True
+    except subprocess.TimeoutExpired:
+        logger.error("Clearing calendar %s timed out", calendar_name)
+        return False
+    except Exception as e:
+        logger.error("Failed to clear calendar %s: %s", calendar_name, e)
+        return False
+
+
+def delete_calendar(calendar_name: str) -> bool:
+    """Delete a whole calendar. Callers must have verified it's a mock
+    calendar first (main.delete_mock_calendar)."""
+    try:
+        safe_calendar = _escape_as_string(calendar_name)
+        script = f"""
+tell application "Calendar"
+    delete (first calendar whose name is "{safe_calendar}")
+end tell
+"""
+        if _run_osascript(script, timeout=_BULK_TIMEOUT) is None:
+            return False
+        logger.info("Deleted calendar %s", calendar_name)
+        return True
+    except subprocess.TimeoutExpired:
+        logger.error("Deleting calendar %s timed out", calendar_name)
+        return False
+    except Exception as e:
+        logger.error("Failed to delete calendar %s: %s", calendar_name, e)
+        return False
