@@ -139,8 +139,8 @@ def test_update_event_targets_uid_and_rewrites_properties(capture_osascript):
     script = capture_osascript["script"]
     assert 'first event of targetCalendar whose uid is "UID-42"' in script
     assert 'set summary of theEvent to "Dinner"' in script
-    assert 'set start date of theEvent to date "June 13, 2026 at 08:00:00 PM"' in script
-    assert 'set end date of theEvent to date "June 13, 2026 at 09:00:00 PM"' in script
+    assert 'set newStart to date "June 13, 2026 at 08:00:00 PM"' in script
+    assert 'set newEnd to date "June 13, 2026 at 09:00:00 PM"' in script
     assert "set allday event of theEvent to false" in script
     assert 'set location of theEvent to "Lucia\'s"' in script
     assert 'first calendar whose name is "Home"' in script
@@ -153,6 +153,20 @@ def test_update_event_allday(capture_osascript):
     assert 'date "June 13, 2026 at 12:00:00 AM"' in script
     assert 'date "June 14, 2026 at 12:00:00 AM"' in script
     assert "set location" not in script
+
+
+def test_update_event_sets_end_first_when_moving_past_old_end(capture_osascript):
+    """Calendar rejects any intermediate state with start >= end, so moving an
+    event later than its old end date must set the new end before the new
+    start (seen live: an all-day event moved from the 25th to the 26th failed
+    with "The start date must be before the end date")."""
+    calendar.update_event("UID-42", "Rehearsal", "2026-09-26", None, None, None)
+    script = capture_osascript["script"]
+    branch = script.index("if newStart is greater than or equal to (end date of theEvent) then")
+    later = script[branch:script.index("else", branch)]
+    earlier = script[script.index("else", branch):script.index("end if", branch)]
+    assert later.index("set end date") < later.index("set start date")
+    assert earlier.index("set start date") < earlier.index("set end date")
 
 
 def test_update_event_tentative_prefixes_title(capture_osascript):
@@ -260,3 +274,87 @@ def test_get_events_near_fails_open_on_error(capture_osascript):
 def test_get_events_near_fails_open_on_timeout(capture_osascript):
     capture_osascript["raise"] = subprocess.TimeoutExpired(cmd="osascript", timeout=15)
     assert calendar.get_events_near("2026-06-13") == []
+
+
+# --- Mock calendars ----------------------------------------------------------
+
+
+def test_get_calendar_info_missing(capture_osascript):
+    capture_osascript["stdout"] = "0\x1f\n"
+    assert calendar.get_calendar_info("SA test") == {"count": 0, "description": ""}
+    assert 'every calendar whose name is "SA test"' in capture_osascript["script"]
+
+
+def test_get_calendar_info_found_with_description(capture_osascript):
+    capture_osascript["stdout"] = f"1\x1f{calendar.MOCK_CALENDAR_MARKER}\n"
+    assert calendar.get_calendar_info("SA test") == {
+        "count": 1, "description": calendar.MOCK_CALENDAR_MARKER,
+    }
+
+
+def test_get_calendar_info_failure_returns_none(capture_osascript):
+    capture_osascript["returncode"] = 1
+    assert calendar.get_calendar_info("SA test") is None
+
+
+def test_get_calendar_info_escapes_name(capture_osascript):
+    capture_osascript["stdout"] = "0\x1f\n"
+    calendar.get_calendar_info('A "quoted" name')
+    assert 'name is "A \\"quoted\\" name"' in capture_osascript["script"]
+
+
+def test_create_mock_calendar_tags_it_with_marker(capture_osascript):
+    assert calendar.create_mock_calendar("SA test") is True
+    script = capture_osascript["script"]
+    assert 'make new calendar with properties {name:"SA test"}' in script
+    assert f'set description of newCalendar to "{calendar.MOCK_CALENDAR_MARKER}"' in script
+
+
+def test_create_mock_calendar_failure_returns_false(capture_osascript):
+    capture_osascript["returncode"] = 1
+    assert calendar.create_mock_calendar("SA test") is False
+
+
+def test_count_events_parses_integer(capture_osascript):
+    capture_osascript["stdout"] = "42\n"
+    assert calendar.count_events("SA test") == 42
+
+
+def test_count_events_failure_returns_none(capture_osascript):
+    capture_osascript["returncode"] = 1
+    assert calendar.count_events("SA test") is None
+
+
+def test_clear_calendar_deletes_every_event(capture_osascript):
+    assert calendar.clear_calendar("SA test") is True
+    assert 'delete every event of (first calendar whose name is "SA test")' in capture_osascript["script"]
+
+
+def test_clear_calendar_timeout_returns_false(capture_osascript):
+    capture_osascript["raise"] = subprocess.TimeoutExpired(cmd="osascript", timeout=120)
+    assert calendar.clear_calendar("SA test") is False
+
+
+def test_delete_calendar_targets_named_calendar(capture_osascript):
+    assert calendar.delete_calendar("SA test") is True
+    assert 'delete (first calendar whose name is "SA test")' in capture_osascript["script"]
+
+
+def test_delete_calendar_failure_returns_false(capture_osascript):
+    capture_osascript["returncode"] = 1
+    assert calendar.delete_calendar("SA test") is False
+
+
+def test_list_calendars_parses_names_and_descriptions(capture_osascript):
+    capture_osascript["stdout"] = (
+        f"Home\x1f\x1eSA test: main\x1f{calendar.MOCK_CALENDAR_MARKER}\x1e\n"
+    )
+    assert calendar.list_calendars() == [
+        {"name": "Home", "description": ""},
+        {"name": "SA test: main", "description": calendar.MOCK_CALENDAR_MARKER},
+    ]
+
+
+def test_list_calendars_failure_returns_none(capture_osascript):
+    capture_osascript["returncode"] = 1
+    assert calendar.list_calendars() is None

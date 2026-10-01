@@ -1,3 +1,4 @@
 anthropic==0.109.1
 watchdog==6.0.0
 python-dotenv==1.2.2
+typesafe_sdk==0.7.2

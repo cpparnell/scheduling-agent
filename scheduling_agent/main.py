@@ -383,27 +383,53 @@ def process_new_messages(cfg: dict) -> None:
 
 
 @contextlib.contextmanager
-def _dry_run_environment():
+def _scratch_state():
     """Redirects state.py's persistence to a scratch temp directory (deleted
-    on exit) and replaces calendar.py's AppleScript writes with logging
-    no-ops, for the duration of the `with` block. Lets backfill() run the
-    exact production code path (process_event / reconcile / state) against
-    real historical messages with zero chance of touching the user's real
-    state.json or Calendar.app.
+    on exit) for the duration of the `with` block, so backfill can never
+    touch the user's real state.json."""
+    scratch_dir = Path(tempfile.mkdtemp(prefix="scheduling-agent-backfill-"))
+    real_state_dir = state.STATE_DIR
+    real_state_file = state.STATE_FILE
+    state.STATE_DIR = scratch_dir
+    state.STATE_FILE = scratch_dir / "state.json"
+    try:
+        yield
+    finally:
+        state.STATE_DIR = real_state_dir
+        state.STATE_FILE = real_state_file
+        shutil.rmtree(scratch_dir, ignore_errors=True)
+
+
+@contextlib.contextmanager
+def _patched_calendar(create, update, delete, get_near):
+    """Swaps calendar.py's four pipeline-facing functions for the duration
+    of the `with` block."""
+    real = (calendar.create_event, calendar.update_event,
+            calendar.delete_event, calendar.get_events_near)
+    calendar.create_event = create
+    calendar.update_event = update
+    calendar.delete_event = delete
+    calendar.get_events_near = get_near
+    try:
+        yield
+    finally:
+        (calendar.create_event, calendar.update_event,
+         calendar.delete_event, calendar.get_events_near) = real
+
+
+@contextlib.contextmanager
+def _dry_run_environment():
+    """Scratch state plus calendar.py's AppleScript writes replaced with
+    logging no-ops, for the duration of the `with` block. Lets backfill() run
+    the exact production code path (process_event / reconcile / state)
+    against real historical messages with zero chance of touching the user's
+    real state.json or Calendar.app.
 
     Reads (calendar.get_events_near) are stubbed to return nothing rather
     than routed to the real calendar — callers should also set
     cfg["calendar_query_enabled"] = False so this is belt-and-suspenders, not
     the only thing standing between backfill and a live calendar query.
     """
-    scratch_dir = Path(tempfile.mkdtemp(prefix="scheduling-agent-backfill-"))
-    real_state_dir = state.STATE_DIR
-    real_state_file = state.STATE_FILE
-    real_create = calendar.create_event
-    real_update = calendar.update_event
-    real_delete = calendar.delete_event
-    real_get_near = calendar.get_events_near
-
     def fake_create(title, date_str, time_start, duration_minutes, location,
                      calendar_name="Calendar", tentative=False, recurrence=None, end_date=None):
         logger.info(
@@ -426,22 +452,114 @@ def _dry_run_environment():
     def fake_get_near(date_str, window_days=1, calendar_name="Calendar"):
         return []
 
-    state.STATE_DIR = scratch_dir
-    state.STATE_FILE = scratch_dir / "state.json"
-    calendar.create_event = fake_create
-    calendar.update_event = fake_update
-    calendar.delete_event = fake_delete
-    calendar.get_events_near = fake_get_near
-    try:
+    with _scratch_state(), _patched_calendar(fake_create, fake_update, fake_delete, fake_get_near):
         yield
-    finally:
-        state.STATE_DIR = real_state_dir
-        state.STATE_FILE = real_state_file
-        calendar.create_event = real_create
-        calendar.update_event = real_update
-        calendar.delete_event = real_delete
-        calendar.get_events_near = real_get_near
-        shutil.rmtree(scratch_dir, ignore_errors=True)
+
+
+@contextlib.contextmanager
+def _mock_calendar_environment(mock_calendar: str):
+    """Scratch state plus the REAL calendar functions, but guarded so any
+    call naming a calendar other than `mock_calendar` raises instead of
+    running. backfill() already points cfg["target_calendar"] at the mock
+    calendar; the guard makes sure no code path can reach a real one."""
+    real_create = calendar.create_event
+    real_update = calendar.update_event
+    real_delete = calendar.delete_event
+    real_get_near = calendar.get_events_near
+
+    def check(calendar_name):
+        if calendar_name != mock_calendar:
+            raise RuntimeError(
+                f"backfill tried to touch calendar {calendar_name!r} while "
+                f"writing to mock calendar {mock_calendar!r}; refusing"
+            )
+
+    def create(*args, calendar_name="Calendar", **kwargs):
+        check(calendar_name)
+        return real_create(*args, calendar_name=calendar_name, **kwargs)
+
+    def update(*args, calendar_name="Calendar", **kwargs):
+        check(calendar_name)
+        return real_update(*args, calendar_name=calendar_name, **kwargs)
+
+    def delete(*args, calendar_name="Calendar", **kwargs):
+        check(calendar_name)
+        return real_delete(*args, calendar_name=calendar_name, **kwargs)
+
+    def get_near(date_str, window_days=1, calendar_name="Calendar"):
+        check(calendar_name)
+        return real_get_near(date_str, window_days, calendar_name)
+
+    with _scratch_state(), _patched_calendar(create, update, delete, get_near):
+        yield
+
+
+class MockCalendarError(Exception):
+    """A mock-calendar safety check failed; the message says why."""
+
+
+def _check_mock_calendar(name: str, cfg: dict) -> dict:
+    """Shared safety checks for anything that writes to, clears or deletes a
+    mock calendar. Returns calendar.get_calendar_info()'s result."""
+    if not name.strip():
+        raise MockCalendarError("mock calendar name can't be empty")
+    if name.strip().casefold() == cfg["target_calendar"].strip().casefold():
+        raise MockCalendarError(
+            f"{name!r} is your real target_calendar; pick a different name for the mock calendar"
+        )
+    info = calendar.get_calendar_info(name)
+    if info is None:
+        raise MockCalendarError(f"couldn't query Calendar.app for {name!r} (see the osascript error above)")
+    if info["count"] > 1:
+        raise MockCalendarError(f"{info['count']} calendars are named {name!r}; refusing to guess which one")
+    if info["count"] == 1 and info["description"] != calendar.MOCK_CALENDAR_MARKER:
+        raise MockCalendarError(
+            f"{name!r} already exists and wasn't created by scheduling-agent as a mock "
+            f"calendar; refusing to touch it. Pick a new name."
+        )
+    return info
+
+
+def prepare_mock_calendar(name: str, cfg: dict, clear: bool = False) -> None:
+    """Get `name` ready for a backfill run: create it (tagged with
+    calendar.MOCK_CALENDAR_MARKER) if missing, and make sure it starts empty
+    so the run's output isn't mixed with an earlier one. Raises
+    MockCalendarError on any safety check failing."""
+    info = _check_mock_calendar(name, cfg)
+    if info["count"] == 0:
+        if not calendar.create_mock_calendar(name):
+            raise MockCalendarError(f"couldn't create calendar {name!r} (see the osascript error above)")
+        created = calendar.get_calendar_info(name)
+        if not created or created["count"] != 1 or created["description"] != calendar.MOCK_CALENDAR_MARKER:
+            raise MockCalendarError(
+                f"created {name!r} but couldn't confirm it's tagged as a mock calendar; "
+                f"check Calendar.app and delete it by hand if needed"
+            )
+        return
+
+    n = calendar.count_events(name)
+    if n is None:
+        raise MockCalendarError(f"couldn't count events on {name!r} (see the osascript error above)")
+    if n == 0:
+        return
+    if not clear:
+        raise MockCalendarError(
+            f"mock calendar {name!r} already has {n} event(s) from an earlier run; "
+            f"pass --clear-calendar to empty it first, or use a new name"
+        )
+    if not calendar.clear_calendar(name):
+        raise MockCalendarError(f"couldn't clear {name!r} (see the osascript error above)")
+    logger.info("Cleared %d event(s) from mock calendar %s", n, name)
+
+
+def delete_mock_calendar(name: str, cfg: dict) -> None:
+    """Delete a calendar previously created by prepare_mock_calendar. Raises
+    MockCalendarError if it doesn't exist or isn't tagged as a mock."""
+    info = _check_mock_calendar(name, cfg)
+    if info["count"] == 0:
+        raise MockCalendarError(f"no calendar named {name!r}")
+    if not calendar.delete_calendar(name):
+        raise MockCalendarError(f"couldn't delete {name!r} (see the osascript error above)")
 
 
 def _stable_id(*parts: str) -> str:
@@ -483,6 +601,8 @@ def backfill(
     until: datetime | None = None,
     window_days: float = 1.0,
     out_path: Path | None = None,
+    mock_calendar: str | None = None,
+    clear_calendar: bool = False,
 ) -> BackfillResult:
     """Replay historical messages through the real detection + reconciliation
     pipeline in read-only dry-run mode, to sanity-check the agent's real-world
@@ -493,8 +613,14 @@ def backfill(
     own end as "today" (both for the detector's relative-date resolution and
     process_event's past-event gate) so a message from months ago describing
     "next Tuesday" is judged as it would have been judged at the time, not
-    against the real live wall clock. No calendar or state.json is touched —
-    see _dry_run_environment.
+    against the real live wall clock. state.json is never touched. With no
+    `mock_calendar`, calendar writes are no-ops (see _dry_run_environment).
+    With one, events are really written to that calendar — and only that
+    calendar — so the result can be browsed in Calendar.app and compared
+    against what actually happened (see prepare_mock_calendar and
+    _mock_calendar_environment). Reconciliation also reads the mock calendar
+    back, like production does with the real one. Raises MockCalendarError
+    before any API call if the mock calendar fails a safety check.
 
     Returns a BackfillResult: out_path is the JSONL decision log written (one
     line per detected event, across all windows, plus one line per thread
@@ -519,7 +645,13 @@ def backfill(
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    backfill_cfg = {**cfg, "calendar_query_enabled": False}
+    if mock_calendar is not None:
+        prepare_mock_calendar(mock_calendar, cfg, clear=clear_calendar)
+        backfill_cfg = {**cfg, "target_calendar": mock_calendar, "calendar_query_enabled": True}
+        environment = _mock_calendar_environment(mock_calendar)
+    else:
+        backfill_cfg = {**cfg, "calendar_query_enabled": False}
+        environment = _dry_run_environment()
 
     counts: dict[str, int] = {}
     n_events = 0
@@ -527,7 +659,7 @@ def backfill(
     first_failed_window: date | None = None
     window_start = since
 
-    with _dry_run_environment():
+    with environment:
         with open(out_path, "w") as f:
             while window_start < until:
                 window_end = min(window_start + timedelta(days=window_days), until)
@@ -710,7 +842,8 @@ def main() -> None:
         "--backfill", action="store_true",
         help=(
             "Replay historical messages through the real detector in "
-            "read-only dry-run mode (no calendar or state.json writes) — for "
+            "read-only dry-run mode (no calendar or state.json writes; see "
+            "--calendar to write to a mock calendar instead) — for "
             "sanity-checking behavior against real message volume beyond "
             "what shows up live in one day. Requires --since."
         ),
@@ -736,11 +869,42 @@ def main() -> None:
         "--out",
         help="Path to write the backfill JSONL decision log (default logs/backfill/<timestamp>.jsonl).",
     )
+    parser.add_argument(
+        "--calendar", metavar="NAME",
+        help=(
+            "With --backfill: really write events to this mock calendar (created "
+            "if missing) instead of dry-running, so you can browse the result in "
+            "Calendar.app. Never your real target_calendar."
+        ),
+    )
+    parser.add_argument(
+        "--clear-calendar", action="store_true",
+        help="With --calendar: empty the mock calendar first if an earlier run left events on it.",
+    )
+    parser.add_argument(
+        "--delete-calendar", metavar="NAME",
+        help="Delete a mock calendar created by --backfill --calendar, then exit.",
+    )
     args = parser.parse_args()
 
     if args.purge:
         purge()
         return
+
+    if args.delete_calendar:
+        setup_logging()
+        try:
+            delete_mock_calendar(args.delete_calendar, config.load())
+        except MockCalendarError as e:
+            print(f"ERROR: {e}")
+            sys.exit(1)
+        print(f"Deleted mock calendar {args.delete_calendar!r}")
+        return
+
+    if args.calendar and not args.backfill:
+        parser.error("--calendar only works with --backfill")
+    if args.clear_calendar and not args.calendar:
+        parser.error("--clear-calendar requires --calendar")
 
     if args.backfill:
         if not args.since:
@@ -761,13 +925,23 @@ def main() -> None:
                 return
         out_path = Path(args.out) if args.out else None
         logger.info(
-            "Backfilling from %s to %s in %s-day windows (dry run — no calendar/state writes)",
+            "Backfilling from %s to %s in %s-day windows (%s)",
             since_dt.date(), (until_dt or datetime.now()).date(), args.window_days,
+            f"writing to mock calendar {args.calendar!r}" if args.calendar
+            else "dry run — no calendar/state writes",
         )
-        result = backfill(
-            cfg, since=since_dt, until=until_dt, window_days=args.window_days, out_path=out_path,
-        )
+        try:
+            result = backfill(
+                cfg, since=since_dt, until=until_dt, window_days=args.window_days,
+                out_path=out_path, mock_calendar=args.calendar,
+                clear_calendar=args.clear_calendar,
+            )
+        except MockCalendarError as e:
+            print(f"ERROR: {e}")
+            sys.exit(1)
         print(f"Backfill decision log written to {result.out_path} ({result.n_events} event(s))")
+        if args.calendar and result.n_events:
+            print(f"Events written to mock calendar {args.calendar!r} — open Calendar.app to review")
         if result.n_failed:
             print(
                 f"WARNING: {result.n_failed} detection call(s) failed starting at "

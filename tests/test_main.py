@@ -1002,3 +1002,189 @@ class TestBackfill:
         assert len(lines) == 1
         assert lines[0]["result"] == "detection_failed"
         assert lines[0]["chat_id"] == 1
+
+
+@pytest.fixture
+def fake_mock_calendar(monkeypatch):
+    """Stand-in for Calendar.app's calendar-level operations. `calendars`
+    maps name -> {"description", "events"}; tweak it before calling the code
+    under test."""
+    fake = {"calendars": {}, "calls": [], "fail": set()}
+
+    def get_info(name):
+        if "info" in fake["fail"]:
+            return None
+        matches = [c for n, c in fake["calendars"].items() if n == name]
+        if not matches:
+            return {"count": 0, "description": ""}
+        return {"count": len(matches), "description": matches[0]["description"]}
+
+    def create(name):
+        fake["calls"].append(("create", name))
+        if "create" in fake["fail"]:
+            return False
+        fake["calendars"][name] = {"description": calendar.MOCK_CALENDAR_MARKER, "events": 0}
+        return True
+
+    def count(name):
+        return fake["calendars"][name]["events"]
+
+    def clear(name):
+        fake["calls"].append(("clear", name))
+        fake["calendars"][name]["events"] = 0
+        return True
+
+    def delete(name):
+        fake["calls"].append(("delete", name))
+        del fake["calendars"][name]
+        return True
+
+    monkeypatch.setattr(calendar, "get_calendar_info", get_info)
+    monkeypatch.setattr(calendar, "create_mock_calendar", create)
+    monkeypatch.setattr(calendar, "count_events", count)
+    monkeypatch.setattr(calendar, "clear_calendar", clear)
+    monkeypatch.setattr(calendar, "delete_calendar", delete)
+    monkeypatch.setattr(calendar, "get_events_near", lambda *a, **k: [])
+    return fake
+
+
+class TestPrepareMockCalendar:
+    """--backfill --calendar writes to a real calendar, so every path into
+    it must refuse anything that could be a calendar the user cares about."""
+
+    def test_creates_missing_calendar(self, fake_mock_calendar):
+        main.prepare_mock_calendar("SA test", _cfg())
+        assert fake_mock_calendar["calls"] == [("create", "SA test")]
+
+    def test_refuses_real_target_calendar_case_insensitively(self, fake_mock_calendar):
+        with pytest.raises(main.MockCalendarError, match="target_calendar"):
+            main.prepare_mock_calendar(" work ", _cfg(target_calendar="Work"))
+        assert fake_mock_calendar["calls"] == []
+
+    def test_refuses_empty_name(self, fake_mock_calendar):
+        with pytest.raises(main.MockCalendarError):
+            main.prepare_mock_calendar("  ", _cfg())
+
+    def test_refuses_existing_calendar_without_marker(self, fake_mock_calendar):
+        fake_mock_calendar["calendars"]["Family"] = {"description": "", "events": 12}
+        with pytest.raises(main.MockCalendarError, match="wasn't created by scheduling-agent"):
+            main.prepare_mock_calendar("Family", _cfg(), clear=True)
+        assert fake_mock_calendar["calls"] == []
+
+    def test_existing_empty_mock_is_reused(self, fake_mock_calendar):
+        fake_mock_calendar["calendars"]["SA test"] = {
+            "description": calendar.MOCK_CALENDAR_MARKER, "events": 0,
+        }
+        main.prepare_mock_calendar("SA test", _cfg())
+        assert fake_mock_calendar["calls"] == []
+
+    def test_non_empty_mock_requires_clear(self, fake_mock_calendar):
+        fake_mock_calendar["calendars"]["SA test"] = {
+            "description": calendar.MOCK_CALENDAR_MARKER, "events": 5,
+        }
+        with pytest.raises(main.MockCalendarError, match="--clear-calendar"):
+            main.prepare_mock_calendar("SA test", _cfg())
+        assert fake_mock_calendar["calls"] == []
+
+    def test_non_empty_mock_is_cleared_when_asked(self, fake_mock_calendar):
+        fake_mock_calendar["calendars"]["SA test"] = {
+            "description": calendar.MOCK_CALENDAR_MARKER, "events": 5,
+        }
+        main.prepare_mock_calendar("SA test", _cfg(), clear=True)
+        assert fake_mock_calendar["calls"] == [("clear", "SA test")]
+
+    def test_calendar_query_failure_is_an_error(self, fake_mock_calendar):
+        fake_mock_calendar["fail"].add("info")
+        with pytest.raises(main.MockCalendarError, match="couldn't query"):
+            main.prepare_mock_calendar("SA test", _cfg())
+
+    def test_create_failure_is_an_error(self, fake_mock_calendar):
+        fake_mock_calendar["fail"].add("create")
+        with pytest.raises(main.MockCalendarError, match="couldn't create"):
+            main.prepare_mock_calendar("SA test", _cfg())
+
+
+class TestDeleteMockCalendar:
+    def test_deletes_tagged_mock(self, fake_mock_calendar):
+        fake_mock_calendar["calendars"]["SA test"] = {
+            "description": calendar.MOCK_CALENDAR_MARKER, "events": 3,
+        }
+        main.delete_mock_calendar("SA test", _cfg())
+        assert fake_mock_calendar["calls"] == [("delete", "SA test")]
+
+    def test_refuses_untagged_calendar(self, fake_mock_calendar):
+        fake_mock_calendar["calendars"]["Family"] = {"description": "", "events": 3}
+        with pytest.raises(main.MockCalendarError):
+            main.delete_mock_calendar("Family", _cfg())
+        assert fake_mock_calendar["calls"] == []
+
+    def test_refuses_real_target_calendar(self, fake_mock_calendar):
+        with pytest.raises(main.MockCalendarError):
+            main.delete_mock_calendar("Work", _cfg(target_calendar="Work"))
+
+    def test_missing_calendar_is_an_error(self, fake_mock_calendar):
+        with pytest.raises(main.MockCalendarError, match="no calendar named"):
+            main.delete_mock_calendar("SA test", _cfg())
+
+
+class TestBackfillToMockCalendar:
+    def test_writes_events_to_mock_calendar_only(
+        self, fake_chat_db, fake_anthropic, spy_create_event, fake_mock_calendar, tmp_path
+    ):
+        send_time = time.time() - 10 * 86400
+        fake_chat_db([
+            {
+                "participants": ["+15551234567"],
+                "messages": [
+                    {"text": "dinner friday?", "from_me": False, "unix_ts": send_time - 3600},
+                    {"text": "yes 7pm", "from_me": True, "unix_ts": send_time},
+                ],
+            }
+        ])
+        fake_anthropic([_response(_event())])
+
+        result = main.backfill(
+            _cfg(),
+            since=datetime.now() - timedelta(days=15),
+            until=datetime.now(),
+            window_days=30,
+            out_path=tmp_path / "backfill.jsonl",
+            mock_calendar="SA test",
+        )
+
+        assert fake_mock_calendar["calls"] == [("create", "SA test")]
+        assert len(spy_create_event["calls"]) == 1
+        assert spy_create_event["calls"][0]["calendar_name"] == "SA test"
+        assert result.n_events == 1
+        # Real state.json still untouched; and the calendar functions are
+        # restored once the run ends.
+        assert not state.STATE_FILE.exists()
+        assert calendar.create_event.__name__ == "fake"
+
+    def test_safety_failure_aborts_before_any_api_call(
+        self, fake_chat_db, fake_anthropic, spy_create_event, fake_mock_calendar, tmp_path
+    ):
+        fake_chat_db([])
+        client = fake_anthropic([_response(_event())])
+        with pytest.raises(main.MockCalendarError):
+            main.backfill(
+                _cfg(target_calendar="Work"),
+                since=datetime.now() - timedelta(days=5),
+                out_path=tmp_path / "backfill.jsonl",
+                mock_calendar="Work",
+            )
+        assert client.messages.calls == []
+        assert spy_create_event["calls"] == []
+
+    def test_guard_refuses_any_other_calendar(self, spy_create_event, spy_delete_event):
+        with main._mock_calendar_environment("SA test"):
+            with pytest.raises(RuntimeError, match="refusing"):
+                calendar.create_event(
+                    title="x", date_str="2099-01-01", time_start=None,
+                    duration_minutes=None, location=None, calendar_name="Work",
+                )
+            with pytest.raises(RuntimeError, match="refusing"):
+                calendar.delete_event("uid", calendar_name="Work")
+            calendar.delete_event("uid", calendar_name="SA test")
+        assert spy_create_event["calls"] == []
+        assert spy_delete_event["calls"] == [{"uid": "uid", "calendar_name": "SA test"}]
