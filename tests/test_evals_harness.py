@@ -558,3 +558,19 @@ def test_jev_path_summary_reports_fallback_rate():
     paths = run_mod.jev_path_summary({"threads": 10, "skip": 5, "fast": 3, "fallback": 1, "jev_errors": 1})
     assert paths["fallback_rate"] == 0.2  # errors also fell back to Haiku
     assert run_mod.jev_path_summary({})["fallback_rate"] is None
+
+
+def test_score_pipeline_case_null_updates_skips_the_update_count(fake_anthropic):
+    # Second poll adds a location -> 1 update; "updates": null must not care.
+    fake_anthropic([
+        {"events": [_detector_event()]},
+        {"events": [_detector_event(location="Lucia's")]},
+    ])
+
+    strict = score_pipeline_case(_poll_case(), model="fake", dedup_model="fake")
+    relaxed = score_pipeline_case(
+        _poll_case(expected_pipeline={"creates": 1, "updates": None}), model="fake", dedup_model="fake",
+    )
+
+    assert strict["passed"] is False
+    assert relaxed["passed"] is True, relaxed["failures"]

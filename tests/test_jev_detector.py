@@ -374,3 +374,97 @@ def test_ordinary_new_message_can_still_be_skipped(fake_jev, fake_haiku):
 
 def test_cant_wait_is_not_cancel_language():
     assert not jev_detector._CHANGE_RE.search("can't wait!!")
+
+
+# --- v0.13: attribution guard, imminent skip, date notes, participants -------
+
+
+def _one_message_thread(text, from_me=False):
+    return _thread(messages=[
+        {"sender": "+15551234567", "text": text, "from_me": from_me, "unix_ts": WED},
+        {"sender": "me", "text": "nice", "from_me": True, "unix_ts": WED + 60},
+    ])
+
+
+def test_other_persons_own_plan_falls_back_to_haiku(fake_jev, fake_haiku):
+    fake_jev(_resp())
+    haiku = fake_haiku()
+    thread = _one_message_thread(
+        "i'm planning to hang with emily saturday assuming you are going to venue early"
+    )
+    events, _ = jev_detector.detect_plans([thread])
+    assert len(haiku) == 1
+    assert events == []
+    assert jev_detector.STATS["fallback"] == 1
+
+
+def test_own_plan_with_an_invitation_stays_on_fast_path(fake_jev, fake_haiku):
+    fake_jev(_resp())
+    haiku = fake_haiku()
+    events, _ = jev_detector.detect_plans([_one_message_thread("i'm going to dinner saturday at 7pm, wanna come?")])
+    assert haiku == []
+    assert len(events) == 1
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("I have a work dinner saturday", True),
+    ("i'll be in denver saturday", True),
+    ("im heading to my mom's saturday", True),
+    ("I'm going saturday, you in?", False),
+    ("let's do dinner saturday", False),
+    ("dinner saturday at 7pm?", False),
+])
+def test_others_own_plan_regex(text, expected):
+    assert jev_detector._others_own_plan({"text": text, "from_me": False}) is expected
+
+
+def test_users_own_plan_statement_is_not_flagged():
+    assert jev_detector._others_own_plan({"text": "I have a dentist appt saturday", "from_me": True}) is False
+
+
+def test_imminent_fast_path_event_is_skipped(fake_jev, fake_haiku):
+    fake_jev(_resp(date=_choice("2026-09-30"), time=None))
+    haiku = fake_haiku()
+    events, _ = jev_detector.detect_plans([_one_message_thread("dinner today? be there in 10")])
+    assert events == []
+    assert haiku == []
+    assert jev_detector.STATS["skip"] == 1
+
+
+def test_fast_path_ambiguous_date_gets_note(fake_jev, fake_haiku):
+    # "wednesday" said on Wednesday Sep 30: today, or a week out.
+    fake_jev(_resp(date=_choice("2026-09-30")))
+    fake_haiku()
+    events, _ = jev_detector.detect_plans([_one_message_thread("dinner wednesday at 7pm?")])
+    assert "Wed Oct 7" in events[0]["_date_note"]
+
+
+def test_next_weekday_candidate_is_next_weeks():
+    from scheduling_agent import candidates
+    sun = datetime(2026, 10, 4, 12, 0).timestamp()
+    got = candidates.date_candidates([{"text": "brunch next saturday?", "unix_ts": sun}])
+    assert [c["value"] for c in got] == ["2026-10-17"]
+
+
+def test_fast_path_unambiguous_date_has_no_note(fake_jev, fake_haiku):
+    fake_jev(_resp())
+    fake_haiku()
+    events, _ = jev_detector.detect_plans([_thread()])
+    assert "_date_note" not in events[0]
+    assert events[0]["date_basis"] == "relative_to_message"
+    assert events[0]["participation_basis"] == "user_invited"
+
+
+def test_fast_path_events_carry_participants(fake_jev, fake_haiku):
+    fake_jev(_resp())
+    fake_haiku()
+    events, _ = jev_detector.detect_plans([_thread(participants=("Sam",))])
+    assert events[0]["participants"] == ["Sam"]
+
+
+def test_known_plans_reach_the_fallback_thread(fake_jev, fake_haiku):
+    fake_jev(_resp(has_plan=0.5))
+    haiku = fake_haiku()
+    known = [{"title": "Marathon", "date": "2026-10-11", "time_start": None}]
+    detector.detect_plans([_thread()], backend="jev", known_plans=known)
+    assert haiku[0][0][0]["known_plans"] == known

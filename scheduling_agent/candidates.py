@@ -18,6 +18,8 @@ Candidates are de-duplicated by value, keeping the first mention.
 import re
 from datetime import date, datetime, timedelta
 
+from scheduling_agent import temporal
+
 _MONTHS = {
     "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
     "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
@@ -239,14 +241,13 @@ def date_candidates(messages: list[dict]) -> list[dict]:
             target = _WEEKDAYS[m.group(2).lower()]
             ahead = (target - sent.weekday()) % 7
             nearest = sent + timedelta(days=ahead)
-            # "next Friday" follows the project convention (golden
-            # anchor_next_friday): the Friday of next week, never the coming
-            # one. A convention isn't something to infer from context, so only
-            # that reading is offered. A weekday named on that same weekday
-            # is genuinely ambiguous (today, or a week out), so both readings
-            # are offered for Jev to pick between.
+            # "next Friday" is the Friday of next week, never the coming one
+            # (temporal.next_weekday). A convention isn't something to infer
+            # from context, so only that reading is offered. A weekday named
+            # on that same weekday is genuinely ambiguous (today, or a week
+            # out), so both readings are offered for Jev to pick between.
             if qualifier == "next":
-                ds = [nearest + timedelta(days=7)]
+                ds = [temporal.next_weekday(sent, target)]
             elif ahead == 0:
                 ds = [nearest, nearest + timedelta(days=7)]
             else:

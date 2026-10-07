@@ -621,3 +621,65 @@ def test_unmatched_create_has_no_relationship():
 
     assert decision.action == "create"
     assert decision.relationship is None
+
+
+# --- v0.13: location-aware fuzzy, same-evidence layer ---------------------------
+
+
+def test_fuzzy_match_uses_overlapping_location():
+    candidate = {"date": "2099-01-15", "time_start": "16:00", "title": "Party",
+                 "location": "Augies in Lincoln park"}
+    event = _event(title="Party at Augies", time_start="16:00", location="Augies in Lincoln Park")
+    assert reconcile.fuzzy_match(event, [candidate], 0.6) is candidate
+
+
+def test_fuzzy_match_location_needs_a_shared_title_word():
+    candidate = {"date": "2099-01-15", "time_start": "16:00", "title": "Brunch", "location": "Augies"}
+    event = _event(title="Party", time_start="16:00", location="Augies")
+    assert reconcile.fuzzy_match(event, [candidate], 0.6) is None
+
+
+def test_fuzzy_match_ignores_different_locations():
+    candidate = {"date": "2099-01-15", "time_start": "16:00", "title": "Party", "location": "Rosie's"}
+    event = _event(title="Party at Augies", time_start="16:00", location="Augies")
+    assert reconcile.fuzzy_match(event, [candidate], 0.6) is None
+
+
+_LUCKY = "I made us 2 a club lucky res at 4:15 the day before the marathon"
+
+
+def test_evidence_candidates_finds_same_message_at_any_date():
+    state.record_event(1, "2099-03-01", "16:15", "Club Lucky reservation", evidence=_LUCKY)
+    state.record_event(2, "2099-03-01", "16:15", "Club Lucky reservation", evidence=_LUCKY)  # other chat
+    state.record_event(1, "2099-03-01", "16:15", "Other", evidence="something else entirely here")
+
+    got = reconcile.evidence_candidates(_event(title="Club Lucky Restaurant Reservation", evidence=_LUCKY))
+
+    assert [r["chat_id"] for r in got] == [1]
+    assert got[0]["title"] == "Club Lucky reservation"
+
+
+def test_evidence_candidates_ignores_short_evidence():
+    state.record_event(1, "2099-03-01", None, "Dinner", evidence="I'm down")
+    assert reconcile.evidence_candidates(_event(evidence="I'm down")) == []
+
+
+def test_reconcile_sends_far_same_evidence_record_to_adjudicator(monkeypatch):
+    state.record_event(1, "2099-03-01", "16:15", "Club Lucky reservation", evidence=_LUCKY,
+                       calendar_uid="UID-L", confidence=0.95)
+    seen = {}
+
+    def fake_adjudicate(event, candidates, model, source=None, backend="claude"):
+        seen["source"], seen["titles"] = source, [c["title"] for c in candidates]
+        return {"is_duplicate": True, "duplicate_of": 0, "relationship": "duplicate", "reasoning": "same message"}
+
+    monkeypatch.setattr(reconcile.dedup, "adjudicate", fake_adjudicate)
+
+    decision = reconcile.reconcile(
+        _event(title="Club Lucky Restaurant Reservation", date="2099-04-20", time_start="16:15", evidence=_LUCKY),
+        _cfg(),
+    )
+
+    assert seen == {"source": "evidence", "titles": ["Club Lucky reservation"]}
+    # A far "duplicate" never moves the stored date, and never creates.
+    assert decision.action == "skip_duplicate"

@@ -78,18 +78,35 @@ def test_no_time_creates_allday_event(capture_osascript):
     calendar.create_event("All day thing", "2026-06-13", None, 60, None)
     script = capture_osascript["script"]
     assert "allday event:true" in script
-    # Start at midnight June 13; end at midnight June 14 (exclusive end).
+    # Start at midnight June 13; end inside June 13 (see _compute_span).
     assert 'date "June 13, 2026 at 12:00:00 AM"' in script
-    assert 'date "June 14, 2026 at 12:00:00 AM"' in script
+    assert 'date "June 13, 2026 at 11:59:59 PM"' in script
 
 
-def test_no_time_multiday_allday_end_is_exclusive(capture_osascript):
+def test_no_time_multiday_allday_ends_inside_last_day(capture_osascript):
     calendar.create_event("NYC Trip", "2026-06-13", None, 60, None, end_date="2026-06-16")
     script = capture_osascript["script"]
     assert "allday event:true" in script
     assert 'date "June 13, 2026 at 12:00:00 AM"' in script
-    # Last day is June 16; all-day end date must be the midnight *after* it.
-    assert 'date "June 17, 2026 at 12:00:00 AM"' in script
+    # Last day is June 16: end inside it, never the midnight after (Calendar
+    # reads that midnight as an extra day once a location is set).
+    assert 'date "June 16, 2026 at 11:59:59 PM"' in script
+    assert "June 17" not in script
+
+
+@pytest.mark.parametrize("location", [None, "Augies"])
+def test_single_day_allday_ends_same_day(capture_osascript, location):
+    calendar.create_event("Brunch", "2026-09-27", None, None, location)
+    script = capture_osascript["script"]
+    assert 'end date:date "September 27, 2026 at 11:59:59 PM"' in script
+    assert "September 28" not in script
+
+
+def test_update_single_day_allday_ends_same_day(capture_osascript):
+    calendar.update_event("UID-1", "Dinner", "2026-10-15", None, None, "Black Briar")
+    script = capture_osascript["script"]
+    assert 'set newEnd to date "October 15, 2026 at 11:59:59 PM"' in script
+    assert "October 16" not in script
 
 
 def test_none_duration_defaults_to_60_minutes(capture_osascript):
@@ -151,7 +168,7 @@ def test_update_event_allday(capture_osascript):
     script = capture_osascript["script"]
     assert "set allday event of theEvent to true" in script
     assert 'date "June 13, 2026 at 12:00:00 AM"' in script
-    assert 'date "June 14, 2026 at 12:00:00 AM"' in script
+    assert 'date "June 13, 2026 at 11:59:59 PM"' in script
     assert "set location" not in script
 
 
@@ -358,3 +375,43 @@ def test_list_calendars_parses_names_and_descriptions(capture_osascript):
 def test_list_calendars_failure_returns_none(capture_osascript):
     capture_osascript["returncode"] = 1
     assert calendar.list_calendars() is None
+
+
+# --- v0.13: notes, ensure_calendar ---------------------------------------------
+
+
+def test_create_event_writes_notes(capture_osascript):
+    calendar.create_event("Dinner", "2026-06-13", "19:00", 60, None, notes='Date from "next Friday"')
+    assert 'description:"Date from \\"next Friday\\""' in capture_osascript["script"]
+
+
+def test_create_event_without_notes_has_no_description(capture_osascript):
+    calendar.create_event("Dinner", "2026-06-13", "19:00", 60, None)
+    assert "description" not in capture_osascript["script"]
+
+
+def test_update_event_writes_notes_only_when_given(capture_osascript):
+    calendar.update_event("UID-1", "Dinner", "2026-06-13", "19:00", 60, None, notes="maybe Fri")
+    assert 'set description of theEvent to "maybe Fri"' in capture_osascript["script"]
+    calendar.update_event("UID-1", "Dinner", "2026-06-13", "19:00", 60, None)
+    assert "description" not in capture_osascript["script"]
+
+
+def test_ensure_calendar_existing_is_left_alone(monkeypatch):
+    monkeypatch.setattr(calendar, "get_calendar_info", lambda name: {"count": 1, "description": ""})
+    monkeypatch.setattr(calendar, "_run_osascript", lambda s: pytest.fail("must not create"))
+    assert calendar.ensure_calendar("Suggestions") is True
+
+
+def test_ensure_calendar_creates_missing(monkeypatch):
+    scripts = []
+    monkeypatch.setattr(calendar, "get_calendar_info", lambda name: {"count": 0, "description": ""})
+    monkeypatch.setattr(calendar, "_run_osascript", lambda s: scripts.append(s) or "")
+    assert calendar.ensure_calendar("Suggestions") is True
+    assert 'name:"Suggestions"' in scripts[0]
+    assert calendar.SUGGESTIONS_CALENDAR_DESCRIPTION in scripts[0]
+
+
+def test_ensure_calendar_lookup_failure_returns_false(monkeypatch):
+    monkeypatch.setattr(calendar, "get_calendar_info", lambda name: None)
+    assert calendar.ensure_calendar("Suggestions") is False

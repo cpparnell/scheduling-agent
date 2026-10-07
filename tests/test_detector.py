@@ -1099,3 +1099,264 @@ def test_demote_still_skips_when_new_message_is_from_user():
     event = _event(status="confirmed")
     detector._demote_if_user_silent(event, thread)
     assert event["status"] == "confirmed"
+
+
+# --- v0.13: date verification, imminent plans, known plans, attribution -------
+
+
+_WED_NOON = datetime(2026, 10, 7, 12, 0).timestamp()  # a Wednesday, local time
+
+
+def _wed_thread(text, from_me=False, participants=("+15551234567",)):
+    return _thread(messages=[
+        {"sender": "+15551234567", "text": text, "from_me": from_me, "unix_ts": _WED_NOON},
+        {"sender": "me", "text": "yes!", "from_me": True, "unix_ts": _WED_NOON + 60},
+    ], participants=participants)
+
+
+def test_relative_date_wrong_arithmetic_is_corrected(fake_anthropic):
+    # "tomorrow" sent Wed Oct 7 is Oct 8; the model said Oct 9.
+    fake_anthropic([_response(_event(
+        date="2026-10-09", evidence="dinner tomorrow at 7?", date_evidence="dinner tomorrow at 7?",
+        date_phrase="tomorrow", date_basis="relative_to_message",
+    ))])
+
+    results, _ = detector.detect_plans([_wed_thread("dinner tomorrow at 7?")])
+
+    assert results[0]["date"] == "2026-10-08"
+    assert "_date_note" not in results[0]
+
+
+def test_relative_date_correction_shifts_end_date(fake_anthropic):
+    fake_anthropic([_response(_event(
+        date="2026-10-11", end_date="2026-10-12", evidence="trip this saturday for 2 nights?",
+        date_evidence="trip this saturday for 2 nights?", date_phrase="this saturday",
+        date_basis="relative_to_message",
+    ))])
+
+    results, _ = detector.detect_plans([_wed_thread("trip this saturday for 2 nights?")])
+
+    assert results[0]["date"] == "2026-10-10"
+    assert results[0]["end_date"] == "2026-10-11"
+
+
+def test_relative_date_correct_is_left_alone(fake_anthropic):
+    fake_anthropic([_response(_event(
+        date="2026-10-08", evidence="dinner tomorrow at 7?", date_evidence="dinner tomorrow at 7?",
+        date_phrase="tomorrow", date_basis="relative_to_message",
+    ))])
+
+    results, _ = detector.detect_plans([_wed_thread("dinner tomorrow at 7?")])
+
+    assert results[0]["date"] == "2026-10-08"
+
+
+def test_anchored_basis_is_never_verified(fake_anthropic):
+    # A bare weekday the model anchored to a far-off event must not be pulled
+    # back to the coming one.
+    fake_anthropic([_response(_event(
+        date="2026-12-04", evidence="dinner friday?", date_evidence="dinner friday?",
+        date_phrase="friday", date_basis="anchored_in_thread",
+    ))])
+
+    results, _ = detector.detect_plans([_wed_thread("dinner friday?")], date_resolver_enabled=False)
+
+    assert results[0]["date"] == "2026-12-04"
+
+
+def test_next_weekday_wrong_week_is_corrected(fake_anthropic):
+    # Real backfill miss: "next Saturday" sent on a Thursday was created on the
+    # Sunday after this week's Saturday. It means next week's Saturday.
+    thu = datetime(2026, 10, 1, 14, 36).timestamp()
+    text = "kate booked ranallis next Saturday 3-6pm for my birthday"
+    thread = _thread(messages=[
+        {"sender": "+15551234567", "text": text, "from_me": False, "unix_ts": thu},
+        {"sender": "me", "text": "I'll be there!", "from_me": True, "unix_ts": thu + 60},
+    ])
+    fake_anthropic([_response(_event(
+        date="2026-10-04", evidence=text, date_evidence=text,
+        date_phrase="next Saturday", date_basis="relative_to_message",
+    ))])
+
+    results, _ = detector.detect_plans([thread])
+
+    assert results[0]["date"] == "2026-10-10"
+    assert "_date_note" not in results[0]
+
+
+def test_ambiguous_same_day_weekday_keeps_date_and_adds_note(fake_anthropic):
+    fake_anthropic([_response(_event(
+        date="2026-10-07", evidence="dinner wednesday?", date_evidence="dinner wednesday?",
+        date_phrase="wednesday", date_basis="relative_to_message",
+    ))])
+
+    results, _ = detector.detect_plans([_wed_thread("dinner wednesday?")], date_resolver_enabled=False)
+
+    assert results[0]["date"] == "2026-10-07"
+    assert "Wed Oct 14" in results[0]["_date_note"]
+
+
+def test_phrase_not_in_any_message_is_not_verified(fake_anthropic):
+    fake_anthropic([_response(_event(
+        date="2026-10-09", evidence="dinner tomorrow at 7?", date_evidence="dinner tomorrow at 7?",
+        date_phrase="tmrw", date_basis="relative_to_message",
+    ))])
+
+    results, _ = detector.detect_plans([_wed_thread("dinner tomorrow at 7?")])
+
+    assert results[0]["date"] == "2026-10-09"
+
+
+def test_imminent_microplan_is_dropped(fake_anthropic):
+    text = "I would watch a quick episode in like 30 mins"
+    fake_anthropic([_response(_event(date="2026-10-07", time_start=None, evidence=text, date_evidence=text))])
+
+    results, _ = detector.detect_plans([_wed_thread(text)])
+
+    assert results == []
+
+
+def test_imminent_phrasing_about_a_later_day_is_kept(fake_anthropic):
+    # "in 10 min" sent Wednesday can't be about a Saturday plan's timing.
+    text = "omw to the store, but bbq saturday?"
+    fake_anthropic([_response(_event(date="2026-10-10", time_start=None, evidence=text, date_evidence=text))])
+
+    results, _ = detector.detect_plans([_wed_thread(text)], date_resolver_enabled=False)
+
+    assert len(results) == 1
+
+
+def test_same_day_plan_without_imminent_phrasing_is_kept(fake_anthropic):
+    text = "dinner tonight at 8?"
+    fake_anthropic([_response(_event(date="2026-10-07", time_start="20:00", evidence=text, date_evidence=text))])
+
+    results, _ = detector.detect_plans([_wed_thread(text)])
+
+    assert len(results) == 1
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("be there in 10", True),
+    ("leaving now!", True),
+    ("call you in an hour", True),
+    ("in 2 mins", True),
+    ("in 3 months we go to Spain", False),
+    ("dinner at 7?", False),
+])
+def test_imminent_regex(text, expected):
+    assert bool(detector._IMMINENT_RE.search(text)) is expected
+
+
+def test_events_carry_thread_participants(fake_anthropic):
+    fake_anthropic([_response(_event())])
+
+    results, _ = detector.detect_plans([_thread(participants=("Sam", "Alex"))])
+
+    assert results[0]["participants"] == ["Sam", "Alex"]
+
+
+def test_known_plans_render_in_prompt(fake_anthropic):
+    client = fake_anthropic([_response()])
+    known = [{"title": "Chicago Marathon", "date": "2026-10-11", "time_start": None},
+             {"title": "Dinner", "date": "2026-10-09", "time_start": "19:00"}]
+
+    detector.detect_plans([_thread()], known_plans=known)
+
+    content = client.messages.calls[0]["messages"][0]["content"]
+    assert "Known plans already on the user's calendar" in content
+    assert "Chicago Marathon — Sun Oct 11, 2026" in content
+    assert "Dinner — Fri Oct 09, 2026 at 19:00" in content
+
+
+def test_no_known_plans_leaves_prompt_unchanged(fake_anthropic):
+    client = fake_anthropic([_response(), _response()])
+
+    detector.detect_plans([_thread()], known_plans=[])
+    detector.detect_plans([_thread()])
+
+    first, second = (c["messages"][0]["content"] for c in client.messages.calls)
+    assert first == second
+    assert "Known plans" not in first
+
+
+def test_schema_requires_new_fields():
+    required = detector.EVENT_ITEM_SCHEMA["required"]
+    for field in ("participation_basis", "date_phrase", "date_basis"):
+        assert field in required
+    assert set(detector.NON_OWNER_BASES) <= set(detector.PARTICIPATION_BASES)
+
+
+def test_date_evidence_quoting_a_known_plan_passes_gate(fake_anthropic):
+    known = [{"title": "Marathon at mile", "date": "2026-10-18", "time_start": None}]
+    fake_anthropic([_response(_event(
+        date="2026-10-17", evidence="yes 7pm", date_evidence="Marathon at mile — Sun Oct 18, 2026",
+        date_basis="anchored_to_known_plan",
+    ))])
+
+    results, _ = detector.detect_plans([_thread()], known_plans=known)
+
+    assert len(results) == 1
+
+
+def test_date_evidence_naming_an_unknown_plan_is_still_dropped(fake_anthropic):
+    known = [{"title": "Marathon", "date": "2026-10-18", "time_start": None}]
+    fake_anthropic([_response(_event(date_evidence="Half marathon — Sun Oct 25, 2026"))])
+
+    results, _ = detector.detect_plans([_thread()], known_plans=known)
+
+    assert results == []
+
+
+def test_bare_title_fragment_does_not_count_as_known_plan_quote():
+    thread = {"known_plans": [{"title": "Big Marathon Weekend", "date": "2026-10-18", "time_start": None}]}
+    assert detector._quotes_known_plan("Marathon", thread) is False
+    assert detector._quotes_known_plan("- Big Marathon Weekend — Sun Oct 18, 2026", thread) is True
+
+
+def test_next_weekday_later_clarified_is_not_overridden(fake_anthropic):
+    # "next Saturday" means next week's — unless the thread later says otherwise.
+    thread = _thread(messages=[
+        {"sender": "+15551234567", "text": "brunch next saturday?", "from_me": False, "unix_ts": _WED_NOON},
+        {"sender": "me", "text": "wait This Saturday or the one after?", "from_me": True, "unix_ts": _WED_NOON + 60},
+        {"sender": "+15551234567", "text": "this one, the 10th", "from_me": False, "unix_ts": _WED_NOON + 120},
+        {"sender": "me", "text": "perfect", "from_me": True, "unix_ts": _WED_NOON + 180},
+    ])
+    fake_anthropic([_response(_event(
+        date="2026-10-10", evidence="brunch next saturday?", date_evidence="brunch next saturday?",
+        date_phrase="next saturday", date_basis="relative_to_message",
+    ))])
+
+    results, _ = detector.detect_plans([thread], date_resolver_enabled=False)
+
+    assert results[0]["date"] == "2026-10-10"
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("this one, the 10th", True),
+    ("wait This Saturday?", True),
+    ("10/10 works", True),
+    ("sounds good", False),
+    ("next saturday works", False),
+    ("you may want to bring a jacket", False),
+])
+def test_clarification_regex(text, expected):
+    assert bool(detector._CLARIFICATION_RE.search(text)) is expected
+
+
+@pytest.mark.parametrize("text,multi_day", [
+    # Real backfill evidence that wrongly counted as multi-day wording.
+    ("It says anytime from 10 to 1", False),
+    ("Party is Oct 17 7-9 at easy does it", False),
+    ("golf 1 day", False),
+    ("dinner tomorrow night", False),
+    ("4-8 pm at Augies", False),
+    # Genuine spans.
+    ("Yes 9-13 works", True),
+    ("the 3rd through the 5th", True),
+    ("2 nights in Tahoe", True),
+    ("3-day weekend", True),
+    ("Fri-Sun at the cabin", True),
+    ("ski trip", True),
+])
+def test_multi_day_signal(text, multi_day):
+    assert bool(detector._MULTI_DAY_SIGNAL_RE.search(text)) is multi_day

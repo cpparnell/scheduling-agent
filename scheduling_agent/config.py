@@ -111,6 +111,19 @@ DEFAULTS = {
     "dedup_backend": "claude",
     # Overrides for jev_detector.DEFAULT_THRESHOLDS (any subset of keys).
     "jev_thresholds": {},
+    # Show the detector the user's upcoming recorded plans (title + date) so a
+    # date relative to another plan ("the day before the marathon") resolves.
+    # Listed plans are anchors only; the prompt forbids re-emitting them.
+    "known_plans_enabled": True,
+    # Opt-in suggestions tier: a calendar name (created if missing) for plans
+    # the agent isn't sure enough to put on target_calendar — confidence in
+    # [suggestion_confidence_threshold, confidence_threshold), or a genuinely
+    # ambiguous date ("next Wednesday" said on a Monday). A later confident
+    # detection of the same plan promotes it to target_calendar; deleting a
+    # suggestion ignores it (it is never re-suggested). null = off: uncertain
+    # plans are skipped and ambiguous dates are committed with a note.
+    "suggestions_calendar": None,
+    "suggestion_confidence_threshold": 0.6,
 }
 
 

@@ -7,7 +7,7 @@ from datetime import date as _date, datetime, timedelta
 import anthropic
 
 from scheduling_agent.datepatterns import ANCHOR_PATTERN, EXPLICIT_DATE_RE
-from scheduling_agent import usage_tracker
+from scheduling_agent import temporal, usage_tracker
 from scheduling_agent import dedup as dedup_module
 from scheduling_agent.dedup import sampling_kwargs
 
@@ -57,6 +57,24 @@ Set `participation_evidence` to one sentence citing the message that shows the u
 is (or is not) expected to attend. When in doubt whether "Me" is included, set
 `user_is_participant` to false — a wrong event on the user's calendar is worse than
 a missing one.
+
+Also set `participation_basis` to WHY the plan is (or isn't) the user's — judge whose
+commitment it is from who said what, not from the topic:
+- "user_proposed": "Me" proposed or organized it
+- "user_invited": someone invited or directly addressed "Me" ("you in?", "you guys come")
+- "user_joined": "Me" asked to come along or included themselves in someone's plan
+- "user_own_plan": "Me" describes their OWN commitment ("I'm running the marathon Oct
+  11", "my dentist appt is Tuesday")
+- "other_persons_plan": someone else describes what THEY will do, and "Me" is not
+  going. This happens in 1:1 chats too — the other person telling the user about their
+  own day is not an invitation, even when it mentions the user: "I'm planning to hang
+  with Emily Saturday while you're at the venue", "I have a work dinner Thursday",
+  "heading to my mom's this weekend", "we're doing brunch Sunday" (with "we" meaning
+  people other than "Me"). A question about the user's plans ("are you going to the
+  venue early?") does not make the other person's plan the user's.
+- "user_declined": "Me" said no while others still go
+- "user_not_addressed": a group arranges it among themselves and never involves "Me"
+Use the last three exactly when `user_is_participant` is false.
 
 Plans fall into three categories — set `status` accordingly:
 
@@ -110,6 +128,14 @@ Do NOT emit a plan when:
   the original date, and not a guessed replacement
 - A vaguely floated date ("maybe Saturday?") was answered only with hedges ("maybe,
   I'll let you know") and never became a real invitation with a real answer
+- It is real-time coordination of something happening within the next hour or two of
+  the message — "watch an episode in like 30 mins?", "omw", "be there in 10", "call
+  you in 5", "grabbing coffee now, want one?". People don't calendar these; they are
+  over before an event would matter. (A plan for later the same day — "dinner tonight
+  at 8?" sent at noon — is still a plan.)
+- It is only availability, with no agreed activity: "I'm free 10/2", "I think I'm good
+  for the 2nd" in answer to "when are you around?" — unless the thread shows what the
+  plan on that date actually is
 NEVER fabricate a date: `date` must come from a specific message. Do not compute one
 by adding time to a vague phrase like "next week" or "sometime soon".
 
@@ -127,7 +153,12 @@ Set `time_confidence` to how certain you are the plan starts exactly at `time_st
 "tomorrow", "tonight", "this Saturday" etc. relative to the SEND time of the message
 containing them, NOT relative to today. A message sent 3 days ago saying "tomorrow"
 means 2 days ago. A weekday named on that same weekday ("this Thursday" sent on a
-Thursday) means THAT DAY — the send date itself, not next week.
+Thursday) means THAT DAY — the send date itself, not next week. "next <weekday>"
+ALWAYS means that weekday in the FOLLOWING week (weeks start on Sunday), even when this
+week's has not happened yet: "next Saturday" sent on a Wednesday is 10 days later, not 3;
+sent on a Sunday it is 13 days later. The only exception is a LATER message in the thread
+that clarifies which day was meant ("wait, this Saturday or the one after?" / "this one,
+the 10th") — then use the clarified date and set `date_basis` to "anchored_in_thread".
 
 **Bare weekday names**: Before resolving a bare weekday ("Friday", "on Wed"), scan
 the ENTIRE thread — including old messages — for an anchor: an explicit date, a
@@ -143,6 +174,25 @@ after the message's send time.
   the weekday WITHIN that timeframe.
 - If the weekday clearly belongs to an anchored event whose exact dates are never
   stated in the thread, set `date` to null rather than guessing the next occurrence.
+
+**Known plans**: The thread may begin with a list of plans already on the user's
+calendar. Use it ONLY to resolve dates that are relative to another plan ("the day
+before the marathon", "the weekend after the wedding", "dinner after the game") and
+to reuse a known plan's exact title when a message is about that same plan. Never
+emit a plan just because it is in the list — a listed plan that a message merely
+mentions is an anchor, not a new plan.
+
+**Date phrase and basis**: Set `date_phrase` to the verbatim words in the messages
+that give the plan's date ("tomorrow", "next Friday", "the day before the marathon",
+"October 10th"), or null if there are none. Set `date_basis` to how you resolved it:
+- "explicit_date": the messages state the calendar date itself ("Oct 10", "10/14", "the 14th")
+- "relative_to_message": resolved purely from when the message was sent ("tomorrow",
+  "tonight", "this Saturday", "next Friday", "in 3 days")
+- "anchored_in_thread": resolved against another message's date or timeframe (a bare
+  weekday inside "the October trip", "that weekend" after a date was proposed)
+- "anchored_to_known_plan": resolved against a plan from the known-plans list. Set
+  `date_evidence` to the thread message that refers to that plan ("the day before the
+  marathon"), not to the list entry.
 
 **Date evidence**: For every plan, set `date_evidence` to a verbatim quote of the
 single message that establishes the plan's DATE. When a bare weekday was resolved
@@ -186,6 +236,17 @@ acceptance of an invitation that was proposed in the context, or a
 reschedule/cancellation of a plan established there.
 """
 
+# Values of `participation_basis`. The last three mean the plan is someone
+# else's; main.process_event treats them as non-participation even when the
+# model's `user_is_participant` boolean disagrees.
+PARTICIPATION_BASES = (
+    "user_proposed", "user_invited", "user_joined", "user_own_plan",
+    "other_persons_plan", "user_declined", "user_not_addressed",
+)
+NON_OWNER_BASES = frozenset({"other_persons_plan", "user_declined", "user_not_addressed"})
+
+DATE_BASES = ("explicit_date", "relative_to_message", "anchored_in_thread", "anchored_to_known_plan")
+
 EVENT_ITEM_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -228,6 +289,20 @@ EVENT_ITEM_SCHEMA = {
             "type": "string",
             "description": "One sentence citing the message that shows whether the user is expected to attend"
         },
+        "participation_basis": {
+            "type": "string",
+            "enum": list(PARTICIPATION_BASES),
+            "description": "Why the plan is or isn't the user's: who proposed, invited, or committed"
+        },
+        "date_phrase": {
+            "type": ["string", "null"],
+            "description": "Verbatim words from the messages that give the plan's date, or null"
+        },
+        "date_basis": {
+            "type": "string",
+            "enum": list(DATE_BASES),
+            "description": "How the date was resolved from date_phrase"
+        },
         "recurrence": {
             "anyOf": [
                 {"type": "string", "enum": ["daily", "weekly", "biweekly", "monthly"]},
@@ -251,8 +326,8 @@ EVENT_ITEM_SCHEMA = {
     "required": [
         "title", "date", "time_start", "time_confidence", "duration_minutes",
         "location", "confidence", "status", "user_is_participant",
-        "participation_evidence", "recurrence", "end_date", "evidence",
-        "date_evidence",
+        "participation_evidence", "participation_basis", "recurrence", "end_date",
+        "evidence", "date_evidence", "date_phrase", "date_basis",
     ],
 }
 
@@ -299,6 +374,13 @@ def _format_thread(
         f"[Participants: {participants}]",
         "",
     ]
+    # Omitted entirely when there are none, so a thread with no known plans
+    # (every single-poll eval case) renders exactly as before.
+    known_plans = thread.get("known_plans") or []
+    if known_plans:
+        lines.append("[Known plans already on the user's calendar — anchors only, not new plans:]")
+        lines.extend(f"- {_known_plan_line(p)}" for p in known_plans)
+        lines.append("")
     messages = thread.get("messages", [])
     # Only insert the context/new-message separators when the thread actually
     # mixes both (some message tagged is_context=True by reader._prepend_context
@@ -323,6 +405,16 @@ def _format_thread(
         age_suffix = f", sent {age_days} day{'s' if age_days != 1 else ''} ago" if age_days >= 1 else ""
         lines.append(f"{sender} ({ts}{age_suffix}): {msg.get('text', '')}")
     return "\n".join(lines)
+
+
+def _known_plan_line(plan: dict) -> str:
+    try:
+        when = _date.fromisoformat(plan["date"]).strftime("%a %b %d, %Y")
+    except (KeyError, TypeError, ValueError):
+        when = str(plan.get("date"))
+    if plan.get("time_start"):
+        when += f" at {plan['time_start']}"
+    return f"{plan.get('title')} — {when}"
 
 
 # Variation selectors (FE00-FE0F), emoji tag characters used in flag-sequence
@@ -574,11 +666,19 @@ def _reconcile_weekday(event: dict, chat_id) -> None:
 # — those flag *any* date-like content, not specifically a *range* of days.
 _MULTI_DAY_SIGNAL_RE = re.compile(
     r"(?i:\bweekend\b|\btrip\b|\bvacation\b|\bgetaway\b|\bfestival\b|"
-    r"\bconference\b|\btour\b|\bovernight\b|\bnights?\b|\b\d+[\s-]*days?\b|"
+    r"\bconference\b|\btour\b|\bovernight\b|"
+    # A count of at least two days/nights ("2 nights", "3-day") — not "tonight",
+    # "Monday night", or "1 day".
+    r"\b(?:[2-9]|\d{2,})[\s-]*(?:days?|nights?)\b|"
     r"\b(?:mon|tues?|wed(?:nes)?|thu(?:rs)?|fri|sat(?:ur)?|sun)[a-z]*\s*"
     r"(?:-|–|—|to|through|thru|until)\s*"
     r"(?:mon|tues?|wed(?:nes)?|thu(?:rs)?|fri|sat(?:ur)?|sun)[a-z]*\b|"
-    r"\d{1,2}(?:st|nd|rd|th)?\s*(?:-|–|—|to|through|thru|until)\s*\d{1,2}(?:st|nd|rd|th)?\b)"
+    # A day-of-month range: ordinals ("the 3rd through the 5th"), or plain
+    # numbers where one side can't be a clock hour ("Oct 9-13"). "7-9" and
+    # "10 to 1" are time ranges.
+    r"\b\d{1,2}(?:st|nd|rd|th)\s*(?:-|–|—|to|through|thru|until)\s*(?:the\s+)?\d{1,2}(?:st|nd|rd|th)?\b|"
+    r"\b(?:1[3-9]|2\d|3[01])\s*(?:-|–|—|through|thru)\s*\d{1,2}\b|"
+    r"\b\d{1,2}\s*(?:-|–|—|through|thru)\s*(?:1[3-9]|2\d|3[01])\b)"
 )
 
 
@@ -589,7 +689,7 @@ def _validate_end_date(event: dict, chat_id) -> None:
     are exclusive) sometimes apply that convention themselves and emit
     end_date = date + 1 for a plan that is really just one day — but
     calendar._compute_span already treats end_date as the *inclusive* last
-    day and adds the exclusive +1 itself, so an untrue end_date silently
+    day, so an untrue end_date silently
     turns a one-day plan into a two-day all-day event. Require actual
     multi-day language in the evidence before trusting end_date at all.
     """
@@ -711,6 +811,134 @@ def _second_pass_date_resolution(
     event["date"] = chosen
 
 
+def _quotes_known_plan(evidence: str, thread: dict) -> bool:
+    """Whether `evidence` quotes an entry of the thread's known-plans list
+    exactly as _format_thread rendered it. That list is the user's own
+    recorded plans, so a date resolved against it ("the day before the
+    marathon") cites real data even though no message contains the quote."""
+    quote = _normalize_for_match(_strip_quote_wrappers(evidence or "").lstrip("- "))
+    if not quote:
+        return False
+    return any(
+        quote in _normalize_for_match(_known_plan_line(p))
+        and len(quote) >= len(_normalize_for_match(p.get("title") or ""))
+        for p in thread.get("known_plans") or []
+    )
+
+
+def _message_containing(phrase: str, preferred: str, thread: dict) -> dict | None:
+    """The message a date phrase came from: the one `preferred` (the model's
+    date_evidence) quotes if it contains the phrase, otherwise the latest
+    message that does. None when no message contains it."""
+    phrase_norm = _normalize_for_match(phrase)
+    if not phrase_norm:
+        return None
+    preferred_norm = _normalize_for_match(_strip_quote_wrappers(preferred or ""))
+    containing = [
+        m for m in thread.get("messages", [])
+        if phrase_norm in _normalize_for_match(m.get("text", ""))
+    ]
+    for m in containing:
+        if preferred_norm and preferred_norm in _normalize_for_match(m.get("text", "")):
+            return m
+    return containing[-1] if containing else None
+
+
+# A later message pinning the date another way: an explicit date ("the 10th",
+# "10/10") or a "this <weekday>" correction ("this saturday, not next").
+_CLARIFICATION_RE = re.compile(
+    rf"(?:{EXPLICIT_DATE_RE.pattern})|(?i:\bthis (?:coming )?(?:{'|'.join(_WEEKDAY_INDEX)})\b)",
+)
+
+
+def _clarified_later(msg: dict, thread: dict) -> bool:
+    """Whether any message after `msg` restates the date in a way that can
+    override what its relative phrase means on its own — "next Saturday"
+    followed by "wait this saturday or the one after?" / "this one, the 3rd".
+    The model, which sees the whole thread, is then trusted over the
+    deterministic reading."""
+    messages = thread.get("messages", [])
+    try:
+        later = messages[messages.index(msg) + 1:]
+    except ValueError:
+        return False
+    return any(_CLARIFICATION_RE.search(m.get("text") or "") for m in later)
+
+
+def _verify_relative_date(event: dict, thread: dict) -> None:
+    """Model picks, code verifies: for a date the model says it resolved
+    purely from a message's send time, recompute what its own `date_phrase`
+    means against that message's send date (temporal.resolve_phrase).
+
+    - The model's date isn't a reading and the phrase has exactly one
+      ("tomorrow", "this Saturday") -> correct it. Date arithmetic is the
+      part the model gets wrong; the phrase is the part it gets right.
+    - The phrase is genuinely ambiguous ("next Wednesday" said on a Monday)
+      -> keep the model's reading but attach `_date_note`, which is written to
+      the calendar event's notes (and, with a suggestions calendar
+      configured, routes the event there) instead of committing silently."""
+    if event.get("date_basis") != "relative_to_message":
+        return
+    phrase = event.get("date_phrase") or ""
+    try:
+        chosen = _date.fromisoformat(event.get("date") or "")
+    except ValueError:
+        return
+    msg = _message_containing(phrase, event.get("date_evidence") or "", thread)
+    if msg is None:
+        return
+    sent = datetime.fromtimestamp(msg.get("unix_ts", 0)).date()
+    res = temporal.resolve_phrase(phrase, sent)
+    if res is None or not res.readings:
+        return
+
+    if chosen not in res.readings and res.overridable and not _clarified_later(msg, thread):
+        corrected = res.readings[0]
+        delta = corrected - chosen
+        logger.warning(
+            "  -> Correcting %r: %r sent %s resolves to %s, not %s",
+            event.get("title"), phrase, sent.isoformat(), corrected.isoformat(), chosen.isoformat(),
+        )
+        event["date"] = corrected.isoformat()
+        if event.get("end_date"):
+            try:
+                event["end_date"] = (_date.fromisoformat(event["end_date"]) + delta).isoformat()
+            except ValueError:
+                event["end_date"] = None
+        chosen = corrected
+
+    note = temporal.ambiguity_note(res, chosen, sent)
+    if note:
+        event["_date_note"] = note
+
+
+# Real-time coordination ("in like 30 mins", "omw"): over before a calendar
+# entry would matter. Backstops the prompt's rule on both backends.
+_IMMINENT_RE = re.compile(
+    r"\bin (?:like |about |abt |~)?(?:\d{1,3}|a few|a couple(?: of)?|five|ten|fifteen|twenty|thirty|forty five) ?"
+    r"(?:min|mins|minutes|m)\b"
+    r"|\bin (?:like |about |abt )?(?:an|1|one|half an) (?:hour|hr)\b"
+    r"|\bomw\b|\bon my way\b|\bbe there in\b|\bheading (?:over|out) now\b|\bleaving now\b",
+    re.IGNORECASE,
+)
+
+
+def is_imminent_microplan(event: dict, thread: dict) -> bool:
+    """True when the plan's own evidence is real-time coordination (see
+    _IMMINENT_RE) sent on the plan's date — "watch an episode in like 30
+    mins?". A same-day plan set hours ahead never quotes that phrasing."""
+    for quote in (event.get("evidence") or "", event.get("date_evidence") or ""):
+        if not _IMMINENT_RE.search(quote):
+            continue
+        msg = _message_containing(_strip_quote_wrappers(quote), quote, thread)
+        if msg is None:
+            continue
+        sent = datetime.fromtimestamp(msg.get("unix_ts", 0)).date()
+        if event.get("date") == sent.isoformat():
+            return True
+    return False
+
+
 def _new_messages(thread: dict) -> list[dict]:
     """The thread's messages that aren't already-processed context — i.e. the
     ones from THIS poll. When the thread carries no context-marking info at
@@ -772,9 +1000,14 @@ def detect_plans(
     date_resolver_enabled: bool = True,
     backend: str = "claude",
     jev_thresholds: dict | None = None,
+    known_plans: list[dict] | None = None,
 ) -> tuple[list[dict], set]:
     """
     Analyze a list of conversation threads for plans.
+
+    `known_plans` (state.known_plans()) is the user's upcoming recorded plans,
+    rendered into every thread's prompt so a date relative to another plan
+    ("the day before the marathon") can resolve. None or empty adds nothing.
 
     `backend` (mirrors config.DEFAULTS["detector_backend"]) picks the
     implementation: "claude" runs every thread through Haiku; "jev" runs
@@ -782,6 +1015,8 @@ def detect_plans(
     calls Haiku (with `model`) for threads it can't settle itself. Both
     return the same shape.
     """
+    if known_plans:
+        threads = [{**t, "known_plans": known_plans} for t in threads]
     if backend == "jev":
         from scheduling_agent import jev_detector
         return jev_detector.detect_plans(
@@ -891,7 +1126,7 @@ def _detect_plans_claude(
                     continue
 
                 date_evidence = event.get("date_evidence") or ""
-                if not _evidence_found(date_evidence, thread):
+                if not _evidence_found(date_evidence, thread) and not _quotes_known_plan(date_evidence, thread):
                     logger.warning(
                         "  -> Date evidence not found verbatim in thread %s: %s",
                         thread["chat_id"], _log_snippet(date_evidence),
@@ -916,6 +1151,14 @@ def _detect_plans_claude(
                         )
                         continue
 
+                if is_imminent_microplan(event, thread):
+                    logger.info(
+                        "  -> Dropping real-time coordination, not a calendar plan: %s",
+                        event.get("title"),
+                    )
+                    continue
+
+                _verify_relative_date(event, thread)
                 _reconcile_weekday(event, thread["chat_id"])
                 _validate_end_date(event, thread["chat_id"])
                 if date_resolver_enabled:
@@ -923,13 +1166,17 @@ def _detect_plans_claude(
                 _demote_if_user_silent(event, thread)
 
                 logger.info(
-                    "  -> Detected %s plan: %s on %s (confidence %.2f)",
+                    "  -> Detected %s plan: %s on %s%s (confidence %.2f)",
                     event.get("status", "confirmed"),
                     event.get("title"),
                     event.get("date"),
+                    f" through {event['end_date']}" if event.get("end_date") else "",
                     event.get("confidence", 0),
                 )
                 event["chat_id"] = thread["chat_id"]
+                # Persisted on the record so the dedup adjudicator can judge
+                # whether two plans' conversations share people.
+                event["participants"] = list(thread.get("participants", []))
                 # Consumed by main.py's anti-flap guard (F7), which has no
                 # access to the thread itself — see _new_message_from_user.
                 event["_new_msg_from_user"] = _new_message_from_user(thread)

@@ -39,9 +39,16 @@ def _compute_span(
     if is_allday:
         start_dt = start_date
         last_day = datetime.strptime(end_date, "%Y-%m-%d") if end_date else start_date
-        # Calendar's all-day end date is exclusive, so it must land on the
-        # midnight *after* the last day of the event.
-        end_dt = last_day + timedelta(days=1)
+        # End at 11:59:59 PM on the last day, NOT the midnight after it.
+        # Calendar.app only treats a next-midnight end as exclusive when
+        # nothing else is touched: include a location in the new event's
+        # properties, or set the end date of an existing all-day event (any
+        # update), and it reads that midnight as a day of the event — every
+        # one-day all-day event with a location, and every updated one,
+        # landed on the calendar spanning two days. An end inside the last
+        # day reads as that day in every case (probed against Calendar.app:
+        # create with/without location, update, move, timed -> all-day).
+        end_dt = last_day + timedelta(days=1, seconds=-1)
     else:
         start_dt = datetime.strptime(f"{date_str} {time_start}", "%Y-%m-%d %H:%M")
         if end_date:
@@ -75,11 +82,13 @@ def create_event(
     tentative: bool = False,
     recurrence: str | None = None,
     end_date: str | None = None,
+    notes: str | None = None,
 ) -> str | None:
     """
     Create an Apple Calendar event via osascript.
     Returns the created event's UID on success (empty string if Calendar
-    didn't return one), or None on failure.
+    didn't return one), or None on failure. `notes` becomes the event's
+    notes field (e.g. why its date is uncertain).
     """
     try:
         start_dt, end_dt, is_allday = _compute_span(
@@ -99,6 +108,8 @@ def create_event(
         if location:
             safe_location = _escape_as_string(location)
             props += f', location:"{safe_location}"'
+        if notes:
+            props += f', description:"{_escape_as_string(notes)}"'
         props += "}"
 
         recurrence_line = ""
@@ -138,10 +149,12 @@ def update_event(
     calendar_name: str = "Calendar",
     tentative: bool = False,
     end_date: str | None = None,
+    notes: str | None = None,
 ) -> bool:
     """
     Rewrite an existing Apple Calendar event's properties (found by UID) to the
-    given merged field values. Same field semantics as create_event.
+    given merged field values. Same field semantics as create_event; `notes`
+    None leaves the event's existing notes alone.
     Returns True on success, False on any failure.
     """
     try:
@@ -158,6 +171,8 @@ def update_event(
         if location:
             safe_location = _escape_as_string(location)
             location_line = f'\n    set location of theEvent to "{safe_location}"'
+        if notes:
+            location_line += f'\n    set description of theEvent to "{_escape_as_string(notes)}"'
 
         script = f"""
 tell application "Calendar"
@@ -394,6 +409,40 @@ end tell
     except Exception as e:
         logger.error("Failed to list calendars: %s", e)
         return None
+
+
+SUGGESTIONS_CALENDAR_DESCRIPTION = (
+    "Plans scheduling-agent detected but wasn't sure enough to put on your main "
+    "calendar. Delete one to ignore it."
+)
+
+
+def ensure_calendar(calendar_name: str, description: str = SUGGESTIONS_CALENDAR_DESCRIPTION) -> bool:
+    """Make sure a calendar named `calendar_name` exists, creating it (with
+    `description`) if not. Returns True when it exists afterwards. Never
+    modifies an existing calendar."""
+    info = get_calendar_info(calendar_name)
+    if info is None:
+        return False
+    if info["count"] > 0:
+        return True
+    try:
+        script = f"""
+tell application "Calendar"
+    set newCalendar to make new calendar with properties {{name:"{_escape_as_string(calendar_name)}"}}
+    set description of newCalendar to "{_escape_as_string(description)}"
+end tell
+"""
+        if _run_osascript(script) is None:
+            return False
+        logger.info("Created calendar %s", calendar_name)
+        return True
+    except subprocess.TimeoutExpired:
+        logger.error("Calendar creation timed out for %s", calendar_name)
+        return False
+    except Exception as e:
+        logger.error("Failed to create calendar %s: %s", calendar_name, e)
+        return False
 
 
 def create_mock_calendar(calendar_name: str) -> bool:
