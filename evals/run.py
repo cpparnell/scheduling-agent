@@ -145,6 +145,7 @@ def _would_reach_calendar(event: dict) -> bool:
     (or, once implemented, cancelled)."""
     return (
         bool(event.get("user_is_participant"))
+        and event.get("participation_basis") not in detector.NON_OWNER_BASES
         and event.get("status") not in _NON_CREATING_STATUSES
     )
 
@@ -329,7 +330,8 @@ class _FakeCalendar:
         self.deletes = 0
 
     def create_event(self, title, date_str, time_start, duration_minutes, location,
-                     calendar_name="Calendar", tentative=False, recurrence=None, end_date=None):
+                     calendar_name="Calendar", tentative=False, recurrence=None, end_date=None,
+                     notes=None):
         uid = f"uid-{self.creates}"
         self.creates += 1
         self.events[uid] = {
@@ -339,7 +341,8 @@ class _FakeCalendar:
         return uid
 
     def update_event(self, uid, title, date_str, time_start, duration_minutes, location,
-                     calendar_name="Calendar", tentative=False, end_date=None):
+                     calendar_name="Calendar", tentative=False, end_date=None,
+                     notes=None):
         self.updates += 1
         if uid not in self.events:
             return False
@@ -418,6 +421,7 @@ def score_pipeline_case(
                 today=datetime.combine(today, time(12, 0)),
                 context_marking_enabled=cfg["context_marking_enabled"],
                 date_resolver_enabled=cfg["date_resolver_enabled"], backend=backend,
+                known_plans=state_mod.known_plans(today=today) if cfg["known_plans_enabled"] else None,
             )
             for event in events:
                 outcomes.append(main.process_event(event, cfg))
@@ -435,7 +439,10 @@ def score_pipeline_case(
     failures: list[str] = []
     if fake_calendar.creates != expected.get("creates", 0):
         failures.append(f"creates {fake_calendar.creates} != {expected.get('creates', 0)}")
-    if fake_calendar.updates != expected.get("updates", 0):
+    # "updates": null opts out of the count, for cases whose point is the
+    # create count and final event — whether a re-mention also adds an
+    # incidental detail (a location) is up to the model.
+    if expected.get("updates", 0) is not None and fake_calendar.updates != expected.get("updates", 0):
         failures.append(f"updates {fake_calendar.updates} != {expected.get('updates', 0)}")
     if fake_calendar.deletes != expected.get("deletes", 0):
         failures.append(f"deletes {fake_calendar.deletes} != {expected.get('deletes', 0)}")

@@ -312,8 +312,16 @@ def make_record(
     calendar_uid: str | None = None,
     suppressed: bool = False,
     duplicate_of_uid: str | None = None,
+    participants: list[str] | None = None,
+    date_note: str | None = None,
+    tier: str = "main",
+    calendar_name: str | None = None,
 ) -> dict:
-    """Build a canonical event record (not yet persisted)."""
+    """Build a canonical event record (not yet persisted).
+
+    `tier` is "main" (the target calendar) or "suggested" (the opt-in
+    suggestions calendar, named by `calendar_name`); a suggested record is
+    promoted to main when a later detection of the same plan qualifies."""
     now = datetime.now().isoformat()
     return {
         "canonical_id": uuid.uuid4().hex,
@@ -332,6 +340,10 @@ def make_record(
         "updated_at": now,
         "suppressed": suppressed,
         "duplicate_of_uid": duplicate_of_uid,
+        "participants": list(participants or []),
+        "date_note": date_note,
+        "tier": tier,
+        "calendar_name": calendar_name,
         "revisions": [],
     }
 
@@ -415,6 +427,7 @@ def record_event(
     calendar_uid: str | None = None,
     suppressed: bool = False,
     duplicate_of_uid: str | None = None,
+    participants: list[str] | None = None,
 ) -> None:
     """Record an event directly (intent + commit in one step). Used for paths
     with no calendar write to journal around, e.g. suppressed duplicates.
@@ -424,6 +437,7 @@ def record_event(
         location=location, status=status, evidence=evidence,
         confidence=confidence, calendar_uid=calendar_uid,
         suppressed=suppressed, duplicate_of_uid=duplicate_of_uid,
+        participants=participants,
     )
     data = _load()
     _commit_record(data, record)
@@ -594,6 +608,35 @@ def get_events_near(date_str: str, window_days: int = 1) -> list[dict]:
         if abs((record_date - target).days) <= window_days:
             matches.append(record)
     return matches
+
+
+KNOWN_PLANS_MAX = 25
+KNOWN_PLANS_HORIZON_DAYS = 180
+
+
+def known_plans(today: date_type | None = None) -> list[dict]:
+    """The user's upcoming, live plans as {title, date, time_start}, soonest
+    first — shown to the detector so a date relative to another plan ("the
+    day before the marathon") can resolve. Suppressed duplicates and
+    cancelled plans are left out."""
+    today = today or date_type.today()
+    horizon = today + timedelta(days=KNOWN_PLANS_HORIZON_DAYS)
+    plans = []
+    for record in get_active_events():
+        if record.get("status") == "cancelled":
+            continue
+        try:
+            d = date_type.fromisoformat(record["date"])
+        except (KeyError, ValueError, TypeError):
+            continue
+        if today <= d <= horizon:
+            plans.append({
+                "title": record.get("title"),
+                "date": record["date"],
+                "time_start": record.get("time_start"),
+            })
+    plans.sort(key=lambda p: (p["date"], p.get("time_start") or ""))
+    return plans[:KNOWN_PLANS_MAX]
 
 
 def get_active_events() -> list[dict]:

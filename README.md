@@ -27,6 +27,13 @@ chat.db changes
 **Ownership gate.** The detector judges whether the user is personally part of each plan
 (`user_is_participant`); plans that belong to someone else — a friend describing *their* trip,
 a sibling's wedding, a group plan the user declined — are logged and skipped, never created.
+It also states *why* (`participation_basis`: `user_proposed`, `user_invited`, `user_joined`,
+`user_own_plan`, `other_persons_plan`, `user_declined`, `user_not_addressed`), following the
+commitment-detection framing where only the speaker's own commitments count. The last three
+skip the plan even when the boolean says true — the model has been seen answering "true"
+while describing the other person's plan. The prompt covers the 1:1 case explicitly: the
+other person telling the user about their own day ("I'm planning to hang with Emily Saturday
+while you're at the venue") is not an invitation, even though it mentions the user.
 
 **Status semantics.** `confirmed` means the user is attending with clear agreement. `tentative`
 means the user was invited and *explicitly hedged* ("maybe", "I'll try") — it is a
@@ -47,6 +54,13 @@ it (the record's hash is left in place so replayed context can't re-create it ei
 genuinely new date for the same plan arrives as a `reschedule`/`new_occurrence` instead (see
 below).
 
+**Calendar-worthiness.** Real-time coordination ("watch an episode in like 30 mins?",
+"omw", "be there in 10") and bare availability ("I'm free 10/2") are not plans — people
+don't calendar something that's over before the event would matter. The prompt says so,
+and a deterministic backstop (`detector.is_imminent_microplan`, both backends) drops a
+same-day plan whose own evidence is "in N minutes / in an hour / omw" phrasing. A plan set
+hours ahead ("dinner tonight at 8?" sent at noon) is unaffected.
+
 **Reconciliation instead of create-by-default.** Every detection is matched against the
 canonical event store (`state.json`) before any calendar write: an exact hash/title-window
 check, then a deterministic fuzzy match (normalized-title overlap + compatible date/time,
@@ -63,6 +77,29 @@ chat + date + a normalized, order-insensitive token set of the title — "dinner
 time-confidence flap (7pm one poll, all-day the next) can't fork the same plan into two
 records. A match with material new information — a newly stated location, tentative →
 confirmed — **updates** the existing calendar event; anything else is skipped as a duplicate.
+
+Three additions target plans recorded twice under different names:
+- **Relevance-ranked candidates.** The adjudicator sees at most 5 candidates. They used to be
+  the 5 *newest* records in the window, so on a busy week the real match could fall off the
+  list ("Party" and "Party at Augies" both created on the same slot). Candidates are now ranked
+  by `dedup.relevance` — title and location overlap, a shared chat, shared participants,
+  identical evidence, date distance — before the cut. Entity-matching research found the same
+  thing: an LLM picking one of a short, relevant candidate list beats both pairwise yes/no
+  calls and long lists.
+- **Location-aware fuzzy layer.** When both events name overlapping locations and the titles
+  share a word, the fuzzy layer scores title+location together, so "Party" @ "Augies in
+  Lincoln Park" matches "Party at Augies" without an LLM call.
+- **Same-evidence candidates.** One message re-read on a later poll can come back with a new
+  title *and* a mis-resolved date (a "day before the marathon" reservation recorded on 09-19
+  and again on 11-01). Records in the same chat that quote the same evidence message
+  (`dedup.evidence_key`, at least 4 words so "I'm down" never collides) join the
+  adjudicator's candidates at any date (`source: "evidence"`). The adjudicator still decides,
+  since one message can set up several plans; a far `duplicate` verdict never moves the
+  stored date.
+
+Each event also carries its thread's `participants`, persisted on the record and shown to
+the adjudicator, so a group chat and a 1:1 with one of its members can be recognized as
+discussing the same plan.
 
 **Reschedules vs. new occurrences.** A matched detection far from its record's stored date
 used to always be treated as a duplicate mention (correct for a mis-dated re-mention, wrong
@@ -137,17 +174,78 @@ explicit-date anchor nearby *and* the thread contains some other date-like conte
 plausibly change the answer (skipping the extra call otherwise), re-examines the whole thread
 for a competing anchor, and overrides the default only at confidence ≥ 0.8.
 
+**Model names the phrase, code does the arithmetic.** The detector also reports the
+verbatim words that gave the date (`date_phrase`) and how it resolved them (`date_basis`:
+`explicit_date`, `relative_to_message`, `anchored_in_thread`, `anchored_to_known_plan`).
+For `relative_to_message`, `detector._verify_relative_date` re-resolves the phrase against
+the send date of the message it came from (`temporal.resolve_phrase`). If the model's date
+isn't one of the phrase's readings and the phrase has exactly one ("tomorrow", "this
+Saturday", "next Friday", "in 3 days"), the date is corrected. Research on temporal normalization finds the
+same split: models identify the expression well and do the date arithmetic badly. A bare
+weekday is never corrected this way, since it may be anchored to an event weeks out.
+
+**"next <weekday>" is deterministic.** It always means that weekday in the following
+week (weeks start on Sunday), even when this week's hasn't happened yet: "next Saturday"
+sent on a Wednesday is 10 days out, and sent on a Sunday it's 13 (`temporal.next_weekday`).
+The prompt states the rule, the date check snaps any other answer to it, and the Jev
+candidate generator offers only that reading. The one exception is a later message that
+clarifies the day ("wait, this Saturday or the one after?" / "this one, the 10th"): when a
+message after the phrase restates the date (an explicit date or "this <weekday>",
+`detector._clarified_later`), the model's reading of the whole thread is kept. A backfill created "booked ranallis next
+Saturday" (sent on a Thursday) on the following *Sunday*; the check now corrects it to
+next week's Saturday.
+
+**Ambiguous dates are flagged, not silently committed.** A bare weekday said on that same
+weekday ("dinner Wednesday?" sent on a Wednesday: today, or a week out) and "next weekend"
+said mid-week keep the model's reading but get a note — *Date inferred from "on Thursday"
+(sent Thu Oct 8); could also be Thu Oct 15* — written to the calendar event's notes. Both backends do this (the Jev fast path checks the
+phrase behind the candidate it chose). With `suggestions_calendar` set, these events go to
+the suggestions calendar instead.
+
+**Known plans.** The detector prompt lists the user's upcoming recorded plans (title and
+date, up to 25 within 180 days, from `state.known_plans`) so a date relative to another
+plan resolves: "a res at 4:15 the day before the marathon" needs to know when the
+marathon is, which may only have been said in another chat. The listed plans are anchors
+only; the prompt forbids emitting one just because it's listed. The block is omitted when
+there are none, so single-poll eval cases see the same prompt as before.
+`known_plans_enabled` turns it off.
+
+**Suggestions calendar (opt-in).** Production assistants keep uncertain detections out of
+the main calendar: Apple shows them in a separate *Siri Suggestions* calendar until you add
+or ignore them, and Gmail auto-adds only booking confirmations. Set `suggestions_calendar`
+to a calendar name (created on startup if missing) and plans the agent isn't sure enough
+about go there instead of being dropped or committed silently:
+- confidence between `suggestion_confidence_threshold` (0.6) and `confidence_threshold` (0.85)
+- a genuinely ambiguous date (see above)
+
+A later detection of the same plan that qualifies for the main calendar **promotes** it:
+the event is created on `target_calendar`, the canonical record is repointed at it (same
+`canonical_id`, so its dedup history carries over), and the suggestion is deleted. Deleting
+a suggestion yourself ignores it: its record stays, so another unsure detection is skipped
+as a duplicate rather than re-suggested. A confident detection still promotes it, since
+that's new evidence. Cancellations, unanswered invitations and non-participant plans are
+never suggested. Default `null` (off): uncertain plans are skipped and ambiguous dates are
+committed with a note, as before. Backfill never writes suggestions.
+
+**One-day events stay one day on the calendar.** All-day events are written with an end of
+11:59:59 PM on their last day, not the midnight after it (`calendar._compute_span`). Calendar.app
+treats a next-midnight end as exclusive only when nothing else is involved: give the new event a
+location, or set the end date of an existing all-day event (any update), and it reads that
+midnight as a second day. Every one-day all-day event with a location, and every updated one,
+showed up spanning two days. That was verified by probing Calendar.app directly (create with and
+without a location, update, move, timed to all-day); an end inside the last day is read correctly
+in every case.
+
 **end_date guard against the exclusive-end-date convention.** `end_date` should be null for
-any single-day plan and the ISO 8601 *inclusive* last day for a genuine multi-day one
-(`calendar.py` adds the exclusive +1 day itself when writing to Calendar — see
-`_compute_span`). Models trained on the Google Calendar API's own exclusive-end-date
-convention sometimes apply it themselves, emitting `end_date = date + 1` for a plan that's
-really just one day — which then gets a second +1 applied downstream, turning a one-day plan
-into a two-day all-day event on the calendar. A deterministic post-check
+any single-day plan and the ISO 8601 *inclusive* last day for a genuine multi-day one.
+Models trained on the Google Calendar API's own exclusive-end-date convention sometimes emit
+`end_date = date + 1` for a plan that's really just one day. A deterministic post-check
 (`_validate_end_date`) requires actual multi-day language in the model's own
-`evidence`/`date_evidence` (a range joiner between two date-like tokens, "weekend", "trip",
-a night count, etc.) before trusting a non-null `end_date` at all, clearing it back to null
-otherwise.
+`evidence`/`date_evidence` before trusting a non-null `end_date`, clearing it back to null
+otherwise. The language that counts is a multi-day noun ("trip", "weekend", "festival"), a
+count of two or more days or nights, a weekday range ("Fri-Sun"), or a day-of-month range
+("the 3rd through the 5th", "Oct 9-13"). Time ranges ("7-9", "4-8 pm", "10 to 1"), "tonight",
+"Monday night" and "1 day" do not count.
 
 **Verbatim evidence matching.** The hallucination guard requires `evidence`/`date_evidence`
 to appear in the thread — empty or missing evidence fails the gate outright rather than
@@ -236,6 +334,13 @@ messages for cancel or change language ("can't make it", "nvm", "bail", "rain ch
 "instead", "push it"). A match sends the thread to the Claude detector, whatever Jev
 answered. This was motivated by Jev calling a cancellation buried in unrelated chat
 "confirmed" (golden `pipe_cancel_buried_in_chatter`).
+
+**Someone else's own plan always gets a second look too.** If the message the chosen date
+came from is another person stating their own plan ("I'm planning to…", "I have a work
+dinner Thursday", "I'll be in Denver") with nothing inviting the user ("you in?", "wanna",
+"let's", "we", "join"), the thread goes to the Claude detector and its
+`participation_basis` rules. Jev's participant judgement accepted exactly this case in a
+1:1 chat, where the user is the only other person.
 
 Fast-path events have exactly the shape the Claude detector emits. Their `evidence` is the
 verbatim message the chosen date came from, so `main.py`'s gates treat both backends the
@@ -481,6 +586,9 @@ The config file lives at `~/.scheduling-agent/config.json` and is created with d
 | `detector_backend` | `"jev"` | `"jev"` (Jev answers the judgements; Haiku only handles threads Jev can't settle) or `"claude"` (Haiku reads every thread). See *Backends* above |
 | `dedup_backend` | `"claude"` | `"claude"` (`dedup_model`) or `"jev"` for the dedup adjudicator. Jev scored 78% vs Sonnet's 100% on the golden dedup pairs, so it isn't the default |
 | `jev_thresholds` | `{}` | Per-key overrides for `jev_detector.DEFAULT_THRESHOLDS` (skip, fast-path, and location bars) |
+| `known_plans_enabled` | `true` | Show the detector the user's upcoming recorded plans (title + date) so a date relative to another plan ("the day before the marathon") resolves. See *Known plans* above |
+| `suggestions_calendar` | `null` | Calendar name (created if missing) for plans the agent isn't sure about: confidence in [`suggestion_confidence_threshold`, `confidence_threshold`), or an ambiguous date. A later confident detection promotes them; deleting one ignores it. `null` = off. See *Suggestions calendar* above |
+| `suggestion_confidence_threshold` | `0.6` | Lowest confidence that still goes to `suggestions_calendar` (below it, the plan is skipped) |
 | `poll_interval_minutes` | `15` | Backstop poll interval, independent of the filesystem watcher, in case a `chat.db` change event is ever missed. `0` disables it |
 
 **Sampling determinism.** Every LLM call the agent makes — `detect_plans`, the
@@ -495,8 +603,8 @@ the call nor silently restore default-temperature sampling.
 
 **Adjudication logging.** Each adjudication emits one structured
 `dedup_adjudication` JSON line at INFO: the event's title/date/chat, the
-candidate identities, the **source layer** that proposed them (`near`, `far`,
-or `far_exact`), the verdict tuple, the model's self-reported confidence, and
+candidate identities, the **source layer** that proposed them (`near`,
+`evidence`, `far`, or `far_exact`), the verdict tuple, the model's self-reported confidence, and
 whether the call had to be retried. A wrong merge can be traced back to the
 layer that proposed the candidate without re-running the case. The adjudicator
 retries exactly once on a transport error or unparseable response before giving
@@ -725,6 +833,7 @@ scheduling_agent/
 ├── state.py           # Canonical event store, write-ahead journal, checkpoint, dedup hashes
 ├── reader.py          # Reads iMessage threads from chat.db
 ├── datepatterns.py    # Shared date/holiday-anchor regexes (reader anchor harvesting + detector weekday-reconciliation gate)
+├── temporal.py        # Deterministic relative-date resolution ("tomorrow", "next Friday") + ambiguity notes
 ├── detector.py        # Claude Haiku plan detection (participation, status, evidence gate);
                         # detect_plans() dispatches on backend
 ├── candidates.py      # Deterministic date/time/venue/activity candidates for the Jev backend
@@ -758,6 +867,9 @@ evals/                 # Paid detection eval (golden dataset + runner)
   TypeSafe's API for every processed thread (and to Anthropic only for threads Jev hands to
   the fallback). Dedup adjudication with `dedup_backend: "jev"` sends the stored event
   fields, including the truncated evidence, to TypeSafe.
+- The titles and dates of your upcoming recorded plans are included in every detection
+  prompt (`known_plans_enabled`), and records keep each conversation's participant handles
+  so the dedup adjudicator can compare them.
 - Quoted message evidence stored in `~/.scheduling-agent/state.json` (and written to logs) is
   truncated, not stored/logged in full — see "Configuration" above. Run `scheduling-agent
   --purge` at any time to delete all local state and logs.

@@ -31,7 +31,8 @@ from datetime import date as _date, datetime
 from typesafe_sdk import Choice, Noul
 
 from scheduling_agent import candidates as candidates_mod
-from scheduling_agent import detector, jev_client
+from scheduling_agent.datepatterns import EXPLICIT_DATE_RE
+from scheduling_agent import detector, jev_client, temporal
 
 logger = logging.getLogger(__name__)
 
@@ -235,6 +236,35 @@ def _new_message_changes_plan(thread: dict) -> bool:
 
 _NAME_RE = re.compile(r"^[A-Za-z][A-Za-z .'-]{0,40}$")
 
+# Someone else stating their OWN plan ("i'm planning to hang with emily
+# saturday", "I have a work dinner Thursday"), with nothing inviting the user.
+# Jev's participant judgement has accepted these in 1:1 chats, where the user
+# is the only other person — so the thread gets the Claude detector's
+# participation_basis rules instead of the fast path.
+_OWN_PLAN_RE = re.compile(
+    r"\b(?:i'?m|im|i am) (?:going|gonna|planning|heading|driving|flying|working|hosting|"
+    r"running|doing|having|seeing|visiting|off to|out)\b"
+    r"|\bi(?:'ll| will) be (?:at|in|out|away|gone)\b"
+    r"|\bi(?:'ve| have)? got (?:a|an|my)\b|\bi have (?:a|an|my)\b"
+    r"|\bmy (?:\w+ )?(?:appointment|appt|flight|shift|meeting|class)\b",
+    re.IGNORECASE,
+)
+_INVITE_RE = re.compile(
+    r"\b(?:you|u) in\b|\bwanna\b|\bwant to\b|\bjoin\b|\bcome (?:with|along|over|through)\b"
+    r"|\blet'?s\b|\blets\b|\bwe\b|\bus\b|\bwith (?:me|you)\b|\b(?:you|u) (?:guys|two|both|all)\b"
+    r"|\by'?all\b|\binterested\b|\bdown\?|\bcoming\?|\bcome\?",
+    re.IGNORECASE,
+)
+
+
+def _others_own_plan(msg: dict) -> bool:
+    """True when `msg` is another person describing their own plan without
+    inviting the user (see _OWN_PLAN_RE)."""
+    if msg.get("from_me"):
+        return False
+    text = msg.get("text") or ""
+    return bool(_OWN_PLAN_RE.search(text)) and not _INVITE_RE.search(text)
+
 
 def _title(activity: str, location: str | None, thread: dict) -> str:
     title = activity[0].upper() + activity[1:]
@@ -298,13 +328,17 @@ def decide(resp, cands: dict, thread: dict, th: dict) -> tuple[str, dict | None,
     if _new_message_changes_plan(thread):
         return "fallback", None, "cancel/change language"
 
+    date_cand = _find(cands["dates"], date_value)
+    date_msg = messages[date_cand["msg_index"]] if date_cand else {}
+    if _others_own_plan(date_msg):
+        return "fallback", None, "another person's own plan"
+
     location, location_conf = _choice(resp, "location")
     if location == "none" or location_conf < th["location_min"]:
         location = None
     time_start = None if time_value in (None, "none") else time_value
 
-    date_cand = _find(cands["dates"], date_value)
-    evidence = messages[date_cand["msg_index"]].get("text", "") if date_cand else ""
+    evidence = date_msg.get("text", "")
     event = {
         "title": _title(activity, location, thread),
         "date": date_value,
@@ -316,11 +350,30 @@ def decide(resp, cands: dict, thread: dict, th: dict) -> tuple[str, dict | None,
         "status": status,
         "user_is_participant": participant >= 0.5,
         "participation_evidence": f"Jev P(participant)={participant:.2f}",
+        # Jev answers only P(participant); the basis is inferred from who sent
+        # the date-bearing message, for logs and shape parity.
+        "participation_basis": (
+            ("user_proposed" if date_msg.get("from_me") else "user_invited")
+            if participant >= 0.5 else "user_not_addressed"
+        ),
+        "date_phrase": date_cand["phrase"] if date_cand else None,
+        "date_basis": (
+            "explicit_date" if date_cand and EXPLICIT_DATE_RE.search(date_cand["phrase"])
+            else "relative_to_message"
+        ),
         "recurrence": cands["recurrence"],
         "end_date": None,
         "evidence": evidence,
         "date_evidence": evidence,
     }
+    if date_cand:
+        sent = datetime.fromtimestamp(date_msg.get("unix_ts", 0)).date()
+        res = temporal.resolve_phrase(date_cand["phrase"], sent)
+        note = res and temporal.ambiguity_note(res, _date.fromisoformat(date_value), sent)
+        if note:
+            event["_date_note"] = note
+    if detector.is_imminent_microplan(event, thread):
+        return "skip", None, "real-time coordination, not a calendar plan"
     return "fast", event, "all judgements cleared thresholds"
 
 
@@ -398,6 +451,7 @@ def detect_plans(
 
         detector._demote_if_user_silent(event, thread)
         event["chat_id"] = chat_id
+        event["participants"] = list(thread.get("participants", []))
         event["_new_msg_from_user"] = detector._new_message_from_user(thread)
         event["_backend"] = "jev"
         logger.info(

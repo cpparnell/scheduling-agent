@@ -85,11 +85,14 @@ def process_event(event: dict, cfg: dict, reference_date: date | None = None) ->
         return "skipped:past"
 
     # Hard ownership gate: plans the user isn't personally part of never touch
-    # the calendar, no matter how confident or confirmed they are.
-    if not event.get("user_is_participant"):
+    # the calendar, no matter how confident or confirmed they are. A
+    # participation_basis naming someone else's plan wins over the boolean —
+    # the model has answered "true" while explaining it's the other person's.
+    basis = event.get("participation_basis")
+    if not event.get("user_is_participant") or basis in detector.NON_OWNER_BASES:
         logger.info(
-            "Skipping non-participant plan: %s on %s — %s",
-            title, date, event.get("participation_evidence"),
+            "Skipping non-participant plan: %s on %s (%s) — %s",
+            title, date, basis, event.get("participation_evidence"),
         )
         state.record_observation(chat_id, date, time_start, title, "not-participant")
         return "skipped:not-participant"
@@ -117,8 +120,11 @@ def process_event(event: dict, cfg: dict, reference_date: date | None = None) ->
         return "skipped:unanswered"
 
     # Single confidence bar: tentative is a classification (the user explicitly
-    # hedged), not a lower-confidence tier.
-    if confidence < cfg["confidence_threshold"]:
+    # hedged), not a lower-confidence tier. With a suggestions calendar
+    # configured, a plan between the suggestion bar and this one goes there
+    # instead of being dropped (see _tier).
+    tier = _tier(event, cfg)
+    if confidence < cfg["confidence_threshold"] and tier != "suggested":
         logger.info(
             "Skipping low-confidence %s event (%.2f < %.2f): %s",
             status, confidence, cfg["confidence_threshold"], title,
@@ -140,7 +146,7 @@ def process_event(event: dict, cfg: dict, reference_date: date | None = None) ->
             logger.info("Cancellation detected but no agent-owned event matches: %s on %s", title, date)
             return "skipped:cancel-no-match"
         jid = state.journal_intent({"canonical_id": matched["canonical_id"]}, op="cancel")
-        ok = calendar.delete_event(matched["calendar_uid"], calendar_name=cfg["target_calendar"])
+        ok = calendar.delete_event(matched["calendar_uid"], calendar_name=_calendar_of(matched, cfg))
         if not ok:
             logger.error("Failed to delete calendar event: %s", matched.get("title"))
             state.journal_drop(jid)
@@ -168,6 +174,13 @@ def process_event(event: dict, cfg: dict, reference_date: date | None = None) ->
         logger.warning("Skipping event after adjudicator failure (fail-closed): %s", title)
         return "skipped:reconcile-error"
 
+    if (
+        tier == "main" and decision.action in ("skip_duplicate", "update")
+        and decision.matched and decision.matched.get("tier") == "suggested"
+        and "canonical_id" in decision.matched
+    ):
+        return _promote(event, decision, cfg)
+
     if decision.action == "skip_duplicate":
         matched_uid = decision.matched.get("calendar_uid") if decision.matched else None
         logger.info(
@@ -184,6 +197,7 @@ def process_event(event: dict, cfg: dict, reference_date: date | None = None) ->
                 chat_id, date, time_start, title,
                 location=location, status=status, evidence=evidence,
                 confidence=confidence, suppressed=True, duplicate_of_uid=matched_uid,
+                participants=event.get("participants"),
             )
         return "skipped:duplicate"
 
@@ -215,9 +229,10 @@ def process_event(event: dict, cfg: dict, reference_date: date | None = None) ->
                 time_start=merged.get("time_start"),
                 duration_minutes=event.get("duration_minutes"),
                 location=merged.get("location"),
-                calendar_name=cfg["target_calendar"],
+                calendar_name=_calendar_of(matched, cfg),
                 tentative=merged.get("status") == "tentative",
                 end_date=event.get("end_date"),
+                notes=event.get("_date_note"),
             )
             if not ok:
                 logger.error("Failed to update calendar event: %s", merged["title"])
@@ -237,9 +252,12 @@ def process_event(event: dict, cfg: dict, reference_date: date | None = None) ->
 
     # decision.action == "create": journal the intent first so a crash between
     # the calendar write and the state write can't produce a duplicate.
+    calendar_name = cfg["suggestions_calendar"] if tier == "suggested" else cfg["target_calendar"]
     record = state.make_record(
         chat_id, date, time_start, title,
         location=location, status=status, evidence=evidence, confidence=confidence,
+        participants=event.get("participants"), date_note=event.get("_date_note"),
+        tier=tier, calendar_name=calendar_name,
     )
     jid = state.journal_intent(record)
     uid = calendar.create_event(
@@ -248,10 +266,11 @@ def process_event(event: dict, cfg: dict, reference_date: date | None = None) ->
         time_start=time_start,
         duration_minutes=event.get("duration_minutes"),
         location=location,
-        calendar_name=cfg["target_calendar"],
+        calendar_name=calendar_name,
         tentative=status == "tentative",
         recurrence=event.get("recurrence"),
         end_date=event.get("end_date"),
+        notes=event.get("_date_note"),
     )
     if uid is None:
         logger.error("Failed to create calendar event: %s", title)
@@ -262,10 +281,85 @@ def process_event(event: dict, cfg: dict, reference_date: date | None = None) ->
     time_str = f" at {time_start}" if time_start else " (all-day)"
     loc_str = f" @ {location}" if location else ""
     logger.info(
-        "Created %s event: %s — %s%s%s (confidence %.2f)",
-        status, title, date, time_str, loc_str, confidence,
+        "Created %s%s event: %s — %s%s%s (confidence %.2f)",
+        status, " suggested" if tier == "suggested" else "", title, date, time_str, loc_str, confidence,
     )
     return "created"
+
+
+def _tier(event: dict, cfg: dict) -> str:
+    """Where a plan that passed the ownership and status gates belongs:
+    "main" (the target calendar) or "suggested" (cfg["suggestions_calendar"],
+    when configured). Suggested: confidence between
+    suggestion_confidence_threshold and confidence_threshold, or a date the
+    detector flagged as genuinely ambiguous (`_date_note`). Production
+    calendar assistants keep uncertain detections out of the main calendar
+    rather than either committing them silently or dropping them. A
+    cancellation is never a suggestion."""
+    if not cfg.get("suggestions_calendar") or event.get("status") == "cancelled":
+        return "main"
+    confidence = event.get("confidence") or 0
+    if confidence < cfg["confidence_threshold"]:
+        if confidence >= cfg.get("suggestion_confidence_threshold", 1.0):
+            return "suggested"
+        return "main"  # below both bars; the caller's confidence gate drops it
+    if event.get("_date_note"):
+        return "suggested"
+    return "main"
+
+
+def _calendar_of(record: dict, cfg: dict) -> str:
+    """The calendar a recorded event lives on."""
+    return record.get("calendar_name") or cfg["target_calendar"]
+
+
+def _promote(event: dict, decision: "reconcile.Decision", cfg: dict) -> str:
+    """Move a suggested plan to the target calendar now that a detection of
+    it qualifies there: create it on the target calendar (with any changes
+    the new detection carries), repoint the canonical record, then remove the
+    suggestion. Same canonical_id throughout, so the plan's dedup history
+    carries over. If the user already deleted the suggestion, the delete is a
+    no-op — a later, confident detection is new evidence, and wins."""
+    matched = decision.matched
+    merged = {**matched, **decision.changes}
+    if event.get("status") == "confirmed" and merged.get("status") == "tentative":
+        merged["status"] = "confirmed"
+    jid = state.journal_intent(
+        {"canonical_id": matched["canonical_id"], "title": merged["title"], "date": merged["date"]},
+        op="promote",
+    )
+    uid = calendar.create_event(
+        title=merged["title"],
+        date_str=merged["date"],
+        time_start=merged.get("time_start"),
+        duration_minutes=event.get("duration_minutes"),
+        location=merged.get("location"),
+        calendar_name=cfg["target_calendar"],
+        tentative=merged.get("status") == "tentative",
+        recurrence=event.get("recurrence"),
+        end_date=event.get("end_date"),
+        notes=event.get("_date_note"),
+    )
+    if uid is None:
+        logger.error("Failed to promote suggested event: %s", merged["title"])
+        state.journal_drop(jid)
+        return "skipped:promote-failed"
+    old_uid = matched.get("calendar_uid")
+    state.update_record(
+        matched["canonical_id"],
+        {**decision.changes, "status": merged.get("status"), "tier": "main",
+         "calendar_uid": uid, "calendar_name": cfg["target_calendar"],
+         "date_note": event.get("_date_note")},
+        reason=f"promoted from suggestions: {decision.reasoning}", chat_id=event["chat_id"],
+    )
+    state.journal_commit(jid)
+    if old_uid and not calendar.delete_event(old_uid, calendar_name=_calendar_of(matched, cfg)):
+        logger.warning("Promoted %r but could not remove its suggestion (uid=%s)", merged["title"], old_uid)
+    logger.info(
+        "Promoted suggested event %r to %s (uid=%s): %s",
+        merged["title"], cfg["target_calendar"], uid, decision.reasoning,
+    )
+    return "updated"
 
 
 def recover_journal(cfg: dict) -> None:
@@ -273,6 +367,9 @@ def recover_journal(cfg: dict) -> None:
     calendar write and the state write."""
     for entry in state.get_pending_journal():
         jid = entry.get("journal_id")
+        if entry.get("op") == "promote":
+            _recover_promote(entry, cfg)
+            continue
         if entry.get("op") != "create":
             # An interrupted update never landed in state; the next detection
             # re-reconciles and re-issues it (calendar updates are idempotent).
@@ -285,7 +382,7 @@ def recover_journal(cfg: dict) -> None:
         found_uid = None
         if cfg["calendar_query_enabled"] and date:
             wanted = state._normalize_title(title)
-            for cal_event in calendar.get_events_near(date, 0, cfg["target_calendar"]):
+            for cal_event in calendar.get_events_near(date, 0, _calendar_of(record, cfg)):
                 if state._normalize_title(cal_event["title"]) == wanted:
                     found_uid = cal_event["calendar_uid"]
                     break
@@ -309,6 +406,42 @@ def recover_journal(cfg: dict) -> None:
                 title, date,
             )
             state.journal_commit(jid, None)
+
+
+def _resolve_suggestions_calendar(cfg: dict) -> dict:
+    """Create the configured suggestions calendar if it's missing. If it can't
+    be found or created, run without one (uncertain plans are skipped, as
+    with no suggestions calendar configured) rather than failing every
+    suggested write."""
+    name = cfg.get("suggestions_calendar")
+    if not name or calendar.ensure_calendar(name):
+        return cfg
+    logger.error("Could not find or create suggestions calendar %r; uncertain plans will be skipped", name)
+    return {**cfg, "suggestions_calendar": None}
+
+
+def _recover_promote(entry: dict, cfg: dict) -> None:
+    """An interrupted promotion: if the event reached the target calendar,
+    repoint the record at it (its suggestion stays behind for the user to
+    delete) so the next detection can't promote it a second time."""
+    record = entry.get("record") or {}
+    found_uid = None
+    if cfg["calendar_query_enabled"] and record.get("date"):
+        wanted = state._normalize_title(record.get("title", ""))
+        for cal_event in calendar.get_events_near(record["date"], 0, cfg["target_calendar"]):
+            if state._normalize_title(cal_event["title"]) == wanted:
+                found_uid = cal_event["calendar_uid"]
+                break
+    if found_uid is not None:
+        logger.warning("Recovered interrupted promotion of %r (uid=%s)", record.get("title"), found_uid)
+        state.update_record(
+            record["canonical_id"],
+            {"tier": "main", "calendar_uid": found_uid, "calendar_name": cfg["target_calendar"]},
+            reason="recovered interrupted promotion",
+        )
+    else:
+        logger.warning("Dropping interrupted promotion of %r", record.get("title"))
+    state.journal_drop(entry.get("journal_id"))
 
 
 def process_new_messages(cfg: dict) -> None:
@@ -341,6 +474,7 @@ def process_new_messages(cfg: dict) -> None:
         date_resolver_enabled=cfg["date_resolver_enabled"],
         backend=cfg["detector_backend"],
         jev_thresholds=cfg["jev_thresholds"],
+        known_plans=state.known_plans() if cfg["known_plans_enabled"] else None,
     )
 
     counts = {"created": 0, "updated": 0, "cancelled": 0, "skipped": 0}
@@ -433,7 +567,8 @@ def _dry_run_environment():
     the only thing standing between backfill and a live calendar query.
     """
     def fake_create(title, date_str, time_start, duration_minutes, location,
-                     calendar_name="Calendar", tentative=False, recurrence=None, end_date=None):
+                     calendar_name="Calendar", tentative=False, recurrence=None, end_date=None,
+                     notes=None):
         logger.info(
             "[DRY RUN] would create %s event: %s on %s%s%s",
             "tentative" if tentative else "confirmed", title, date_str,
@@ -443,7 +578,8 @@ def _dry_run_environment():
         return f"dryrun-{_stable_id(title, date_str)}"
 
     def fake_update(uid, title, date_str, time_start, duration_minutes, location,
-                     calendar_name="Calendar", tentative=False, end_date=None):
+                     calendar_name="Calendar", tentative=False, end_date=None,
+                     notes=None):
         logger.info("[DRY RUN] would update event %s: %s on %s", uid, title, date_str)
         return True
 
@@ -649,10 +785,13 @@ def backfill(
 
     if mock_calendar is not None:
         prepare_mock_calendar(mock_calendar, cfg, clear=clear_calendar)
-        backfill_cfg = {**cfg, "target_calendar": mock_calendar, "calendar_query_enabled": True}
+        backfill_cfg = {
+            **cfg, "target_calendar": mock_calendar, "calendar_query_enabled": True,
+            "suggestions_calendar": None,
+        }
         environment = _mock_calendar_environment(mock_calendar)
     else:
-        backfill_cfg = {**cfg, "calendar_query_enabled": False}
+        backfill_cfg = {**cfg, "calendar_query_enabled": False, "suggestions_calendar": None}
         environment = _dry_run_environment()
 
     counts: dict[str, int] = {}
@@ -694,6 +833,10 @@ def backfill(
                         date_resolver_enabled=cfg["date_resolver_enabled"],
                         backend=cfg["detector_backend"],
                         jev_thresholds=cfg["jev_thresholds"],
+                        known_plans=(
+                            state.known_plans(today=window_end.date())
+                            if cfg["known_plans_enabled"] else None
+                        ),
                     )
                     for event in events:
                         result = process_event(
@@ -960,12 +1103,14 @@ def main() -> None:
     cfg = config.load_runtime()
     logger.info("Scheduling agent starting (calendar=%s)", cfg["target_calendar"])
 
+    cfg = _resolve_suggestions_calendar(cfg)
+
     # Resolve any calendar writes interrupted by a crash, then run once.
     recover_journal(cfg)
     process_new_messages(cfg)
 
     def run() -> None:
-        cfg_fresh = config.load_runtime()
+        cfg_fresh = _resolve_suggestions_calendar(config.load_runtime())
         process_new_messages(cfg_fresh)
 
     gate = _RunGate(run)

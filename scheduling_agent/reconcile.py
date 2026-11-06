@@ -8,7 +8,9 @@ calendar. Matching runs in three layers, cheapest first:
 2. fuzzy  — deterministic chat-agnostic match: normalized-title token overlap +
             compatible date/time. No LLM call.
 3. llm    — dedup.adjudicate over the remaining nearby candidates, including
-            events read back from the calendar itself when enabled.
+            events read back from the calendar itself when enabled, plus
+            same-chat records quoting the same evidence message at any date
+            (most relevant first — see dedup.relevance).
 
 A match yields either "update" (the detection carries material new information:
 a reschedule, a newly stated location, a tentative plan now confirmed) or
@@ -78,13 +80,36 @@ def _dates_within(a: str, b: str, days: int) -> bool:
         return False
 
 
+# Two events' locations must overlap at least this much before their
+# location words count toward the fuzzy layer's title similarity.
+LOCATION_MATCH_THRESHOLD = 0.5
+
+
+def _match_score(event: dict, cand: dict) -> float:
+    """Title similarity, or — when both events name overlapping locations and
+    the titles share a word — the similarity of title+location. "Party" at
+    "Augies in Lincoln Park" and "Party at Augies" score 0.5 on title alone
+    but are plainly the same slot; the venue is the part one title left out."""
+    title_score = _title_similarity(event.get("title", ""), cand.get("title", ""))
+    loc_a, loc_b = event.get("location"), cand.get("location")
+    if not (loc_a and loc_b) or title_score == 0:
+        return title_score
+    if dedup.token_overlap(loc_a, loc_b) < LOCATION_MATCH_THRESHOLD:
+        return title_score
+    combined = _title_similarity(
+        f"{event.get('title', '')} {loc_a}", f"{cand.get('title', '')} {loc_b}"
+    )
+    return max(title_score, combined)
+
+
 def fuzzy_match(
     event: dict, candidates: list[dict], title_threshold: float, day_window: int = 1
 ) -> dict | None:
     """Deterministic cross-chat match: close date, compatible time, and strong
-    normalized-title overlap. Returns the best candidate or None. Kept to a
-    narrow day_window even when the LLM-facing candidate window is wider —
-    this layer has no adjudicator to catch a wrong call."""
+    normalized-title overlap (location-aware, see _match_score). Returns the
+    best candidate or None. Kept to a narrow day_window even when the
+    LLM-facing candidate window is wider — this layer has no adjudicator to
+    catch a wrong call."""
     best = None
     best_score = 0.0
     for cand in candidates:
@@ -92,7 +117,7 @@ def fuzzy_match(
             continue
         if not _time_compatible(event.get("time_start"), cand.get("time_start")):
             continue
-        score = _title_similarity(event.get("title", ""), cand.get("title", ""))
+        score = _match_score(event, cand)
         if score >= title_threshold and score > best_score:
             best = cand
             best_score = score
@@ -125,6 +150,40 @@ def far_candidates(event: dict, cfg: dict) -> list[dict]:
             scored.append((score, record))
     scored.sort(key=lambda pair: pair[0], reverse=True)
     return [record for _, record in scored[:dedup.MAX_CANDIDATES]]
+
+
+def evidence_candidates(event: dict) -> list[dict]:
+    """Records from the same conversation that quote the same evidence message
+    as the detection, at ANY date. One message re-read on a later poll can come
+    back with a different title and a mis-resolved date ("…a res at 4:15 the
+    day before the marathon" recorded once on 09-19 and again on 11-01); its
+    evidence is the one thing that doesn't drift. The adjudicator still
+    decides — a single message can set up several distinct plans."""
+    key = dedup.evidence_key(event.get("evidence"))
+    if key is None:
+        return []
+    event_hash = state.event_hash(
+        event["chat_id"], event["date"], event.get("time_start"), event["title"]
+    )
+    return [
+        record for record in state.get_active_events()
+        if record.get("hash") != event_hash
+        and dedup.shares_chat(event, record)
+        and dedup.evidence_key(record.get("evidence")) == key
+    ]
+
+
+def _merge_candidates(event: dict, *groups: list[dict]) -> list[dict]:
+    """Union of candidate groups (first occurrence wins), most relevant first,
+    capped at dedup.MAX_CANDIDATES."""
+    seen, merged = set(), []
+    for group in groups:
+        for record in group:
+            ident = record.get("canonical_id") or record.get("calendar_uid") or id(record)
+            if ident not in seen:
+                seen.add(ident)
+                merged.append(record)
+    return dedup.rank_candidates(event, merged)[:dedup.MAX_CANDIDATES]
 
 
 def _assemble_candidates(event: dict, cfg: dict) -> list[dict]:
@@ -287,7 +346,9 @@ def reconcile(event: dict, cfg: dict) -> Decision:
         candidates,
         day_window=cfg["dedup_candidate_day_window"],
     )
-    source = "near"
+    same_evidence = evidence_candidates(event)
+    source = "near" if llm_candidates else "evidence"
+    llm_candidates = _merge_candidates(event, llm_candidates, same_evidence)
     if not llm_candidates:
         # Nothing near the detected date — check for a record with a similar
         # title far away (a mis-resolved bare weekday lands here).
@@ -315,8 +376,8 @@ def _reconcile_far_exact_match(event: dict, matched: dict, cfg: dict) -> Decisio
 def _adjudicate(
     event: dict, llm_candidates: list[dict], cfg: dict, source: str = "near"
 ) -> Decision:
-    """`source` records which layer produced the candidates ("near", "far",
-    "far_exact") — logged with the verdict so a wrong merge can be traced back
+    """`source` records which layer produced the candidates ("near", "evidence",
+    "far", "far_exact") — logged with the verdict so a wrong merge can be traced back
     to the layer that proposed it without re-running the case."""
     verdict = dedup.adjudicate(
         event, llm_candidates, model=cfg["dedup_model"], source=source,

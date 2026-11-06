@@ -332,3 +332,73 @@ def test_adjudicate_logs_failure_and_retry_flag(fake_dedup_anthropic, caplog):
     line = next(r.message for r in caplog.records if "dedup_adjudication" in r.message)
     assert '"failed": true' in line
     assert '"retried": true' in line
+
+
+# --- relevance ranking / evidence key (v0.13) --------------------------------
+
+
+def test_find_candidates_ranks_relevant_match_ahead_of_newer_unrelated():
+    # A busy week: five newer, unrelated records used to push the real match
+    # ("Party" at Augies) off the newest-first list of five.
+    unrelated = [
+        _record(hash=f"u{i}", title=f"Thing {i}", chat_id=50 + i, created_at=f"2026-06-02T{i:02d}:00:00")
+        for i in range(6)
+    ]
+    match = _record(hash="party", title="Party", location="Augies in Lincoln Park",
+                    chat_id=7, created_at="2026-06-01T00:00:00")
+    event = _new_event(title="Party at Augies", location="Augies", chat_id=8)
+
+    candidates = dedup.find_candidates(event, unrelated + [match])
+
+    assert candidates[0]["hash"] == "party"
+
+
+def test_relevance_rewards_shared_chat_participants_and_evidence():
+    event = _new_event(chat_id=1, participants=["Sam"], evidence="I made us a res at Lucky's at 4:15")
+    base = _record(chat_id=9, title="Something else", date="2026-06-13")
+    assert dedup.relevance(event, {**base, "chat_ids": [9, 1]}) > dedup.relevance(event, base)
+    assert dedup.relevance(event, {**base, "participants": ["Sam", "Alex"]}) > dedup.relevance(event, base)
+    same_ev = {**base, "evidence": "Me (Wed 09/16/2026 01:44PM): I made us a res at Lucky's at 4:15"}
+    assert dedup.relevance(event, same_ev) > dedup.relevance(event, base) + 0.9
+
+
+def test_relevance_penalizes_distance():
+    event = _new_event()
+    assert dedup.relevance(event, _record(date="2026-06-13")) > dedup.relevance(event, _record(date="2026-06-19"))
+
+
+@pytest.mark.parametrize("evidence,expected", [
+    ("Me (Wed 09/16/2026 01:44PM): Let's do Giant tonight please", "let's do giant tonight please"),
+    ("I made us 2 a club lucky res", "i made us 2 a club lucky res"),
+    ("I'm down", None),
+    ("Let's go", None),
+    (None, None),
+])
+def test_evidence_key(evidence, expected):
+    assert dedup.evidence_key(evidence) == expected
+
+
+def test_evidence_key_survives_state_truncation():
+    from scheduling_agent import state
+    long = "word " * 100
+    assert dedup.evidence_key(long) == dedup.evidence_key(state._truncate_evidence(long))
+
+
+def test_adjudicator_prompt_shows_participants(fake_dedup_anthropic):
+    client = fake_dedup_anthropic([{
+        "is_duplicate": False, "duplicate_of": None, "relationship": "new_occurrence",
+        "confidence": 0.9, "reasoning": "different",
+    }])
+    dedup.adjudicate(_new_event(participants=["Sam"]), [_record(participants=["Sam", "Alex"])], model="m")
+    prompt = client.messages.calls[0]["messages"][0]["content"]
+    assert "participants='Sam'" in prompt
+    assert "participants='Sam, Alex'" in prompt
+
+
+def test_adjudicator_prompt_omits_empty_participants(fake_dedup_anthropic):
+    client = fake_dedup_anthropic([{
+        "is_duplicate": False, "duplicate_of": None, "relationship": "new_occurrence",
+        "confidence": 0.9, "reasoning": "different",
+    }])
+    dedup.adjudicate(_new_event(), [_record()], model="m")
+    assert "participants=" not in client.messages.calls[0]["messages"][0]["content"]

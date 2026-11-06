@@ -1191,3 +1191,158 @@ class TestBackfillToMockCalendar:
             calendar.delete_event("uid", calendar_name="SA test")
         assert spy_create_event["calls"] == []
         assert spy_delete_event["calls"] == [{"uid": "uid", "calendar_name": "SA test"}]
+
+
+# --- v0.13: participation basis, suggestions tier, notes, known plans --------
+
+
+def _evt(**overrides):
+    return {**_event(), "chat_id": 1, **overrides}
+
+
+def test_non_owner_basis_overrides_participant_true(spy_create_event):
+    result = main.process_event(_evt(participation_basis="other_persons_plan"), _cfg())
+    assert result == "skipped:not-participant"
+    assert spy_create_event["calls"] == []
+
+
+def test_owner_basis_creates(spy_create_event):
+    assert main.process_event(_evt(participation_basis="user_invited"), _cfg()) == "created"
+
+
+def test_low_confidence_skipped_without_suggestions_calendar(spy_create_event):
+    assert main.process_event(_evt(confidence=0.7), _cfg()) == "skipped:low-confidence"
+
+
+def test_low_confidence_goes_to_suggestions_calendar(spy_create_event):
+    result = main.process_event(_evt(confidence=0.7), _cfg(suggestions_calendar="Suggestions"))
+    assert result == "created"
+    assert spy_create_event["calls"][0]["calendar_name"] == "Suggestions"
+    record = state.get_active_events()[0]
+    assert (record["tier"], record["calendar_name"]) == ("suggested", "Suggestions")
+
+
+def test_below_suggestion_bar_is_still_skipped(spy_create_event):
+    result = main.process_event(_evt(confidence=0.5), _cfg(suggestions_calendar="Suggestions"))
+    assert result == "skipped:low-confidence"
+    assert spy_create_event["calls"] == []
+
+
+def test_ambiguous_date_note_written_to_main_calendar_without_suggestions(spy_create_event):
+    main.process_event(_evt(_date_note="could also be Fri"), _cfg())
+    call = spy_create_event["calls"][0]
+    assert (call["calendar_name"], call["notes"]) == ("Work", "could also be Fri")
+    assert state.get_active_events()[0]["date_note"] == "could also be Fri"
+
+
+def test_ambiguous_date_goes_to_suggestions_calendar(spy_create_event):
+    main.process_event(_evt(_date_note="could also be Fri"), _cfg(suggestions_calendar="Suggestions"))
+    assert spy_create_event["calls"][0]["calendar_name"] == "Suggestions"
+
+
+def test_cancellation_is_never_a_suggestion():
+    cfg = _cfg(suggestions_calendar="Suggestions")
+    assert main._tier(_evt(status="cancelled", confidence=0.7), cfg) == "main"
+
+
+def test_suggestion_promoted_when_confident_detection_arrives(spy_create_event, spy_delete_event):
+    cfg = _cfg(suggestions_calendar="Suggestions")
+    spy_create_event["return_value"] = "SUG-UID"
+    main.process_event(_evt(confidence=0.7), cfg)
+    spy_create_event["return_value"] = "MAIN-UID"
+
+    result = main.process_event(_evt(confidence=0.95), cfg)
+
+    assert result == "updated"
+    assert spy_create_event["calls"][-1]["calendar_name"] == "Work"
+    assert spy_delete_event["calls"] == [{"uid": "SUG-UID", "calendar_name": "Suggestions"}]
+    records = state.get_active_events()
+    assert len(records) == 1
+    assert (records[0]["tier"], records[0]["calendar_uid"], records[0]["calendar_name"]) == (
+        "main", "MAIN-UID", "Work",
+    )
+
+
+def test_suggestion_not_re_suggested_or_promoted_by_another_unsure_detection(spy_create_event, spy_delete_event):
+    cfg = _cfg(suggestions_calendar="Suggestions")
+    main.process_event(_evt(confidence=0.7), cfg)
+    result = main.process_event(_evt(confidence=0.7), cfg)
+    assert result == "skipped:duplicate"
+    assert len(spy_create_event["calls"]) == 1
+    assert spy_delete_event["calls"] == []
+
+
+def test_failed_promotion_leaves_suggestion(spy_create_event, spy_delete_event):
+    cfg = _cfg(suggestions_calendar="Suggestions")
+    main.process_event(_evt(confidence=0.7), cfg)
+    spy_create_event["return_value"] = None
+    assert main.process_event(_evt(confidence=0.95), cfg) == "skipped:promote-failed"
+    assert state.get_active_events()[0]["tier"] == "suggested"
+    assert spy_delete_event["calls"] == []
+    assert state.get_pending_journal() == []
+
+
+def test_cancelling_a_suggestion_deletes_from_suggestions_calendar(spy_create_event, spy_delete_event):
+    cfg = _cfg(suggestions_calendar="Suggestions")
+    main.process_event(_evt(confidence=0.7), cfg)
+    assert main.process_event(_evt(status="cancelled"), cfg) == "cancelled"
+    assert spy_delete_event["calls"][0]["calendar_name"] == "Suggestions"
+
+
+def test_recover_interrupted_promotion_repoints_record(monkeypatch):
+    record = state.make_record(1, FUTURE_DATE, None, "Dinner", tier="suggested",
+                               calendar_name="Suggestions", calendar_uid="SUG")
+    jid = state.journal_intent(record)
+    state.journal_commit(jid, "SUG")
+    state.journal_intent({"canonical_id": record["canonical_id"], "title": "Dinner", "date": FUTURE_DATE},
+                         op="promote")
+    monkeypatch.setattr(calendar, "get_events_near", lambda *a, **k: [
+        {"title": "Dinner", "date": FUTURE_DATE, "time_start": None, "calendar_uid": "MAIN"},
+    ])
+
+    main.recover_journal(_cfg(calendar_query_enabled=True))
+
+    rec = state.get_active_events()[0]
+    assert (rec["tier"], rec["calendar_uid"]) == ("main", "MAIN")
+    assert state.get_pending_journal() == []
+
+
+def test_recover_interrupted_promotion_that_never_landed_is_dropped(monkeypatch):
+    state.journal_intent({"canonical_id": "x", "title": "Dinner", "date": FUTURE_DATE}, op="promote")
+    monkeypatch.setattr(calendar, "get_events_near", lambda *a, **k: [])
+    main.recover_journal(_cfg(calendar_query_enabled=True))
+    assert state.get_pending_journal() == []
+
+
+def test_resolve_suggestions_calendar_disables_on_failure(monkeypatch):
+    monkeypatch.setattr(calendar, "ensure_calendar", lambda name: False)
+    assert main._resolve_suggestions_calendar(_cfg(suggestions_calendar="S"))["suggestions_calendar"] is None
+    monkeypatch.setattr(calendar, "ensure_calendar", lambda name: True)
+    assert main._resolve_suggestions_calendar(_cfg(suggestions_calendar="S"))["suggestions_calendar"] == "S"
+
+
+def test_process_new_messages_passes_known_plans(one_chat_db, monkeypatch):
+    soon = (datetime.now() + timedelta(days=10)).date().isoformat()
+    state.record_event(5, soon, None, "Marathon")
+    seen = {}
+
+    def fake_detect(threads, **kwargs):
+        seen.update(kwargs)
+        return [], set()
+
+    monkeypatch.setattr(main.detector, "detect_plans", fake_detect)
+    main.process_new_messages(_cfg())
+    assert seen["known_plans"] == [{"title": "Marathon", "date": soon, "time_start": None}]
+
+
+def test_process_new_messages_known_plans_disabled(one_chat_db, monkeypatch):
+    state.record_event(5, (datetime.now() + timedelta(days=10)).date().isoformat(), None, "Marathon")
+    seen = {}
+
+    def fake_detect(threads, **kwargs):
+        seen.update(kwargs)
+        return [], set()
+
+    monkeypatch.setattr(main.detector, "detect_plans", fake_detect)
+    main.process_new_messages(_cfg(known_plans_enabled=False))
+    assert seen["known_plans"] is None

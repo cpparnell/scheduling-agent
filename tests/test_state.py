@@ -687,3 +687,52 @@ def test_find_record_still_prefers_an_exact_hash_match():
     match = state.find_record(1, "2099-06-01", "19:00", "Book Club")
 
     assert match["date"] == "2099-06-01"
+
+
+# --- v0.13: known plans, new record fields ------------------------------------
+
+
+def test_known_plans_lists_upcoming_live_plans_soonest_first():
+    from datetime import date
+    today = date(2099, 1, 1)
+    state.record_event(1, "2099-02-01", None, "Marathon")
+    state.record_event(1, "2099-01-10", "19:00", "Dinner")
+    state.record_event(1, "2098-12-30", None, "Past thing")
+    state.record_event(1, "2099-12-01", None, "Too far out")
+    state.record_event(1, "2099-01-11", None, "Dup", suppressed=True)
+    state.record_event(1, "2099-01-12", None, "Called off", status="cancelled")
+
+    plans = state.known_plans(today=today)
+
+    assert plans == [
+        {"title": "Dinner", "date": "2099-01-10", "time_start": "19:00"},
+        {"title": "Marathon", "date": "2099-02-01", "time_start": None},
+    ]
+
+
+def test_known_plans_capped(monkeypatch):
+    from datetime import date
+    monkeypatch.setattr(state, "KNOWN_PLANS_MAX", 2)
+    for day in range(10, 15):
+        state.record_event(1, f"2099-01-{day}", None, f"Plan {day}")
+    assert len(state.known_plans(today=date(2099, 1, 1))) == 2
+
+
+def test_make_record_new_fields_default_and_persist():
+    record = state.make_record(1, "2099-01-10", None, "Dinner")
+    assert record["tier"] == "main"
+    assert record["participants"] == []
+    assert record["date_note"] is None and record["calendar_name"] is None
+
+    suggested = state.make_record(
+        1, "2099-01-10", None, "Dinner", participants=["Sam"], date_note="note",
+        tier="suggested", calendar_name="Suggestions",
+    )
+    assert (suggested["tier"], suggested["participants"], suggested["calendar_name"]) == (
+        "suggested", ["Sam"], "Suggestions",
+    )
+
+
+def test_record_event_persists_participants():
+    state.record_event(1, "2099-01-10", None, "Dinner", participants=["Sam"])
+    assert state.get_active_events()[0]["participants"] == ["Sam"]

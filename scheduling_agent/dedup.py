@@ -1,10 +1,11 @@
 import json
 import logging
+import re
 from datetime import date as date_type
 
 import anthropic
 
-from scheduling_agent import usage_tracker
+from scheduling_agent import state, usage_tracker
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,14 @@ When is_duplicate=true, also classify the RELATIONSHIP to the matched event:
   that already happened or is a separate cycle of a repeating plan.
 When is_duplicate=false, set relationship to "new_occurrence" as a placeholder (it
 is not used).
+
+Each plan lists `participants`: the other people in the conversation it came from
+(the user is always there too). Different chats that share participants — a group
+chat and a 1:1 with one of its members — often discuss the same plan; disjoint
+participants with no shared chat point to different plans. Two plans quoting the
+SAME evidence message came from one message: usually the same plan described twice
+(possibly mis-dated once), unless that one message clearly sets up several distinct
+plans ("rehearsal Friday, then the welcome party").
 
 Judge by: whether the conversations/participants overlap, whether titles and
 locations describe the same activity, whether the times are identical or plausibly
@@ -126,10 +135,81 @@ def sampling_kwargs(model: str, temperature: float) -> dict:
     return {} if model.startswith(_NO_TEMPERATURE_PREFIXES) else {"temperature": temperature}
 
 
+def _tokens(text: str | None) -> set[str]:
+    return set(state._normalize_title(text or "").split())
+
+
+def token_overlap(a: str | None, b: str | None) -> float:
+    """Jaccard overlap of normalized tokens (the title-dedup normalization)."""
+    ta, tb = _tokens(a), _tokens(b)
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+
+# The sender/timestamp label the detector sometimes keeps on quoted evidence
+# ("Me (Wed 09/16/2026 01:44PM): Let's do Giant").
+_EVIDENCE_LABEL = re.compile(r"^\s*[^:\n()]{1,40}\([^)\n]*\d{1,2}/\d{1,2}[^)\n]*\)\s*:\s*")
+_EVIDENCE_WORD = re.compile(r"[a-z0-9']+")
+
+# Short acceptances ("I'm down", "let's go") recur across unrelated plans, so
+# they never count as the same evidence.
+EVIDENCE_KEY_MIN_WORDS = 4
+# state.EVIDENCE_MAX_CHARS truncates stored evidence; compare a prefix that
+# survives that truncation on both sides.
+_EVIDENCE_KEY_CHARS = 200
+
+
+def evidence_key(evidence: str | None) -> str | None:
+    """A normalized form of a plan's evidence quote, or None when it's too
+    short to identify a message. Two plans with the same key were quoted from
+    the same message."""
+    text = _EVIDENCE_LABEL.sub("", evidence or "", count=1).lower()
+    words = _EVIDENCE_WORD.findall(text)
+    if len(words) < EVIDENCE_KEY_MIN_WORDS:
+        return None
+    return " ".join(words)[:_EVIDENCE_KEY_CHARS]
+
+
+def shares_chat(event: dict, record: dict) -> bool:
+    chats = set(record.get("chat_ids") or []) | {record.get("chat_id")}
+    return event.get("chat_id") in chats
+
+
+def relevance(event: dict, record: dict) -> float:
+    """How likely `record` is to be the same plan as `event`, for ranking
+    adjudication candidates. Ranking before the MAX_CANDIDATES cut matters on
+    a busy week: newest-first truncation could drop the real match, and an
+    LLM picking among candidates does best with a short, relevant list."""
+    score = token_overlap(event.get("title"), record.get("title"))
+    if event.get("location") and record.get("location"):
+        score += 0.5 * token_overlap(event["location"], record["location"])
+    if shares_chat(event, record):
+        score += 0.3
+    if set(event.get("participants") or []) & set(record.get("participants") or []):
+        score += 0.3
+    key = evidence_key(event.get("evidence"))
+    if key and key == evidence_key(record.get("evidence")):
+        score += 1.0
+    try:
+        days = abs((date_type.fromisoformat(event["date"]) - date_type.fromisoformat(record["date"])).days)
+        score -= 0.05 * min(days, 30)
+    except (KeyError, TypeError, ValueError):
+        pass
+    return score
+
+
+def rank_candidates(event: dict, candidates: list[dict]) -> list[dict]:
+    """Most relevant first; ties go to the newest record."""
+    newest_first = sorted(candidates, key=lambda r: r.get("created_at", ""), reverse=True)
+    return sorted(newest_first, key=lambda r: relevance(event, r), reverse=True)
+
+
 def find_candidates(event: dict, existing: list[dict], day_window: int = 1) -> list[dict]:
     """Code-side filter: existing records within +/- day_window of the new
     event's date, excluding exact-hash matches (already handled upstream by
-    state.is_duplicate). Returns at most MAX_CANDIDATES, newest first."""
+    state.is_duplicate). Returns at most MAX_CANDIDATES, most relevant first
+    (see relevance)."""
     try:
         target = date_type.fromisoformat(event["date"])
     except (KeyError, ValueError, TypeError):
@@ -148,8 +228,12 @@ def find_candidates(event: dict, existing: list[dict], day_window: int = 1) -> l
         if abs((record_date - target).days) <= day_window:
             matches.append(record)
 
-    matches.sort(key=lambda r: r.get("created_at", ""), reverse=True)
-    return matches[:MAX_CANDIDATES]
+    return rank_candidates(event, matches)[:MAX_CANDIDATES]
+
+
+def _participants_field(plan: dict) -> str:
+    people = plan.get("participants")
+    return f" participants={', '.join(people)!r}" if people else ""
 
 
 def _format_candidates(candidates: list[dict]) -> str:
@@ -157,8 +241,8 @@ def _format_candidates(candidates: list[dict]) -> str:
     for i, c in enumerate(candidates):
         lines.append(
             f"{i}. title={c.get('title')!r} date={c.get('date')} time={c.get('time_start')} "
-            f"location={c.get('location')!r} chat_id={c.get('chat_id')} status={c.get('status')} "
-            f"evidence={c.get('evidence')!r}"
+            f"location={c.get('location')!r} chat_id={c.get('chat_id')}{_participants_field(c)} "
+            f"status={c.get('status')} evidence={c.get('evidence')!r}"
         )
     return "\n".join(lines)
 
@@ -166,8 +250,8 @@ def _format_candidates(candidates: list[dict]) -> str:
 def _format_new_plan(event: dict) -> str:
     return (
         f"title={event.get('title')!r} date={event.get('date')} time={event.get('time_start')} "
-        f"location={event.get('location')!r} chat_id={event.get('chat_id')} status={event.get('status')} "
-        f"evidence={event.get('evidence')!r}"
+        f"location={event.get('location')!r} chat_id={event.get('chat_id')}{_participants_field(event)} "
+        f"status={event.get('status')} evidence={event.get('evidence')!r}"
     )
 
 
