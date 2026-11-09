@@ -1,0 +1,536 @@
+<title>Tray Prototype</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* PROTOTYPE — throwaway. Three tray variants for the "Tray UX" wayfinder ticket, switchable via #inbox / #review / #agenda.
+   Layout: a fake macOS desktop (menu bar + dropdown panel + notification banner) above a live state pane. */
+:root{
+  --bg:#e9ece8; --fg:#1d211f; --muted:#5e6762; --line:#d3d8d3;
+  --desk-a:#9fb3a6; --desk-b:#c9d3c4;
+  --panel:#f7f8f6; --panel-2:#eceeeb; --panel-line:#d9ddd8;
+  --accent:#2f6f5e; --accent-fg:#ffffff; --accent-soft:#dbe9e3;
+  --warn:#9a5b12; --warn-soft:#f4e6cf; --bad:#a23a32; --bad-soft:#f5dcd9;
+  --menubar:rgba(250,251,249,.78); --shadow:0 18px 50px rgba(20,30,25,.28),0 2px 6px rgba(20,30,25,.12);
+  --pill:#1d211f; --pill-fg:#f2f4f1;
+  --ui:-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",Helvetica,Arial,sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --bg:#141816; --fg:#e7ebe8; --muted:#97a19b; --line:#2b322e;
+  --desk-a:#24372f; --desk-b:#3a4a40;
+  --panel:#232825; --panel-2:#2c322e; --panel-line:#3a423d;
+  --accent:#6cc3a8; --accent-fg:#0f1a16; --accent-soft:#1f3a31;
+  --warn:#e2b26a; --warn-soft:#3d2f1a; --bad:#ec8a80; --bad-soft:#40221f;
+  --menubar:rgba(30,35,32,.78); --shadow:0 18px 50px rgba(0,0,0,.55),0 2px 6px rgba(0,0,0,.4);
+  --pill:#e7ebe8; --pill-fg:#141816; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#141816; --fg:#e7ebe8; --muted:#97a19b; --line:#2b322e;
+  --desk-a:#24372f; --desk-b:#3a4a40;
+  --panel:#232825; --panel-2:#2c322e; --panel-line:#3a423d;
+  --accent:#6cc3a8; --accent-fg:#0f1a16; --accent-soft:#1f3a31;
+  --warn:#e2b26a; --warn-soft:#3d2f1a; --bad:#ec8a80; --bad-soft:#40221f;
+  --menubar:rgba(30,35,32,.78); --shadow:0 18px 50px rgba(0,0,0,.55),0 2px 6px rgba(0,0,0,.4);
+  --pill:#e7ebe8; --pill-fg:#141816; color-scheme:dark}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--fg);font-family:var(--ui);font-size:13px;line-height:1.4;
+  padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));padding-block:20px 90px}
+button{font:inherit;color:inherit;cursor:pointer}
+button:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.wrap{max-width:1180px;margin:0 auto;display:grid;gap:16px}
+.top{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end;justify-content:space-between}
+.top h1{font-size:20px;margin:0;text-wrap:balance}
+.top p{margin:4px 0 0;color:var(--muted);max-width:68ch}
+.tag{font-family:var(--mono);font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--warn)}
+.sim{display:flex;gap:8px;flex-wrap:wrap}
+.btn{border:1px solid var(--panel-line);background:var(--panel);border-radius:7px;padding:5px 11px;font-size:12.5px}
+.btn:hover{background:var(--panel-2)}
+.btn.primary{background:var(--accent);color:var(--accent-fg);border-color:transparent}
+.btn.danger{color:var(--bad)}
+.btn.sm{padding:3px 9px;font-size:12px}
+.stage{display:grid;grid-template-columns:minmax(0,1fr) 340px;gap:16px;align-items:start}
+@media (max-width:900px){.stage{grid-template-columns:minmax(0,1fr)}}
+
+/* desktop mock */
+.desk{position:relative;border-radius:12px;overflow:hidden;min-height:640px;
+  background:radial-gradient(120% 90% at 20% 10%,var(--desk-b),var(--desk-a));border:1px solid var(--line)}
+.menubar{height:28px;display:flex;align-items:center;gap:16px;padding:0 14px;background:var(--menubar);
+  backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);font-size:13px}
+.menubar .sp{flex:1}
+.menubar b{font-weight:600}
+.trayicon{display:flex;align-items:center;gap:4px;padding:2px 7px;border-radius:5px;border:0;background:var(--accent-soft)}
+.trayicon svg{width:15px;height:15px}
+.badge{min-width:16px;height:16px;border-radius:8px;background:var(--warn);color:#fff;font-size:10.5px;font-weight:600;display:inline-grid;place-items:center;padding:0 4px}
+.panel{position:absolute;top:34px;right:120px;width:372px;max-width:calc(100% - 24px);background:var(--panel);border:1px solid var(--panel-line);
+  border-radius:12px;box-shadow:var(--shadow);overflow:hidden;display:flex;flex-direction:column;max-height:590px}
+@media (max-width:560px){.panel{right:12px}}
+.ph{display:flex;align-items:center;gap:8px;padding:10px 12px 8px;border-bottom:1px solid var(--panel-line)}
+.ph .t{font-weight:600}
+.ph .s{color:var(--muted);font-size:11.5px}
+.ph .live{width:7px;height:7px;border-radius:50%;background:var(--accent)}
+.pbody{overflow:auto;flex:1;min-height:0}
+.pf{display:flex;align-items:center;gap:10px;padding:8px 12px;border-top:1px solid var(--panel-line);font-size:12px;color:var(--muted)}
+.pf .sp{flex:1}
+.switch{display:inline-flex;align-items:center;gap:6px;border:0;background:none;padding:0;color:var(--muted)}
+.switch i{width:26px;height:15px;border-radius:8px;background:var(--panel-line);position:relative;transition:background .15s}
+.switch i::after{content:"";position:absolute;top:2px;left:2px;width:11px;height:11px;border-radius:50%;background:var(--panel);transition:left .15s}
+.switch[aria-pressed="true"] i{background:var(--accent)}
+.switch[aria-pressed="true"] i::after{left:13px}
+.sec{padding:8px 12px 2px;font-size:10.5px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+.empty{padding:16px 12px;color:var(--muted)}
+
+/* rows (variant A) */
+.row{display:grid;grid-template-columns:10px minmax(0,1fr) auto;gap:10px;padding:8px 12px;border:0;background:none;width:100%;text-align:left;border-radius:0}
+.row:hover{background:var(--panel-2)}
+.row.open{background:var(--panel-2)}
+.dot{width:9px;height:9px;border-radius:50%;margin-top:4px;background:var(--accent)}
+.dot.sug{background:none;border:1.5px dashed var(--warn)}
+.ttl{font-weight:600;overflow-wrap:anywhere}
+.meta{color:var(--muted);font-size:12px}
+.when{font-variant-numeric:tabular-nums}
+.ago{color:var(--muted);font-size:11px;white-space:nowrap}
+.detail{padding:0 12px 10px 32px;display:grid;gap:8px;background:var(--panel-2)}
+.actions{display:flex;gap:6px;flex-wrap:wrap}
+.held{font-size:12px;color:var(--warn)}
+
+/* rationale */
+.why{border-left:2px solid var(--panel-line);padding:2px 0 2px 9px;display:grid;gap:4px;font-size:12px}
+.why .q{font-style:italic;overflow-wrap:anywhere}
+.why .q b{font-style:normal;font-weight:600}
+.why .k{color:var(--muted);font-size:10.5px;letter-spacing:.05em;text-transform:uppercase}
+.why .img{display:inline-block;font-style:normal;font-size:11px;padding:1px 6px;border-radius:4px;background:var(--accent-soft)}
+
+/* correction chooser + fix */
+.chooser{display:grid;gap:7px;padding:9px;border:1px solid var(--panel-line);border-radius:9px;background:var(--panel)}
+.chooser .h{font-weight:600;font-size:12px}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.chip{border:1px solid var(--panel-line);background:var(--panel-2);border-radius:999px;padding:3px 10px;font-size:12px}
+.chip:hover{border-color:var(--accent)}
+.chip.on{background:var(--accent);color:var(--accent-fg);border-color:transparent}
+.other{display:grid;gap:4px}
+.other textarea{font:inherit;resize:none;border:1px solid var(--panel-line);border-radius:7px;padding:6px 8px;background:var(--panel-2);color:var(--fg);height:46px}
+.count{font-size:11px;color:var(--muted);text-align:right;font-variant-numeric:tabular-nums}
+.count.full{color:var(--bad)}
+.fix input{font:inherit;border:1px solid var(--panel-line);border-radius:6px;padding:3px 6px;background:var(--panel-2);color:var(--fg)}
+.fixrow{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+
+/* variant B: review cards */
+.card{margin:12px;border:1px solid var(--panel-line);border-radius:12px;padding:14px;display:grid;gap:10px;background:var(--panel)}
+.kind{justify-self:start;font-size:10.5px;font-weight:600;letter-spacing:.05em;text-transform:uppercase;padding:2px 8px;border-radius:999px;background:var(--accent-soft);color:var(--accent)}
+.kind.sug{background:var(--warn-soft);color:var(--warn)}
+.card .big{font-size:18px;font-weight:650;line-height:1.25;text-wrap:balance}
+.card .date{font-size:14px;font-variant-numeric:tabular-nums}
+.bigacts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}
+.bigacts .btn{padding:8px 6px;font-weight:500}
+.progress{display:flex;align-items:center;gap:8px;padding:8px 12px 0;color:var(--muted);font-size:12px}
+.bar{flex:1;height:4px;border-radius:2px;background:var(--panel-line);overflow:hidden}
+.bar i{display:block;height:100%;background:var(--accent)}
+.next{padding:0 12px 10px;display:grid;gap:2px}
+.next div{display:flex;gap:8px;justify-content:space-between;color:var(--muted);font-size:12px;padding:3px 0;border-bottom:1px solid var(--panel-line)}
+.next div:last-child{border:0}
+
+/* variant C: agenda */
+.strip{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:2px;padding:8px 10px;border-bottom:1px solid var(--panel-line)}
+.day{border:0;background:none;border-radius:7px;padding:4px 0 5px;display:grid;justify-items:center;gap:1px;font-size:11px;color:var(--muted)}
+.day b{font-size:14px;color:var(--fg);font-weight:500;font-variant-numeric:tabular-nums}
+.day.today b{color:var(--accent);font-weight:700}
+.day .dots{display:flex;gap:2px;height:5px}
+.day .dots i{width:5px;height:5px;border-radius:50%;background:var(--accent)}
+.day .dots i.s{background:none;border:1px dashed var(--warn)}
+.day.pick{outline:1px dashed var(--warn);cursor:copy}
+.day.pick:hover{background:var(--warn-soft)}
+.movebar{margin:8px 10px 0;padding:8px 10px;border-radius:8px;background:var(--warn-soft);color:var(--warn);font-size:12px;display:grid;gap:6px}
+.ag{display:grid;grid-template-columns:54px minmax(0,1fr) auto;gap:10px;padding:7px 12px;align-items:start}
+.ag .tm{font-variant-numeric:tabular-nums;color:var(--muted);font-size:12px;padding-top:1px}
+.ag.sug .ttl{color:var(--muted)}
+.ag.sug{background:repeating-linear-gradient(135deg,transparent 0 6px,var(--panel-2) 6px 8px)}
+.dh{padding:10px 12px 2px;font-size:12px;font-weight:600;display:flex;gap:6px;align-items:baseline}
+.dh span{color:var(--muted);font-weight:400}
+.more{border:0;background:none;border-radius:6px;padding:0 6px;font-size:16px;line-height:1.2;color:var(--muted)}
+.more:hover{background:var(--panel-2)}
+.menu{display:grid;margin:0 12px 8px 76px;border:1px solid var(--panel-line);border-radius:8px;background:var(--panel);overflow:hidden}
+.menu button{border:0;background:none;text-align:left;padding:6px 10px}
+.menu button:hover{background:var(--panel-2)}
+.inset{margin:0 12px 10px 76px;display:grid;gap:8px}
+
+/* notification banner */
+.banner{position:absolute;top:36px;right:10px;width:330px;max-width:calc(100% - 20px);background:var(--panel);border:1px solid var(--panel-line);
+  border-radius:14px;box-shadow:var(--shadow);padding:10px 12px;display:grid;gap:6px;z-index:5;animation:slide .25s ease-out}
+@keyframes slide{from{transform:translateX(30px);opacity:.3}to{transform:none;opacity:1}}
+@media (prefers-reduced-motion:reduce){.banner{animation:none}}
+.banner .app{display:flex;gap:6px;align-items:center;font-size:11px;color:var(--muted)}
+.banner .app svg{width:13px;height:13px}
+.banner .app .sp{flex:1}
+.banner .b-actions{display:flex;gap:6px;flex-wrap:wrap}
+
+/* state pane */
+.state{border:1px solid var(--line);border-radius:12px;background:var(--panel);padding:12px;display:grid;gap:10px;font-size:12px}
+.state h2{font-size:13px;margin:0}
+.state p{margin:0;color:var(--muted)}
+.counts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}
+.counts div{background:var(--panel-2);border-radius:8px;padding:6px 8px}
+.counts b{display:block;font-size:17px;font-variant-numeric:tabular-nums}
+.counts span{color:var(--muted);font-size:11px}
+.log{font-family:var(--mono);font-size:11px;background:var(--panel-2);border-radius:8px;padding:8px;max-height:360px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;margin:0}
+.log .sig{color:var(--accent)}
+.log .neg{color:var(--bad)}
+.notes{display:grid;gap:4px;color:var(--muted)}
+.notes b{color:var(--fg)}
+
+/* switcher */
+.switcher{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(16px + env(safe-area-inset-bottom,0px));z-index:20;display:flex;align-items:center;gap:4px;
+  background:var(--pill);color:var(--pill-fg);border-radius:999px;padding:5px;box-shadow:0 8px 24px rgba(0,0,0,.3);font-family:var(--mono);font-size:12px;max-width:calc(100% - 32px)}
+.switcher button{border:0;background:transparent;color:inherit;width:30px;height:30px;border-radius:50%;font-size:15px}
+.switcher button:hover{background:rgba(127,127,127,.25)}
+.switcher span{padding:0 10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+</style>
+
+<div class="wrap">
+  <div class="top">
+    <div>
+      <div class="tag">Prototype · throwaway · sample data</div>
+      <h1 id="vname">Tray prototype</h1>
+      <p id="vdesc"></p>
+    </div>
+    <div class="sim">
+      <button class="btn" id="simNew">Simulate: new plan arrives</button>
+      <button class="btn" id="reset">Reset sample data</button>
+    </div>
+  </div>
+  <div class="stage">
+    <div class="desk" id="desk">
+      <div class="menubar">
+        <b>Finder</b><span>File</span><span>Edit</span><span>View</span><span class="sp"></span>
+        <button class="trayicon" id="trayBtn" aria-label="Scheduling agent">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2" y="3" width="12" height="11" rx="2"/><path d="M2 6.5h12M5.5 1.5v3M10.5 1.5v3"/></svg>
+          <span class="badge" id="badge">2</span>
+        </button>
+        <span>Sun Nov 8&nbsp; 9:41 AM</span>
+      </div>
+      <div class="panel" id="panel"></div>
+      <div id="bannerHost"></div>
+    </div>
+    <aside class="state" id="state"></aside>
+  </div>
+</div>
+
+<div class="switcher" role="group" aria-label="Prototype variant switcher">
+  <button id="prev" aria-label="Previous variant">←</button>
+  <span id="vlabel">A</span>
+  <button id="next" aria-label="Next variant">→</button>
+</div>
+
+<script>
+const TODAY = new Date(2026,10,8); // Sun Nov 8 2026
+const VARIANTS = [
+  {key:'inbox', letter:'A', name:'Inbox list', desc:'One scrolling list. Suggestions are pinned on top; everything already on your calendar sits below, newest first. Open a row to see the reasons and correct it.'},
+  {key:'review', letter:'B', name:'Review cards', desc:'Every new entry waits in a queue until you look at it, one card at a time. "Looks right" is an explicit confirmation, so the system learns from approvals as well as removals.'},
+  {key:'agenda', letter:'C', name:'Agenda', desc:'Organized by when the plan happens, not when it was detected. Suggestions sit as hatched ghosts in their day. Fix a wrong day by picking the right one on the week strip.'},
+];
+const REASONS = [
+  {k:'wrong_day', label:'Wrong day or time', fix:true},
+  {k:'not_mine', label:'Not my plan'},
+  {k:'not_a_plan', label:'Not a real plan'},
+  {k:'dont_want', label:"Real, but don't calendar it"},
+  {k:'duplicate', label:'Duplicate'},
+  {k:'other', label:'Other…'},
+];
+const OTHER_MAX = 80;
+
+function sample(){ return [
+  {id:'s1', kind:'suggestion', title:'Game night at Sam’s', date:'2026-11-12', time:'19:00', chat:'Thursday Crew (group)', ago:14,
+   held:'You only reacted 👍. That may or may not mean you’re coming.',
+   why:{evidence:[['Sam','game night thurs at mine? 7ish'],['You','reacted 👍']], date:'“thurs” → Thu Nov 12 (the coming Thursday)', inOn:'Unclear: a reaction is not a reply'}, alts:['2026-11-19']},
+  {id:'s2', kind:'suggestion', title:'Brunch with Jordan', date:'2026-11-15', time:null, chat:'Jordan', ago:52,
+   held:'“Next weekend” could be Sat Nov 14 or Sun Nov 15.',
+   why:{evidence:[['Jordan','brunch next weekend?'],['You','yes!! been craving that pancake place']], date:'“next weekend” → ambiguous between Sat and Sun', inOn:'You accepted'}, alts:['2026-11-14','2026-11-21']},
+  {id:'c1', kind:'commitment', title:'Dinner at Basil Room with Maya', date:'2026-11-13', time:'19:30', chat:'Maya', ago:3,
+   why:{evidence:[['Maya','basil room friday? I can book 7:30'],['You','yes let’s do it']], date:'“friday” → Fri Nov 13 (next Friday after today)', inOn:'You accepted Maya’s proposal'}, alts:['2026-11-20']},
+  {id:'c2', kind:'commitment', title:'Reservation · Tavern on Elm, party of 2', date:'2026-11-21', time:'20:00', chat:'Tavern on Elm (SMS)', ago:95,
+   why:{evidence:[['Tavern on Elm','Your reservation for 2 on Sat, Nov 21 at 8:00 PM is confirmed. Reply C to cancel.']], date:'Explicit date in the message', inOn:'A booking confirmation sent to you'}, alts:[]},
+  {id:'c3', kind:'commitment', title:'Winter Lights at the Conservatory', date:'2026-12-05', time:'18:00', chat:'Maya', ago:240,
+   why:{evidence:[['You','[image: poster “Winter Lights · Dec 5 · 6–10pm”]'],['You','we should go!'],['Maya','omg yes. buying tickets now'],['Maya','done, got 2 for 6pm']], date:'From the poster image: Dec 5, entry 6 PM', inOn:'You proposed it; Maya bought tickets for both of you'}, alts:[]},
+  {id:'c4', kind:'commitment', title:'Ski trip · Ski Crew', date:'2026-11-13', time:null, chat:'Ski Crew (group)', ago:600,
+   why:{evidence:[['Alex','leaving friday morning, I’ll drive'],['You','I’m in, I’ll bring the cooler']], date:'“friday” → Fri Nov 13 (next Friday after today)', inOn:'You said you’re in'}, alts:['2027-01-15'],
+   note:'Planted mistake: on Oct 2 this chat said “trip is MLK weekend”, so it should be Jan 15.'},
+];}
+let items = sample();
+let log = [];
+let ui = {open:null, chooser:null, fix:null, menu:null, moving:null, showWhy:true, banner:null, reviewed:new Set(), sel:null, other:''};
+let simCount = 0, laterSeq = 0;
+
+/* helpers */
+const pd = s => { const [y,m,d]=s.split('-').map(Number); return new Date(y,m-1,d); };
+const iso = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+const DOW=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'], MON=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+const fdate = s => { const d=pd(s); return `${DOW[d.getDay()]}, ${MON[d.getMonth()]} ${d.getDate()}`; };
+const ftime = t => { if(!t) return 'All day'; let [h,m]=t.split(':').map(Number); const ap=h>=12?'PM':'AM'; h=h%12||12; return m?`${h}:${String(m).padStart(2,'0')} ${ap}`:`${h} ${ap}`; };
+const fago = m => m<60?`${m}m ago`:m<1440?`${Math.round(m/60)}h ago`:`${Math.round(m/1440)}d ago`;
+const esc = s => String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const get = id => items.find(i=>i.id===id);
+const active = () => items.filter(i=>!i.gone);
+const daysFrom = s => Math.round((pd(s)-TODAY)/864e5);
+
+function record(action, it, extra={}){
+  log.unshift({t:new Date().toTimeString().slice(0,8), action, item:it.title, chat:it.chat, ...extra});
+}
+
+/* shared fragments (the reason chooser + date fix are shared on purpose; layouts are not) */
+function whyBlock(it){
+  if(!ui.showWhy) return '';
+  const ev = it.why.evidence.map(([w,t])=>{
+    const img = t.startsWith('[image:');
+    return `<div class="q"><b>${esc(w)}:</b> ${img?`<span class="img">${esc(t.slice(1,-1))}</span>`:'“'+esc(t)+'”'}</div>`;
+  }).join('');
+  return `<div class="why"><div class="k">Evidence</div>${ev}<div class="k">Date</div><div>${esc(it.why.date)}</div><div class="k">Why you’re in</div><div>${esc(it.why.inOn)}</div></div>`;
+}
+function chooser(it){
+  const sug = it.kind==='suggestion';
+  const rs = REASONS.filter(r=>!(sug&&r.k==='duplicate'));
+  const chips = rs.map(r=>`<button class="chip ${ui.sel===r.k?'on':''}" data-act="reason" data-id="${it.id}" data-r="${r.k}">${r.label}</button>`).join('');
+  const other = ui.sel==='other' ? `<div class="other"><textarea id="otherText" maxlength="${OTHER_MAX}" placeholder="Short reason, e.g. “that’s my sister’s trip”">${esc(ui.other)}</textarea>
+    <div class="actions" style="justify-content:space-between;align-items:center"><span class="count ${ui.other.length>=OTHER_MAX?'full':''}" id="otherCount">${ui.other.length}/${OTHER_MAX}</span>
+    <button class="btn sm primary" data-act="otherSubmit" data-id="${it.id}">${sug?'Dismiss':'Remove'}</button></div></div>` : '';
+  return `<div class="chooser"><div class="h">${sug?'Why dismiss it?':'Why remove it?'} <span class="meta">One tap ${sug?'dismisses':'removes'} it.</span></div><div class="chips">${chips}</div>${other}
+    <div><button class="btn sm" data-act="cancel">Cancel</button></div></div>`;
+}
+function fixBox(it){
+  const alts = it.alts.filter(a=>a!==it.date);
+  const altBtns = alts.map(a=>`<button class="chip" data-act="fixTo" data-id="${it.id}" data-d="${a}">${fdate(a)}${a.slice(0,4)!=='2026'?' '+a.slice(0,4):''}</button>`).join('');
+  return `<div class="chooser fix"><div class="h">Move to the right day</div>
+    ${alts.length?`<div class="meta">Other readings of the message:</div><div class="chips">${altBtns}</div>`:''}
+    <div class="fixrow"><input type="date" id="fixDate" value="${it.date}"><input type="time" id="fixTime" value="${it.time||''}">
+    <button class="btn sm primary" data-act="fixSave" data-id="${it.id}">${it.kind==='suggestion'?'Add on this day':'Move'}</button>
+    <button class="btn sm" data-act="cancel">Cancel</button></div></div>`;
+}
+function inlineTools(it){
+  if(ui.fix===it.id) return fixBox(it);
+  if(ui.chooser===it.id) return chooser(it);
+  return '';
+}
+function header(){
+  const n = active().filter(i=>i.kind==='suggestion').length;
+  return `<div class="ph"><span class="live"></span><span class="t">Scheduling Agent</span><span class="s">Watching Messages${n?` · ${n} to look at`:''}</span></div>`;
+}
+function footer(){
+  return `<div class="pf"><button class="switch" data-act="toggleWhy" aria-pressed="${ui.showWhy}"><i></i>Show reasons</button><span class="sp"></span><span>Pause</span><span>Open Calendar</span></div>`;
+}
+
+/* Variant A: inbox list */
+function renderInbox(){
+  const sugs = active().filter(i=>i.kind==='suggestion');
+  const coms = active().filter(i=>i.kind==='commitment').sort((a,b)=>a.ago-b.ago);
+  let h = header()+'<div class="pbody">';
+  if(sugs.length){
+    h += `<div class="sec">Needs a look · ${sugs.length}</div>`;
+    for(const it of sugs){
+      const open = ui.open===it.id;
+      h += `<button class="row ${open?'open':''}" data-act="open" data-id="${it.id}"><span class="dot sug"></span>
+        <span><div class="ttl">${esc(it.title)}</div><div class="meta when">${fdate(it.date)} · ${ftime(it.time)}</div><div class="held">${esc(it.held)}</div></span><span class="ago">${fago(it.ago)}</span></button>`;
+      h += `<div class="detail" ${open?'':'hidden'}>${whyBlock(it)}<div class="actions">
+        <button class="btn sm primary" data-act="accept" data-id="${it.id}">Add to calendar</button>
+        <button class="btn sm" data-act="fix" data-id="${it.id}">Different day</button>
+        <button class="btn sm" data-act="choose" data-id="${it.id}">Dismiss…</button></div>${inlineTools(it)}</div>`;
+    }
+  }
+  h += `<div class="sec">Added to your calendar</div>`;
+  if(!coms.length) h += `<div class="empty">Nothing added yet.</div>`;
+  for(const it of coms){
+    const open = ui.open===it.id;
+    h += `<button class="row ${open?'open':''}" data-act="open" data-id="${it.id}"><span class="dot"></span>
+      <span><div class="ttl">${esc(it.title)}</div><div class="meta when">${fdate(it.date)} · ${ftime(it.time)}</div><div class="meta">from ${esc(it.chat)}</div></span><span class="ago">${fago(it.ago)}</span></button>`;
+    h += `<div class="detail" ${open?'':'hidden'}>${whyBlock(it)}<div class="actions">
+      <button class="btn sm" data-act="fix" data-id="${it.id}">Wrong day</button>
+      <button class="btn sm danger" data-act="choose" data-id="${it.id}">Remove…</button></div>${inlineTools(it)}</div>`;
+  }
+  return h+'</div>'+footer();
+}
+
+/* Variant B: review cards */
+function renderReview(){
+  const all = active();
+  const queue = all.filter(i=>!ui.reviewed.has(i.id)).sort((a,b)=>((a.later||0)-(b.later||0)) || (a.kind===b.kind?a.ago-b.ago:a.kind==='suggestion'?-1:1));
+  const done = all.length-queue.length;
+  let h = header()+'<div class="pbody">';
+  h += `<div class="progress"><span>${queue.length?`${queue.length} to review`:'All caught up'}</span><span class="bar"><i style="width:${all.length?Math.round(done/all.length*100):100}%"></i></span><span>${done}/${all.length}</span></div>`;
+  const it = queue[0];
+  if(it){
+    const sug = it.kind==='suggestion';
+    h += `<div class="card"><span class="kind ${sug?'sug':''}">${sug?'Suggestion · not on calendar':'Added to calendar · '+fago(it.ago)}</span>
+      <div class="big">${esc(it.title)}</div><div class="date">${fdate(it.date)} · ${ftime(it.time)}</div><div class="meta">from ${esc(it.chat)}</div>
+      ${sug?`<div class="held">${esc(it.held)}</div>`:''}
+      ${ui.showWhy?whyBlock(it):'<div class="meta">Reasons hidden.</div>'}
+      ${inlineTools(it) || `<div class="bigacts">
+        ${sug?`<button class="btn primary" data-act="accept" data-id="${it.id}">Add</button>`:`<button class="btn primary" data-act="confirm" data-id="${it.id}">Looks right</button>`}
+        <button class="btn" data-act="fix" data-id="${it.id}">Wrong day</button>
+        <button class="btn danger" data-act="choose" data-id="${it.id}">${sug?'Dismiss…':'Remove…'}</button></div>
+        <div style="text-align:center"><button class="btn sm" data-act="later" data-id="${it.id}" style="border:0;background:none;color:var(--muted)">Decide later</button></div>`}
+    </div>`;
+    const rest = queue.slice(1);
+    if(rest.length){ h += `<div class="sec">Up next</div><div class="next">${rest.map(r=>`<div><span>${r.kind==='suggestion'?'◌ ':''}${esc(r.title)}</span><span class="when">${fdate(r.date)}</span></div>`).join('')}</div>`; }
+  } else {
+    h += `<div class="empty">Nothing waiting. New plans will appear here and as a notification.</div>`;
+  }
+  const rev = all.filter(i=>ui.reviewed.has(i.id));
+  if(rev.length){ h += `<div class="sec">Reviewed</div><div class="next">${rev.map(r=>`<div><span>✓ ${esc(r.title)}</span><span class="when">${fdate(r.date)}</span></div>`).join('')}</div>`; }
+  return h+'</div>'+footer();
+}
+
+/* Variant C: agenda */
+function renderAgenda(){
+  const all = active().slice().sort((a,b)=>a.date.localeCompare(b.date)||(a.time||'').localeCompare(b.time||''));
+  const days = [...Array(14)].map((_,i)=>{const d=new Date(TODAY); d.setDate(d.getDate()+i); return iso(d);});
+  let h = header();
+  const moving = ui.moving && get(ui.moving);
+  if(moving){
+    h += `<div class="movebar"><div><b>Moving “${esc(moving.title)}”.</b> Tap the right day below, or pick a later date.</div>
+      <div class="fixrow">${moving.alts.filter(a=>a!==moving.date).map(a=>`<button class="chip" data-act="fixTo" data-id="${moving.id}" data-d="${a}">${fdate(a)}${a.slice(0,4)!=='2026'?' '+a.slice(0,4):''}</button>`).join('')}
+      <input type="date" id="fixDate" value="${moving.date}"><button class="btn sm primary" data-act="fixSave" data-id="${moving.id}">Move</button><button class="btn sm" data-act="cancel">Cancel</button></div></div>`;
+  }
+  for(const wk of [days.slice(0,7),days.slice(7)]){
+    h += `<div class="strip">${wk.map(d=>{const dt=pd(d); const ev=all.filter(i=>i.date===d);
+      return `<button class="day ${d===iso(TODAY)?'today':''} ${moving?'pick':''}" data-act="${moving?'pickDay':'noop'}" data-d="${d}"><span>${DOW[dt.getDay()][0]}</span><b>${dt.getDate()}</b><span class="dots">${ev.slice(0,3).map(e=>`<i class="${e.kind==='suggestion'?'s':''}"></i>`).join('')}</span></button>`;}).join('')}</div>`;
+  }
+  h += '<div class="pbody">';
+  let lastGroup = null;
+  for(const it of all){
+    const n = daysFrom(it.date);
+    const g = n<=6?'This week':n<=13?'Next week':'Later';
+    if(g!==lastGroup){ h += `<div class="sec">${g}</div>`; lastGroup=g; }
+    const sug = it.kind==='suggestion';
+    h += `<div class="dh">${fdate(it.date)} <span>${n===0?'today':n===1?'tomorrow':`in ${n} days`}</span></div>`;
+    h += `<div class="ag ${sug?'sug':''}"><span class="tm">${ftime(it.time)}</span><span><div class="ttl">${esc(it.title)}</div><div class="meta">${sug?esc(it.held):'from '+esc(it.chat)+' · added '+fago(it.ago)}</div></span>
+      <span class="actions">${sug?`<button class="btn sm primary" data-act="accept" data-id="${it.id}">Add</button>`:''}<button class="more" data-act="menu" data-id="${it.id}" aria-label="More actions">⋯</button></span></div>`;
+    if(ui.menu===it.id){
+      h += `<div class="menu"><button data-act="whyToggle" data-id="${it.id}">${ui.open===it.id?'Hide':'Why is this here?'}</button><button data-act="move" data-id="${it.id}">Move to another day</button><button data-act="choose" data-id="${it.id}">${sug?'Dismiss…':'Remove…'}</button></div>`;
+    }
+    if(ui.open===it.id && ui.showWhy) h += `<div class="inset">${whyBlock(it)}</div>`;
+    if(ui.chooser===it.id) h += `<div class="inset">${chooser(it)}</div>`;
+  }
+  return h+'</div>'+footer();
+}
+
+/* banner */
+function renderBanner(){
+  const host = document.getElementById('bannerHost');
+  const it = ui.banner && get(ui.banner);
+  if(!it || it.gone){ host.innerHTML=''; return; }
+  host.innerHTML = `<div class="banner" role="status"><div class="app"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2" y="3" width="12" height="11" rx="2"/><path d="M2 6.5h12"/></svg>SCHEDULING AGENT<span class="sp"></span>now</div>
+    <div><b>Added: ${esc(it.title)}</b><div class="meta when">${fdate(it.date)} · ${ftime(it.time)} · from ${esc(it.chat)}</div></div>
+    <div class="b-actions"><button class="btn sm" data-act="bFix" data-id="${it.id}">Wrong day</button><button class="btn sm" data-act="bNotMine" data-id="${it.id}">Not my plan</button><button class="btn sm" data-act="bMore" data-id="${it.id}">Remove…</button><button class="btn sm" data-act="bClose" style="margin-left:auto">Close</button></div></div>`;
+}
+
+/* state pane */
+function renderState(){
+  const a = active();
+  const lines = log.length ? log.map(e=>{
+    const pos = e.action==='confirmed'||e.action==='accepted_suggestion';
+    return `<span class="${pos?'sig':'neg'}">${e.t} ${e.action}</span>  ${esc(e.item)}\n  chat: ${esc(e.chat)}${e.reason?`\n  reason: ${e.reason}`:''}${e.text?`\n  text: "${esc(e.text)}"`:''}${e.from?`\n  ${e.from} → ${e.to}`:''}`;
+  }).join('\n\n') : 'No corrections yet. Try removing, moving, adding or confirming something.';
+  const planted = get('c4');
+  document.getElementById('state').innerHTML = `<h2>What the system receives</h2>
+    <p>Every tray action becomes a learning signal. Green lines are positive signals, red lines are corrections.</p>
+    <div class="counts"><div><b>${a.filter(i=>i.kind==='commitment').length}</b><span>on calendar</span></div><div><b>${a.filter(i=>i.kind==='suggestion').length}</b><span>suggestions</span></div><div><b>${log.length}</b><span>signals</span></div></div>
+    <pre class="log">${lines}</pre>
+    <div class="notes"><b>Things to try</b>
+      <span>• The ski trip is a planted wrong-day mistake: ${planted&&!planted.gone&&planted.date==='2026-11-13'?'it was mid-November in this chat, but Oct 2 said “MLK weekend”. Fix it.':'done.'}</span>
+      <span>• “Other…” has an ${OTHER_MAX}-character cap.</span>
+      <span>• The Winter Lights entry shows how an image would appear in the reasons.</span>
+      <span>• “Simulate” fires a notification with action buttons.</span></div>`;
+}
+
+/* main render */
+function current(){ const k=location.hash.slice(1); return VARIANTS.find(v=>v.key===k)||VARIANTS[0]; }
+function render(){
+  const v = current();
+  document.getElementById('vname').textContent = `Tray · ${v.letter}: ${v.name}`;
+  document.getElementById('vdesc').textContent = v.desc;
+  document.getElementById('vlabel').textContent = `${v.letter} (${v.name})`;
+  const panel = document.getElementById('panel');
+  const sc = panel.querySelector('.pbody')?.scrollTop||0;
+  panel.innerHTML = v.key==='inbox'?renderInbox():v.key==='review'?renderReview():renderAgenda();
+  const pb = panel.querySelector('.pbody'); if(pb) pb.scrollTop = sc;
+  const n = active().filter(i=>i.kind==='suggestion').length + (v.key==='review'?active().filter(i=>i.kind==='commitment'&&!ui.reviewed.has(i.id)).length:0);
+  const b = document.getElementById('badge'); b.textContent = n; b.hidden = !n;
+  renderBanner(); renderState();
+  const ot = document.getElementById('otherText'); if(ot){ ot.focus(); ot.setSelectionRange(ot.value.length, ot.value.length); }
+}
+function closeTools(){ ui.chooser=null; ui.fix=null; ui.menu=null; ui.moving=null; ui.sel=null; ui.other=''; }
+
+function applyMove(it, d, t){
+  const from = `${fdate(it.date)} ${ftime(it.time)}`;
+  const wasSug = it.kind==='suggestion';
+  it.date = d; if(t!==undefined) it.time = t||null;
+  const to = `${fdate(it.date)} ${ftime(it.time)}`;
+  if(wasSug){ it.kind='commitment'; record('accepted_suggestion', it, {reason:'wrong_day', from, to}); }
+  else record('corrected', it, {reason:'wrong_day', from, to});
+  ui.reviewed.add(it.id);
+  closeTools(); render();
+}
+function removeWith(it, reason, text){
+  it.gone = true;
+  record(it.kind==='suggestion'?'dismissed':'removed', it, {reason, text});
+  if(ui.banner===it.id) ui.banner=null;
+  closeTools(); ui.open=null; render();
+}
+
+document.addEventListener('click', e=>{
+  const el = e.target.closest('[data-act]'); if(!el) return;
+  const act = el.dataset.act, it = el.dataset.id && get(el.dataset.id);
+  switch(act){
+    case 'open': ui.open = ui.open===it.id?null:it.id; closeTools(); break;
+    case 'choose': closeTools(); ui.chooser=it.id; break;
+    case 'fix': closeTools(); ui.fix=it.id; break;
+    case 'cancel': closeTools(); break;
+    case 'reason': {
+      const r = el.dataset.r;
+      if(r==='wrong_day'){ closeTools(); if(current().key==='agenda') ui.moving=it.id; else ui.fix=it.id; break; }
+      if(r==='other'){ ui.sel='other'; break; }
+      removeWith(it, r); return;
+    }
+    case 'otherSubmit': { const txt=(document.getElementById('otherText')?.value||'').trim(); if(!txt){ document.getElementById('otherText')?.focus(); return; } removeWith(it,'other',txt); return; }
+    case 'fixTo': applyMove(it, el.dataset.d); return;
+    case 'fixSave': { const d=document.getElementById('fixDate').value; const t=document.getElementById('fixTime'); if(d) applyMove(it, d, t?t.value:undefined); return; }
+    case 'accept': it.kind='commitment'; it.ago=0; ui.reviewed.add(it.id); record('accepted_suggestion', it); closeTools(); break;
+    case 'confirm': ui.reviewed.add(it.id); record('confirmed', it); closeTools(); break;
+    case 'later': it.later = ++laterSeq; closeTools(); break;
+    case 'toggleWhy': ui.showWhy=!ui.showWhy; break;
+    case 'menu': { const same = ui.menu===it.id; closeTools(); ui.menu = same?null:it.id; break; }
+    case 'whyToggle': ui.open = ui.open===it.id?null:it.id; ui.menu=null; break;
+    case 'move': closeTools(); ui.moving=it.id; break;
+    case 'pickDay': applyMove(get(ui.moving), el.dataset.d); return;
+    case 'bFix': ui.banner=null; closeTools(); ui.open=it.id; if(current().key==='agenda') ui.moving=it.id; else ui.fix=it.id; break;
+    case 'bNotMine': removeWith(it,'not_mine'); return;
+    case 'bMore': ui.banner=null; closeTools(); ui.open=it.id; ui.chooser=it.id; break;
+    case 'bClose': ui.banner=null; break;
+    default: return;
+  }
+  render();
+});
+document.addEventListener('input', e=>{
+  if(e.target.id==='otherText'){ ui.other=e.target.value.slice(0,OTHER_MAX); const c=document.getElementById('otherCount'); if(c){ c.textContent=`${ui.other.length}/${OTHER_MAX}`; c.classList.toggle('full', ui.other.length>=OTHER_MAX); } }
+});
+
+const SIMS = [
+  {title:'Climbing at Movement with Dev', date:'2026-11-10', time:'18:30', chat:'Dev', why:{evidence:[['Dev','climb tues after work? 6:30 at movement'],['You','down']], date:'“tues” → Tue Nov 10', inOn:'You accepted'}, alts:['2026-11-17']},
+  {title:'Mom’s birthday dinner', date:'2026-11-22', time:'17:00', chat:'Family (group)', why:{evidence:[['Dad','dinner for mom sunday the 22nd, 5pm at ours'],['You','I’ll be there']], date:'Explicit: Sunday the 22nd', inOn:'You confirmed'}, alts:[]},
+  {title:'Coffee with Priya', date:'2026-11-09', time:'08:30', chat:'Priya', why:{evidence:[['You','coffee tomorrow before work? 8:30?'],['Priya','yes!']], date:'“tomorrow” → Mon Nov 9', inOn:'You proposed; Priya agreed'}, alts:[]},
+];
+document.getElementById('simNew').onclick = ()=>{
+  const s = SIMS[simCount++ % SIMS.length];
+  const it = {...s, id:'n'+simCount, kind:'commitment', ago:0};
+  items.push(it); ui.banner = it.id; render();
+};
+document.getElementById('reset').onclick = ()=>{ items=sample(); log=[]; simCount=0; ui={open:null,chooser:null,fix:null,menu:null,moving:null,showWhy:ui.showWhy,banner:null,reviewed:new Set(),sel:null,other:''}; render(); };
+document.getElementById('trayBtn').onclick = ()=>{ const p=document.getElementById('panel'); p.hidden=!p.hidden; };
+
+function go(step){ const i=VARIANTS.indexOf(current()); const v=VARIANTS[(i+step+VARIANTS.length)%VARIANTS.length]; location.hash=v.key; }
+document.getElementById('prev').onclick=()=>go(-1);
+document.getElementById('next').onclick=()=>go(1);
+document.addEventListener('keydown', e=>{
+  const t=e.target; if(t.matches('input,textarea,[contenteditable]')) return;
+  if(e.key==='ArrowLeft') go(-1); else if(e.key==='ArrowRight') go(1);
+});
+window.addEventListener('hashchange', ()=>{ closeTools(); ui.open=null; render(); });
+render();
+</script>
