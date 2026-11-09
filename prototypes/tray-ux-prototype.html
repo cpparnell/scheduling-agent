@@ -112,7 +112,11 @@ button:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px soli
 .count{font-size:11px;color:var(--muted);text-align:right;font-variant-numeric:tabular-nums}
 .count.full{color:var(--bad)}
 .fix input{font:inherit;border:1px solid var(--panel-line);border-radius:6px;padding:3px 6px;background:var(--panel-2);color:var(--fg)}
-.fixrow{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.fixrow{display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end}
+.fl{display:grid;gap:2px;font-size:11px;color:var(--muted)}
+.fl input{font:inherit;font-size:12.5px;color:var(--fg);border:1px solid var(--panel-line);border-radius:6px;padding:4px 6px;background:var(--panel-2);min-width:0}
+.fl input:disabled{opacity:.45}
+.ck{display:flex;gap:5px;align-items:center;font-size:12px;padding-bottom:4px}
 
 /* variant B: review cards */
 .card{margin:12px;border:1px solid var(--panel-line);border-radius:12px;padding:14px;display:grid;gap:10px;background:var(--panel)}
@@ -228,27 +232,31 @@ const VARIANTS = [
   {key:'agenda', letter:'C', name:'Agenda', desc:'Organized by when the plan happens, not when it was detected. Suggestions sit as hatched ghosts in their day. Fix a wrong day by picking the right one on the week strip.'},
 ];
 const REASONS = [
-  {k:'wrong_day', label:'Wrong day or time', fix:true},
+  {k:'fix', label:'Details are wrong → fix instead'},
   {k:'not_mine', label:'Not my plan'},
   {k:'not_a_plan', label:'Not a real plan'},
+  {k:'cancelled', label:'It got cancelled'},
   {k:'dont_want', label:"Real, but don't calendar it"},
   {k:'duplicate', label:'Duplicate'},
   {k:'other', label:'Other…'},
 ];
+const FIELD_REASON = {date:'wrong_day', time:'wrong_time', end:'wrong_span', title:'wrong_title', location:'wrong_location', status:'wrong_status'};
 const OTHER_MAX = 80;
 
 function sample(){ return [
-  {id:'s1', kind:'suggestion', title:'Game night at Sam’s', date:'2026-11-12', time:'19:00', chat:'Thursday Crew (group)', ago:14,
-   held:'You only reacted 👍. That may or may not mean you’re coming.',
-   why:{evidence:[['Sam','game night thurs at mine? 7ish'],['You','reacted 👍']], date:'“thurs” → Thu Nov 12 (the coming Thursday)', inOn:'Unclear: a reaction is not a reply'}, alts:['2026-11-19']},
+  {id:'s1', kind:'commitment', title:'Game night at Sam’s', date:'2026-11-12', time:'19:00', location:'Sam’s place', chat:'Thursday Crew (group)', ago:14,
+   why:{evidence:[['Sam','game night thurs at mine? 7ish'],['You','liked “game night thurs at mine? 7ish”']], date:'“thurs” → Thu Nov 12 (the coming Thursday)', inOn:'You liked an invitation made to the group. A like on an invite counts as yes.'}, alts:['2026-11-19']},
+  {id:'s3', kind:'suggestion', title:'Drinks with Chris', date:'2026-11-17', time:null, chat:'Chris', ago:30,
+   held:'You agreed, but no day was picked. Tuesday is a guess.',
+   why:{evidence:[['Chris','drinks sometime next week? maybe tues or wed'],['You','yes def']], date:'“tues or wed” → Tue Nov 17 is a guess', inOn:'You accepted'}, alts:['2026-11-18']},
   {id:'s2', kind:'suggestion', title:'Brunch with Jordan', date:'2026-11-15', time:null, chat:'Jordan', ago:52,
    held:'“Next weekend” could be Sat Nov 14 or Sun Nov 15.',
    why:{evidence:[['Jordan','brunch next weekend?'],['You','yes!! been craving that pancake place']], date:'“next weekend” → ambiguous between Sat and Sun', inOn:'You accepted'}, alts:['2026-11-14','2026-11-21']},
-  {id:'c1', kind:'commitment', title:'Dinner at Basil Room with Maya', date:'2026-11-13', time:'19:30', chat:'Maya', ago:3,
+  {id:'c1', kind:'commitment', title:'Dinner at Basil Room with Maya', date:'2026-11-13', time:'19:30', location:'Basil Room', chat:'Maya', ago:3,
    why:{evidence:[['Maya','basil room friday? I can book 7:30'],['You','yes let’s do it']], date:'“friday” → Fri Nov 13 (next Friday after today)', inOn:'You accepted Maya’s proposal'}, alts:['2026-11-20']},
-  {id:'c2', kind:'commitment', title:'Reservation · Tavern on Elm, party of 2', date:'2026-11-21', time:'20:00', chat:'Tavern on Elm (SMS)', ago:95,
+  {id:'c2', kind:'commitment', title:'Reservation · Tavern on Elm, party of 2', date:'2026-11-21', time:'20:00', location:'Tavern on Elm', chat:'Tavern on Elm (SMS)', ago:95,
    why:{evidence:[['Tavern on Elm','Your reservation for 2 on Sat, Nov 21 at 8:00 PM is confirmed. Reply C to cancel.']], date:'Explicit date in the message', inOn:'A booking confirmation sent to you'}, alts:[]},
-  {id:'c3', kind:'commitment', title:'Winter Lights at the Conservatory', date:'2026-12-05', time:'18:00', chat:'Maya', ago:240,
+  {id:'c3', kind:'commitment', title:'Winter Lights at the Conservatory', date:'2026-12-05', time:'18:00', location:'Conservatory', chat:'Maya', ago:240,
    why:{evidence:[['You','[image: poster “Winter Lights · Dec 5 · 6–10pm”]'],['You','we should go!'],['Maya','omg yes. buying tickets now'],['Maya','done, got 2 for 6pm']], date:'From the poster image: Dec 5, entry 6 PM', inOn:'You proposed it; Maya bought tickets for both of you'}, alts:[]},
   {id:'c4', kind:'commitment', title:'Ski trip · Ski Crew', date:'2026-11-13', time:null, chat:'Ski Crew (group)', ago:600,
    why:{evidence:[['Alex','leaving friday morning, I’ll drive'],['You','I’m in, I’ll bring the cooler']], date:'“friday” → Fri Nov 13 (next Friday after today)', inOn:'You said you’re in'}, alts:['2027-01-15'],
@@ -265,6 +273,7 @@ const iso = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-$
 const DOW=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'], MON=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 const fdate = s => { const d=pd(s); return `${DOW[d.getDay()]}, ${MON[d.getMonth()]} ${d.getDate()}`; };
 const ftime = t => { if(!t) return 'All day'; let [h,m]=t.split(':').map(Number); const ap=h>=12?'PM':'AM'; h=h%12||12; return m?`${h}:${String(m).padStart(2,'0')} ${ap}`:`${h} ${ap}`; };
+const whenStr = it => `${fdate(it.date)}${it.end?' – '+fdate(it.end):''} · ${ftime(it.time)}${it.tentative?' · tentative':''}`;
 const fago = m => m<60?`${m}m ago`:m<1440?`${Math.round(m/60)}h ago`:`${Math.round(m/1440)}d ago`;
 const esc = s => String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const get = id => items.find(i=>i.id===id);
@@ -296,11 +305,20 @@ function chooser(it){
 }
 function fixBox(it){
   const alts = it.alts.filter(a=>a!==it.date);
-  const altBtns = alts.map(a=>`<button class="chip" data-act="fixTo" data-id="${it.id}" data-d="${a}">${fdate(a)}${a.slice(0,4)!=='2026'?' '+a.slice(0,4):''}</button>`).join('');
-  return `<div class="chooser fix"><div class="h">Move to the right day</div>
-    ${alts.length?`<div class="meta">Other readings of the message:</div><div class="chips">${altBtns}</div>`:''}
-    <div class="fixrow"><input type="date" id="fixDate" value="${it.date}"><input type="time" id="fixTime" value="${it.time||''}">
-    <button class="btn sm primary" data-act="fixSave" data-id="${it.id}">${it.kind==='suggestion'?'Add on this day':'Move'}</button>
+  const altBtns = alts.map(a=>`<button class="chip" data-act="altDate" data-d="${a}">${fdate(a)}${a.slice(0,4)!=='2026'?' '+a.slice(0,4):''}</button>`).join('');
+  const sug = it.kind==='suggestion';
+  return `<div class="chooser fix"><div class="h">Fix the details <span class="meta">Change whatever is wrong. Each change is a lesson.</span></div>
+    <label class="fl">Title<input id="fTitle" value="${esc(it.title)}"></label>
+    ${alts.length?`<div class="meta">Other readings of the date:</div><div class="chips">${altBtns}</div>`:''}
+    <div class="fixrow"><label class="fl">Starts<input type="date" id="fDate" value="${it.date}"></label>
+      <label class="fl">Ends <span class="meta">(multi-day)</span><input type="date" id="fEnd" value="${it.end||''}"></label></div>
+    <div class="fixrow"><label class="fl">Time<input type="time" id="fTime" value="${it.time||''}" ${it.time?'':'disabled'}></label>
+      <label class="ck"><input type="checkbox" id="fAllDay" ${it.time?'':'checked'}> All day</label></div>
+    <label class="fl">Location<input id="fLoc" value="${esc(it.location||'')}" placeholder="None"></label>
+    <div class="fixrow"><span class="meta">Status</span>
+      <button class="chip ${!it.tentative?'on':''}" data-act="setStatus" data-v="confirmed">Confirmed</button>
+      <button class="chip ${it.tentative?'on':''}" data-act="setStatus" data-v="tentative">Tentative</button></div>
+    <div class="fixrow"><button class="btn sm primary" data-act="fixSave" data-id="${it.id}">${sug?'Add with these details':'Save fix'}</button>
     <button class="btn sm" data-act="cancel">Cancel</button></div></div>`;
 }
 function inlineTools(it){
@@ -329,7 +347,7 @@ function renderInbox(){
         <span><div class="ttl">${esc(it.title)}</div><div class="meta when">${fdate(it.date)} · ${ftime(it.time)}</div><div class="held">${esc(it.held)}</div></span><span class="ago">${fago(it.ago)}</span></button>`;
       h += `<div class="detail" ${open?'':'hidden'}>${whyBlock(it)}<div class="actions">
         <button class="btn sm primary" data-act="accept" data-id="${it.id}">Add to calendar</button>
-        <button class="btn sm" data-act="fix" data-id="${it.id}">Different day</button>
+        <button class="btn sm" data-act="fix" data-id="${it.id}">Edit, then add</button>
         <button class="btn sm" data-act="choose" data-id="${it.id}">Dismiss…</button></div>${inlineTools(it)}</div>`;
     }
   }
@@ -338,9 +356,9 @@ function renderInbox(){
   for(const it of coms){
     const open = ui.open===it.id;
     h += `<button class="row ${open?'open':''}" data-act="open" data-id="${it.id}"><span class="dot"></span>
-      <span><div class="ttl">${esc(it.title)}</div><div class="meta when">${fdate(it.date)} · ${ftime(it.time)}</div><div class="meta">from ${esc(it.chat)}</div></span><span class="ago">${fago(it.ago)}</span></button>`;
+      <span><div class="ttl">${esc(it.title)}</div><div class="meta when">${whenStr(it)}</div><div class="meta">${it.location?esc(it.location)+' · ':''}from ${esc(it.chat)}</div></span><span class="ago">${fago(it.ago)}</span></button>`;
     h += `<div class="detail" ${open?'':'hidden'}>${whyBlock(it)}<div class="actions">
-      <button class="btn sm" data-act="fix" data-id="${it.id}">Wrong day</button>
+      <button class="btn sm" data-act="fix" data-id="${it.id}">Fix…</button>
       <button class="btn sm danger" data-act="choose" data-id="${it.id}">Remove…</button></div>${inlineTools(it)}</div>`;
   }
   return h+'</div>'+footer();
@@ -357,12 +375,12 @@ function renderReview(){
   if(it){
     const sug = it.kind==='suggestion';
     h += `<div class="card"><span class="kind ${sug?'sug':''}">${sug?'Suggestion · not on calendar':'Added to calendar · '+fago(it.ago)}</span>
-      <div class="big">${esc(it.title)}</div><div class="date">${fdate(it.date)} · ${ftime(it.time)}</div><div class="meta">from ${esc(it.chat)}</div>
+      <div class="big">${esc(it.title)}</div><div class="date">${whenStr(it)}</div>${it.location?`<div class="meta">${esc(it.location)}</div>`:''}<div class="meta">from ${esc(it.chat)}</div>
       ${sug?`<div class="held">${esc(it.held)}</div>`:''}
       ${ui.showWhy?whyBlock(it):'<div class="meta">Reasons hidden.</div>'}
       ${inlineTools(it) || `<div class="bigacts">
         ${sug?`<button class="btn primary" data-act="accept" data-id="${it.id}">Add</button>`:`<button class="btn primary" data-act="confirm" data-id="${it.id}">Looks right</button>`}
-        <button class="btn" data-act="fix" data-id="${it.id}">Wrong day</button>
+        <button class="btn" data-act="fix" data-id="${it.id}">Fix…</button>
         <button class="btn danger" data-act="choose" data-id="${it.id}">${sug?'Dismiss…':'Remove…'}</button></div>
         <div style="text-align:center"><button class="btn sm" data-act="later" data-id="${it.id}" style="border:0;background:none;color:var(--muted)">Decide later</button></div>`}
     </div>`;
@@ -402,10 +420,11 @@ function renderAgenda(){
     h += `<div class="ag ${sug?'sug':''}"><span class="tm">${ftime(it.time)}</span><span><div class="ttl">${esc(it.title)}</div><div class="meta">${sug?esc(it.held):'from '+esc(it.chat)+' · added '+fago(it.ago)}</div></span>
       <span class="actions">${sug?`<button class="btn sm primary" data-act="accept" data-id="${it.id}">Add</button>`:''}<button class="more" data-act="menu" data-id="${it.id}" aria-label="More actions">⋯</button></span></div>`;
     if(ui.menu===it.id){
-      h += `<div class="menu"><button data-act="whyToggle" data-id="${it.id}">${ui.open===it.id?'Hide':'Why is this here?'}</button><button data-act="move" data-id="${it.id}">Move to another day</button><button data-act="choose" data-id="${it.id}">${sug?'Dismiss…':'Remove…'}</button></div>`;
+      h += `<div class="menu"><button data-act="whyToggle" data-id="${it.id}">${ui.open===it.id?'Hide':'Why is this here?'}</button><button data-act="move" data-id="${it.id}">Move to another day</button><button data-act="fix" data-id="${it.id}">Fix details…</button><button data-act="choose" data-id="${it.id}">${sug?'Dismiss…':'Remove…'}</button></div>`;
     }
     if(ui.open===it.id && ui.showWhy) h += `<div class="inset">${whyBlock(it)}</div>`;
     if(ui.chooser===it.id) h += `<div class="inset">${chooser(it)}</div>`;
+    if(ui.fix===it.id) h += `<div class="inset">${fixBox(it)}</div>`;
   }
   return h+'</div>'+footer();
 }
@@ -417,7 +436,7 @@ function renderBanner(){
   if(!it || it.gone){ host.innerHTML=''; return; }
   host.innerHTML = `<div class="banner" role="status"><div class="app"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2" y="3" width="12" height="11" rx="2"/><path d="M2 6.5h12"/></svg>SCHEDULING AGENT<span class="sp"></span>now</div>
     <div><b>Added: ${esc(it.title)}</b><div class="meta when">${fdate(it.date)} · ${ftime(it.time)} · from ${esc(it.chat)}</div></div>
-    <div class="b-actions"><button class="btn sm" data-act="bFix" data-id="${it.id}">Wrong day</button><button class="btn sm" data-act="bNotMine" data-id="${it.id}">Not my plan</button><button class="btn sm" data-act="bMore" data-id="${it.id}">Remove…</button><button class="btn sm" data-act="bClose" style="margin-left:auto">Close</button></div></div>`;
+    <div class="b-actions"><button class="btn sm" data-act="bFix" data-id="${it.id}">Fix…</button><button class="btn sm" data-act="bNotMine" data-id="${it.id}">Not my plan</button><button class="btn sm" data-act="bMore" data-id="${it.id}">Remove…</button><button class="btn sm" data-act="bClose" style="margin-left:auto">Close</button></div></div>`;
 }
 
 /* state pane */
@@ -425,7 +444,7 @@ function renderState(){
   const a = active();
   const lines = log.length ? log.map(e=>{
     const pos = e.action==='confirmed'||e.action==='accepted_suggestion';
-    return `<span class="${pos?'sig':'neg'}">${e.t} ${e.action}</span>  ${esc(e.item)}\n  chat: ${esc(e.chat)}${e.reason?`\n  reason: ${e.reason}`:''}${e.text?`\n  text: "${esc(e.text)}"`:''}${e.from?`\n  ${e.from} → ${e.to}`:''}`;
+    return `<span class="${pos?'sig':'neg'}">${e.t} ${e.action}</span>  ${esc(e.item)}\n  chat: ${esc(e.chat)}${e.reason?`\n  reason: ${e.reason}`:''}${e.text?`\n  text: "${esc(e.text)}"`:''}${e.from?`\n  ${e.from} → ${e.to}`:''}${e.diff?`\n  ${esc(e.diff)}`:''}`;
   }).join('\n\n') : 'No corrections yet. Try removing, moving, adding or confirming something.';
   const planted = get('c4');
   document.getElementById('state').innerHTML = `<h2>What the system receives</h2>
@@ -433,7 +452,9 @@ function renderState(){
     <div class="counts"><div><b>${a.filter(i=>i.kind==='commitment').length}</b><span>on calendar</span></div><div><b>${a.filter(i=>i.kind==='suggestion').length}</b><span>suggestions</span></div><div><b>${log.length}</b><span>signals</span></div></div>
     <pre class="log">${lines}</pre>
     <div class="notes"><b>Things to try</b>
-      <span>• The ski trip is a planted wrong-day mistake: ${planted&&!planted.gone&&planted.date==='2026-11-13'?'it was mid-November in this chat, but Oct 2 said “MLK weekend”. Fix it.':'done.'}</span>
+      <span>• The ski trip is a planted wrong-day mistake: ${planted&&!planted.gone&&planted.date==='2026-11-13'?'it was mid-November in this chat, but Oct 2 said “MLK weekend”. Fix it (it’s a Fri–Mon trip).':'done.'}</span>
+      <span>• Game night went straight onto the calendar because you liked the invite.</span>
+      <span>• Fix… edits the day, time, span, title, location or status. Each changed field is logged as its own reason.</span>
       <span>• “Other…” has an ${OTHER_MAX}-character cap.</span>
       <span>• The Winter Lights entry shows how an image would appear in the reasons.</span>
       <span>• “Simulate” fires a notification with action buttons.</span></div>`;
@@ -455,7 +476,7 @@ function render(){
   renderBanner(); renderState();
   const ot = document.getElementById('otherText'); if(ot){ ot.focus(); ot.setSelectionRange(ot.value.length, ot.value.length); }
 }
-function closeTools(){ ui.chooser=null; ui.fix=null; ui.menu=null; ui.moving=null; ui.sel=null; ui.other=''; }
+function closeTools(){ ui.status=null; ui.chooser=null; ui.fix=null; ui.menu=null; ui.moving=null; ui.sel=null; ui.other=''; }
 
 function applyMove(it, d, t){
   const from = `${fdate(it.date)} ${ftime(it.time)}`;
@@ -466,6 +487,16 @@ function applyMove(it, d, t){
   else record('corrected', it, {reason:'wrong_day', from, to});
   ui.reviewed.add(it.id);
   closeTools(); render();
+}
+function applyFix(it, n){
+  const old = {title:it.title, date:it.date, end:it.end||null, time:it.time||null, location:it.location||null, status:it.tentative?'tentative':'confirmed'};
+  const changed = Object.keys(old).filter(k=>(old[k]||null)!==(n[k]||null));
+  const wasSug = it.kind==='suggestion';
+  Object.assign(it, {title:n.title, date:n.date, end:n.end, time:n.time, location:n.location, tentative:n.status==='tentative'});
+  const diff = changed.map(k=>`${k}: ${old[k]??'—'} → ${n[k]??'—'}`).join('\n  ');
+  if(wasSug){ it.kind='commitment'; record('accepted_suggestion', it, {reason: changed.map(k=>FIELD_REASON[k]).join(', ')||undefined, diff}); }
+  else if(changed.length) record('corrected', it, {reason: changed.map(k=>FIELD_REASON[k]).join(', '), diff});
+  ui.reviewed.add(it.id); closeTools(); render();
 }
 function removeWith(it, reason, text){
   it.gone = true;
@@ -484,13 +515,21 @@ document.addEventListener('click', e=>{
     case 'cancel': closeTools(); break;
     case 'reason': {
       const r = el.dataset.r;
-      if(r==='wrong_day'){ closeTools(); if(current().key==='agenda') ui.moving=it.id; else ui.fix=it.id; break; }
+      if(r==='fix'){ closeTools(); ui.fix=it.id; break; }
       if(r==='other'){ ui.sel='other'; break; }
       removeWith(it, r); return;
     }
     case 'otherSubmit': { const txt=(document.getElementById('otherText')?.value||'').trim(); if(!txt){ document.getElementById('otherText')?.focus(); return; } removeWith(it,'other',txt); return; }
     case 'fixTo': applyMove(it, el.dataset.d); return;
-    case 'fixSave': { const d=document.getElementById('fixDate').value; const t=document.getElementById('fixTime'); if(d) applyMove(it, d, t?t.value:undefined); return; }
+    case 'fixSave': {
+      if(ui.moving){ const d=document.getElementById('fixDate').value; if(d) applyMove(it, d); return; }
+      const v = id=>document.getElementById(id);
+      const allDay = v('fAllDay').checked;
+      applyFix(it, {title:v('fTitle').value.trim()||it.title, date:v('fDate').value||it.date, end:v('fEnd').value||null,
+        time: allDay?null:(v('fTime').value||null), location:v('fLoc').value.trim()||null, status: ui.status ?? (it.tentative?'tentative':'confirmed')});
+      return; }
+    case 'altDate': document.getElementById('fDate').value = el.dataset.d; return;
+    case 'setStatus': ui.status = el.dataset.v; el.parentElement.querySelectorAll('.chip').forEach(c=>c.classList.toggle('on', c===el)); return;
     case 'accept': it.kind='commitment'; it.ago=0; ui.reviewed.add(it.id); record('accepted_suggestion', it); closeTools(); break;
     case 'confirm': ui.reviewed.add(it.id); record('confirmed', it); closeTools(); break;
     case 'later': it.later = ++laterSeq; closeTools(); break;
@@ -499,7 +538,7 @@ document.addEventListener('click', e=>{
     case 'whyToggle': ui.open = ui.open===it.id?null:it.id; ui.menu=null; break;
     case 'move': closeTools(); ui.moving=it.id; break;
     case 'pickDay': applyMove(get(ui.moving), el.dataset.d); return;
-    case 'bFix': ui.banner=null; closeTools(); ui.open=it.id; if(current().key==='agenda') ui.moving=it.id; else ui.fix=it.id; break;
+    case 'bFix': ui.banner=null; closeTools(); ui.open=it.id; ui.fix=it.id; break;
     case 'bNotMine': removeWith(it,'not_mine'); return;
     case 'bMore': ui.banner=null; closeTools(); ui.open=it.id; ui.chooser=it.id; break;
     case 'bClose': ui.banner=null; break;
@@ -507,6 +546,7 @@ document.addEventListener('click', e=>{
   }
   render();
 });
+document.addEventListener('change', e=>{ if(e.target.id==='fAllDay'){ document.getElementById('fTime').disabled = e.target.checked; } });
 document.addEventListener('input', e=>{
   if(e.target.id==='otherText'){ ui.other=e.target.value.slice(0,OTHER_MAX); const c=document.getElementById('otherCount'); if(c){ c.textContent=`${ui.other.length}/${OTHER_MAX}`; c.classList.toggle('full', ui.other.length>=OTHER_MAX); } }
 });
@@ -521,7 +561,7 @@ document.getElementById('simNew').onclick = ()=>{
   const it = {...s, id:'n'+simCount, kind:'commitment', ago:0};
   items.push(it); ui.banner = it.id; render();
 };
-document.getElementById('reset').onclick = ()=>{ items=sample(); log=[]; simCount=0; ui={open:null,chooser:null,fix:null,menu:null,moving:null,showWhy:ui.showWhy,banner:null,reviewed:new Set(),sel:null,other:''}; render(); };
+document.getElementById('reset').onclick = ()=>{ items=sample(); log=[]; simCount=0; laterSeq=0; ui={open:null,chooser:null,fix:null,menu:null,moving:null,showWhy:ui.showWhy,banner:null,reviewed:new Set(),sel:null,other:''}; render(); };
 document.getElementById('trayBtn').onclick = ()=>{ const p=document.getElementById('panel'); p.hidden=!p.hidden; };
 
 function go(step){ const i=VARIANTS.indexOf(current()); const v=VARIANTS[(i+step+VARIANTS.length)%VARIANTS.length]; location.hash=v.key; }
