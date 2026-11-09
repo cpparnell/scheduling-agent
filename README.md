@@ -695,6 +695,12 @@ and the run's total/average cost is printed at the end and written to
 zero bystander leaks, all known-duplicate pairs caught with no controls merged,
 and exact create/update counts on every pipeline scenario.
 
+**Baseline corpus (real history).** `python -m evals.baseline` replays the last
+90 days of your own `chat.db` through the pipeline as a dry run, queues
+chat-day episodes for labeling in a local UI, and reports each failure mode
+(wrong day, missed, hallucinated, not mine) with 95% intervals. All data stays
+in `~/.scheduling-agent/corpus/`. See `evals/baseline/README.md`.
+
 **Eval clock pinning.** What the detector prompt shows as "today" affects
 weekday-dependent cases ("this Thursday" resolves differently depending on the
 real day of the week), so a run's pass/fail must not depend on which day it
@@ -852,6 +858,7 @@ scripts/
 tests/                 # Offline unit/integration tests (pytest)
 └── fixtures/chatdb.py # Builds a temp chat.db + encodes attributedBody blobs
 evals/                 # Paid detection eval (golden dataset + runner)
+├── baseline/          # Real-history corpus: v0.14 dry run, labeling UI, per-failure-mode score
 ├── golden.jsonl       # Labeled threads: positives, negatives, bystander, dedup, pipeline polls
 ├── loader.py          # Materializes runtime-relative dates (+ multi-poll threads)
 └── run.py             # Detection, dedup-adjudication, and pipeline scorers + report writer
