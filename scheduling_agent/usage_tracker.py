@@ -112,6 +112,10 @@ def get_records() -> list[UsageRecord]:
     return list(_records)
 
 
+def get_failures() -> list[str]:
+    return list(_failures)
+
+
 def summary() -> dict:
     """Aggregate totals: overall + a per-model breakdown, plus a count of
     calls whose model had no known pricing (their cost is excluded from

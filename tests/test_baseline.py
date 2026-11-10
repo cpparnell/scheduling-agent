@@ -7,7 +7,10 @@ from pathlib import Path
 
 import pytest
 
-from evals.baseline import episodes, labels, score
+import time
+
+from evals.baseline import episodes, labels, run_v014, score
+from scheduling_agent import usage_tracker
 from evals.baseline.episodes import Detection, Episode, _DayStats
 from evals.baseline.signals import plan_signal
 
@@ -141,3 +144,23 @@ def test_wilson_bounds() -> None:
     lo, hi = score.wilson(24, 30)
     assert 0.6 < lo < 0.65 and 0.9 < hi < 0.92
     assert score.wilson(0, 0) == (0.0, 1.0)
+
+
+def test_guard_interrupts_main_thread_on_first_api_failure() -> None:
+    usage_tracker.reset()
+    guard = run_v014._Guard(budget_usd=100.0)
+    with pytest.raises(KeyboardInterrupt):
+        with guard:
+            usage_tracker.record_failure("credit balance is too low")
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                time.sleep(0.05)
+    assert guard.reason is not None and "credit balance" in guard.reason
+    usage_tracker.reset()
+
+
+def test_guard_stays_quiet_on_a_healthy_run() -> None:
+    usage_tracker.reset()
+    with run_v014._Guard(budget_usd=100.0) as guard:
+        time.sleep(1.3)
+    assert guard.reason is None

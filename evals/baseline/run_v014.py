@@ -13,9 +13,11 @@ Cost guard: a 7-day preflight runs first and its cost is projected to the full
 range; the full run only starts when the projection is under the cap.
 """
 
+import _thread
 import json
 import logging
 import subprocess
+import threading
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -43,6 +45,44 @@ class KeyCheckFailed(RuntimeError):
     pass
 
 
+class RunAborted(RuntimeError):
+    pass
+
+
+class _Guard:
+    """Stops a backfill early instead of letting it grind on. backfill() has no
+    hook for this, so a watcher thread interrupts the main thread on the first
+    failed API call (dead key, exhausted credit: the rest of the run would be
+    invalid anyway) or once spend passes the budget. The interrupt unwinds
+    through backfill's context managers, so its scratch state is still cleaned up."""
+
+    def __init__(self, budget_usd: float) -> None:
+        self.budget = budget_usd
+        self.reason: str | None = None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._watch, daemon=True)
+
+    def _watch(self) -> None:
+        while not self._stop.wait(1.0):
+            s = usage_tracker.summary()
+            if int(s.get("failed_calls", 0)) > 0:
+                failures = usage_tracker.get_failures()
+                first = failures[0] if failures else ""
+                self.reason = f"an API call failed: {first[:300]}"
+            elif float(s.get("total_cost_usd", 0.0)) > self.budget:
+                self.reason = f"spend passed the ${self.budget:.2f} budget"
+            if self.reason:
+                _thread.interrupt_main()
+                return
+
+    def __enter__(self) -> "_Guard":
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._stop.set()
+
+
 def check_keys(cfg: dict[str, object]) -> None:
     """Fail fast, before any spend, when a backend's key is rejected. The
     default config calls both Jev (detector) and Claude (second looks, dedup)."""
@@ -67,9 +107,17 @@ def _midnight(d: date) -> datetime:
     return datetime.combine(d, datetime.min.time())
 
 
-def _one(cfg: dict[str, object], since: date, until: date, out: Path) -> RunOutcome:
+def _one(cfg: dict[str, object], since: date, until: date, out: Path, budget_usd: float) -> RunOutcome:
     usage_tracker.reset()
-    r = backfill(cfg, _midnight(since), _midnight(until), window_days=1.0, out_path=out)
+    guard = _Guard(budget_usd)
+    try:
+        with guard:
+            r = backfill(cfg, _midnight(since), _midnight(until), window_days=1.0, out_path=out)
+    except KeyboardInterrupt:
+        if guard.reason is None:
+            raise
+        spent = float(usage_tracker.summary().get("total_cost_usd", 0.0))
+        raise RunAborted(f"Stopped early: {guard.reason} (spent ${spent:.3f}).") from None
     s = usage_tracker.summary()
     cost = float(s.get("total_cost_usd", 0.0))
     failed_calls = int(s.get("failed_calls", 0))
@@ -92,20 +140,21 @@ def run(days: int, cap_usd: float, until: date | None = None) -> RunOutcome:
     until = until or date.today()
     since = until - timedelta(days=days)
 
-    pre = _one(cfg, until - timedelta(days=PREFLIGHT_DAYS), until, paths.CORPUS_DIR / "preflight.jsonl")
+    pre = _one(cfg, until - timedelta(days=PREFLIGHT_DAYS), until, paths.CORPUS_DIR / "preflight.jsonl", cap_usd)
     if not pre.valid:
         raise RuntimeError(
             f"Preflight had failed API calls ({pre.n_failed} failed threads); fix the backend and re-run."
         )
     projected = pre.cost_usd * days / PREFLIGHT_DAYS
-    print(f"Preflight: {PREFLIGHT_DAYS} days cost ${pre.cost_usd:.3f}; projected {days} days ≈ ${projected:.2f}")
+    print(f"Preflight: {PREFLIGHT_DAYS} days cost ${pre.cost_usd:.3f}; projected {days} days ≈ ${projected:.2f}", flush=True)
     if projected > cap_usd:
         raise RuntimeError(
             f"Projected cost ${projected:.2f} exceeds the cap ${cap_usd:.2f}. "
             "Re-run with a higher --cap or fewer --days."
         )
 
-    full = _one(cfg, since, until, paths.DETECTIONS)
+    paths.RUN_META.unlink(missing_ok=True)  # a stale valid run must not survive a failed re-run
+    full = _one(cfg, since, until, paths.DETECTIONS, cap_usd - pre.cost_usd)
     meta = {
         "since": since.isoformat(), "until": until.isoformat(), "days": days,
         "ran_at": datetime.now().isoformat(timespec="seconds"),

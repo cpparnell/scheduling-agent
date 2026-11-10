@@ -70,7 +70,10 @@ def main() -> None:
     if args.cmd == "status":
         cmd_status()
     elif args.cmd == "run":
-        out = run_v014.run(args.days, args.cap, args.until)
+        try:
+            out = run_v014.run(args.days, args.cap, args.until)
+        except (run_v014.KeyCheckFailed, run_v014.RunAborted) as e:
+            raise SystemExit(str(e)) from None
         print(f"v0.14 run done: {out.n_events} detections, valid={out.valid}, ${out.cost_usd:.2f}")
         if out.valid:
             cmd_episodes()
