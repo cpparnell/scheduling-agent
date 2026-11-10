@@ -142,13 +142,13 @@ def run(days: int, cap_usd: float, until: date | None = None) -> RunOutcome:
 
     pre = _one(cfg, until - timedelta(days=PREFLIGHT_DAYS), until, paths.CORPUS_DIR / "preflight.jsonl", cap_usd)
     if not pre.valid:
-        raise RuntimeError(
+        raise RunAborted(
             f"Preflight had failed API calls ({pre.n_failed} failed threads); fix the backend and re-run."
         )
     projected = pre.cost_usd * days / PREFLIGHT_DAYS
     print(f"Preflight: {PREFLIGHT_DAYS} days cost ${pre.cost_usd:.3f}; projected {days} days ≈ ${projected:.2f}", flush=True)
     if projected > cap_usd:
-        raise RuntimeError(
+        raise RunAborted(
             f"Projected cost ${projected:.2f} exceeds the cap ${cap_usd:.2f}. "
             "Re-run with a higher --cap or fewer --days."
         )
